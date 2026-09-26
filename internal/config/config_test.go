@@ -2,6 +2,8 @@ package config
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -113,5 +115,64 @@ func TestBuildChatModel(t *testing.T) {
 	}
 	if cm == nil {
 		t.Fatal("BuildChatModel() returned a nil model")
+	}
+}
+
+func TestDiscoverContextWindow_LMStudioSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v0/models" {
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"test-model","max_context_length":32768,"loaded_context_length":16384}]}`))
+	}))
+	defer srv.Close()
+
+	got := DiscoverContextWindow(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "test-model"})
+	if got != 16384 {
+		t.Errorf("DiscoverContextWindow() = %d, want 16384 (loaded_context_length preferred)", got)
+	}
+}
+
+func TestDiscoverContextWindow_PrefersMaxWhenLoadedAbsent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"test-model","max_context_length":32768}]}`))
+	}))
+	defer srv.Close()
+
+	got := DiscoverContextWindow(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "test-model"})
+	if got != 32768 {
+		t.Errorf("DiscoverContextWindow() = %d, want 32768", got)
+	}
+}
+
+func TestDiscoverContextWindow_FallsBackToConfigField(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	got := DiscoverContextWindow(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "test-model", ContextWindow: 4096})
+	if got != 4096 {
+		t.Errorf("DiscoverContextWindow() = %d, want 4096 (config field fallback)", got)
+	}
+}
+
+func TestDiscoverContextWindow_FallsBackToDefault(t *testing.T) {
+	got := DiscoverContextWindow(context.Background(), ModelConfig{BaseURL: "http://127.0.0.1:1", Model: "test-model"})
+	if got != defaultContextWindow {
+		t.Errorf("DiscoverContextWindow() = %d, want default %d", got, defaultContextWindow)
+	}
+}
+
+func TestDiscoverContextWindow_NoMatchingModelFallsThrough(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"other-model","max_context_length":32768}]}`))
+	}))
+	defer srv.Close()
+
+	got := DiscoverContextWindow(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "test-model", ContextWindow: 2048})
+	if got != 2048 {
+		t.Errorf("DiscoverContextWindow() = %d, want 2048 (fallback since no matching model)", got)
 	}
 }

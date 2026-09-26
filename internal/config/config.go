@@ -2,9 +2,13 @@ package config
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/components/model"
@@ -26,6 +30,10 @@ type ModelConfig struct {
 	BaseURL string `yaml:"base_url"`
 	APIKey  string `yaml:"api_key"`
 	Model   string `yaml:"model"`
+	// ContextWindow is an optional explicit context-window size, used as a
+	// fallback when it can't be discovered from the provider (see
+	// DiscoverContextWindow). Zero means "not set."
+	ContextWindow int `yaml:"context_window"`
 }
 
 // Config is the fully-resolved, defaulted configuration for one run.
@@ -165,4 +173,70 @@ func BuildChatModel(ctx context.Context, m ModelConfig) (model.ToolCallingChatMo
 		return nil, err
 	}
 	return cm, nil
+}
+
+const defaultContextWindow = 8192
+
+type lmStudioModelsResponse struct {
+	Data []struct {
+		ID                  string `json:"id"`
+		MaxContextLength    int    `json:"max_context_length"`
+		LoadedContextLength int    `json:"loaded_context_length"`
+	} `json:"data"`
+}
+
+// DiscoverContextWindow resolves the context window size for m, trying (in
+// order): LM Studio's native API, m.ContextWindow if set, then a hardcoded
+// default. LM Studio discovery failures are silent and expected for any
+// other OpenAI-compatible provider — this is a best-effort convenience, not
+// a required capability.
+func DiscoverContextWindow(ctx context.Context, m ModelConfig) int {
+	if window, ok := discoverLMStudioContextWindow(ctx, m); ok {
+		return window
+	}
+	if m.ContextWindow > 0 {
+		return m.ContextWindow
+	}
+	return defaultContextWindow
+}
+
+func discoverLMStudioContextWindow(ctx context.Context, m ModelConfig) (int, bool) {
+	base := strings.TrimSuffix(strings.TrimSuffix(m.BaseURL, "/"), "/v1")
+
+	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, base+"/api/v0/models", nil)
+	if err != nil {
+		return 0, false
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, false
+	}
+
+	var parsed lmStudioModelsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return 0, false
+	}
+
+	for _, entry := range parsed.Data {
+		if entry.ID != m.Model {
+			continue
+		}
+		if entry.LoadedContextLength > 0 {
+			return entry.LoadedContextLength, true
+		}
+		if entry.MaxContextLength > 0 {
+			return entry.MaxContextLength, true
+		}
+		return 0, false
+	}
+	return 0, false
 }
