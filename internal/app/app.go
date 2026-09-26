@@ -181,7 +181,7 @@ func (m *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// line renders as its own turn, and the reply that follows the
 			// tool call starts a fresh block.
 			m.streaming = false
-			m.newLine("system", "Running "+msg.Payload+"...")
+			m.newLine("system", "```\n"+msg.Payload+"\n```")
 			return m, waitForAgentEvent(m.agentChan)
 		case "error":
 			m.streaming = false

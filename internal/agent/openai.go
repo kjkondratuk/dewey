@@ -141,7 +141,7 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 					}
 				}
 
-				ch <- Event{Kind: "tool", Payload: tc.Function.Name}
+				ch <- Event{Kind: "tool", Payload: formatToolInvocation(tc.Function.Name, tc.Function.Arguments)}
 				result, err := t.InvokableRun(ctx, tc.Function.Arguments)
 				if err != nil {
 					result = "error: " + err.Error()
@@ -180,17 +180,23 @@ func (a *openaiAgent) awaitConfirmation(ctx context.Context, ch chan<- Event, na
 	}
 }
 
-func formatConfirmMessage(name string, c safety.Classification, argsJSON string) string {
-	args := argsJSON
+func prettyPrintArgs(argsJSON string) string {
 	var buf bytes.Buffer
 	if err := json.Indent(&buf, []byte(argsJSON), "", "  "); err == nil {
-		args = buf.String()
+		return buf.String()
 	}
+	return argsJSON
+}
 
+func formatConfirmMessage(name string, c safety.Classification, argsJSON string) string {
 	kind := ""
 	if c.Kind != "" {
 		kind = " (" + strings.ToUpper(c.Kind) + ")"
 	}
 
-	return fmt.Sprintf("%s wants to run%s [risk: %s]\n%s\nAllow? [y/n]", name, kind, c.Risk, args)
+	return fmt.Sprintf("%s wants to run%s [risk: %s]\n%s\nAllow? [y/n]", name, kind, c.Risk, prettyPrintArgs(argsJSON))
+}
+
+func formatToolInvocation(name, argsJSON string) string {
+	return fmt.Sprintf("Running %s:\n%s", name, prettyPrintArgs(argsJSON))
 }
