@@ -226,7 +226,7 @@ silent truncation of a profile the user curated would be worse than the overflow
 | Either memory dir missing | Treated as empty. The global one is created lazily on first save. |
 | Malformed frontmatter | That file is skipped and reported; the rest load. |
 | Duplicate `id` across the two stores | Project wins, silently — that is the documented override mechanism, not an error. |
-| Duplicate `id` within one store | Last one wins, reported. |
+| Duplicate `id` within one store | Both load and both apply. Nothing downstream requires ids to be unique within a store, so this needs no special handling. |
 | Budget exceeded | Oldest dropped, notice surfaced. |
 | `enabled: false` | No injection, no `remember` tool registered. |
 
