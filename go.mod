@@ -9,6 +9,7 @@ require (
 	charm.land/lipgloss/v2 v2.0.6
 	github.com/cloudwego/eino v0.9.20
 	github.com/cloudwego/eino-ext/components/model/openai v0.1.13
+	github.com/pkoukk/tiktoken-go v0.1.8
 	gopkg.in/yaml.v3 v3.0.1
 )
 
