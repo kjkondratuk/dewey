@@ -173,6 +173,9 @@ func (m *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// blocked on Confirm, not on the event channel. Resumed from
 			// the pendingConfirm branch in the KeyPressMsg handler above.
 			return m, nil
+		case "compacted":
+			m.newLine("system", msg.Payload)
+			return m, waitForAgentEvent(m.agentChan)
 		case "chunk":
 			m.appendChunk(msg.Payload)
 			return m, waitForAgentEvent(m.agentChan)
