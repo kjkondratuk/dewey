@@ -37,7 +37,8 @@ func waitForAgentEvent(ch <-chan agent.Event) tea.Cmd {
 }
 
 type turn struct {
-	role string // "user" | "assistant" | "error" | "system"
+	// role selects the block style; see blockStyles.
+	role string // "user" | "assistant" | "error" | "confirm" | "denied" | "system"
 	text string // raw markdown, never pre-rendered
 }
 
@@ -51,6 +52,18 @@ var blockStyles = map[string]lipgloss.Style{
 		BorderForeground(lipgloss.Color("240")).
 		Padding(0, 1),
 	"error": lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("196")).
+		Padding(0, 1),
+	// confirm is yellow because it is the one block that is waiting on the
+	// user — it needs to read differently from passive status output.
+	"confirm": lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("220")).
+		Padding(0, 1),
+	// denied shares the error colour: scrolling back, "this did not happen"
+	// is the salient fact, whether the cause was a refusal or a failure.
+	"denied": lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("196")).
 		Padding(0, 1),
@@ -111,7 +124,7 @@ func (m *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "n":
 				m.pendingConfirm <- false
 				m.pendingConfirm = nil
-				m.newLine("system", "Denied.")
+				m.newLine("denied", "Denied.")
 				return m, m.resumeWaiting()
 			case "esc":
 				m.pendingConfirm = nil
@@ -209,6 +222,9 @@ func (m *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			input := m.Entry.Value()
 			m.newLine("user", input)
+			// Submitting is an explicit "I'm done reading back" — rejoin the
+			// tail even if the user had scrolled away.
+			m.Conversation.GotoBottom()
 			ctx, cancel := context.WithCancel(context.Background())
 			m.cancel = cancel
 			ch, err := m.Agent.Run(ctx, input)
@@ -262,7 +278,7 @@ func (m *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.disarmAbort()
 			// The agent emits complete markdown (fencing only the argument
 			// text), so render it verbatim rather than fencing it again.
-			m.newLine("system", msg.Payload)
+			m.newLine("confirm", msg.Payload)
 			// Do not resume waitForAgentEvent yet — the agent goroutine is
 			// blocked on Confirm, not on the event channel. Resumed from
 			// the pendingConfirm branch in the KeyPressMsg handler above.
@@ -303,6 +319,12 @@ func (m *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *App) render() {
+	// Follow the tail only when the user is already at it. Redrawing happens on
+	// every streamed chunk, so unconditionally jumping to the bottom made
+	// scrolling back impossible while a response was arriving.
+	follow := m.Conversation.AtBottom()
+	offset := m.Conversation.YOffset()
+
 	blocks := make([]string, len(m.turns))
 	for i, t := range m.turns {
 		text := t.text
@@ -315,7 +337,14 @@ func (m *App) render() {
 		blocks[i] = style.Width(m.width - style.GetHorizontalFrameSize()).Render(text)
 	}
 	m.Conversation.SetContent(strings.Join(blocks, "\n\n"))
-	m.Conversation.GotoBottom()
+
+	if follow {
+		m.Conversation.GotoBottom()
+		return
+	}
+	// SetContent may clamp or reset the offset, so restore it explicitly
+	// rather than assuming it survived.
+	m.Conversation.SetYOffset(offset)
 }
 
 // finishTurn clears the in-flight state and hands the input back to the user.

@@ -55,6 +55,14 @@ func key(s string) tea.KeyPressMsg {
 		return tea.KeyPressMsg{Code: tea.KeyEscape}
 	case "enter":
 		return tea.KeyPressMsg{Code: tea.KeyEnter}
+	case "up":
+		return tea.KeyPressMsg{Code: tea.KeyUp}
+	case "down":
+		return tea.KeyPressMsg{Code: tea.KeyDown}
+	case "pageup":
+		return tea.KeyPressMsg{Code: tea.KeyPgUp}
+	case "pagedown":
+		return tea.KeyPressMsg{Code: tea.KeyPgDown}
 	}
 	panic("unhandled key " + s)
 }
@@ -370,5 +378,119 @@ func TestTruncateToWidth(t *testing.T) {
 		if got := truncateToWidth(c.in, c.width); got != c.want {
 			t.Errorf("truncateToWidth(%q, %d) = %q, want %q", c.in, c.width, got, c.want)
 		}
+	}
+}
+
+func TestConfirmPromptUsesItsOwnRole(t *testing.T) {
+	f := &fakeAgent{ch: make(chan agent.Event, 8)}
+	m := newTestApp(t, f)
+	submit(t, m, "hello")
+
+	resp := make(chan bool, 1)
+	m.Update(agentEventMsg{Kind: "confirm", Payload: "allow?", Confirm: resp})
+
+	last := m.turns[len(m.turns)-1]
+	if last.role != "confirm" {
+		t.Errorf("confirm turn role = %q, want %q so it can be styled as awaiting input", last.role, "confirm")
+	}
+}
+
+func TestDenialUsesItsOwnRole(t *testing.T) {
+	f := &fakeAgent{ch: make(chan agent.Event, 8)}
+	m := newTestApp(t, f)
+	submit(t, m, "hello")
+
+	resp := make(chan bool, 1)
+	m.Update(agentEventMsg{Kind: "confirm", Payload: "allow?", Confirm: resp})
+	m.Update(key("n"))
+
+	last := m.turns[len(m.turns)-1]
+	if last.role != "denied" {
+		t.Errorf("denial turn role = %q, want %q", last.role, "denied")
+	}
+}
+
+func TestBlockStylesCoverEveryRoleInUse(t *testing.T) {
+	// A missing style renders as an unbordered block, which is easy to ship
+	// by accident when adding a role.
+	for _, role := range []string{"user", "assistant", "error", "confirm", "denied", "system"} {
+		if _, ok := blockStyles[role]; !ok {
+			t.Errorf("no block style registered for role %q", role)
+		}
+	}
+}
+
+func TestConfirmAndDeniedBordersAreDistinctFromSystem(t *testing.T) {
+	system := blockStyles["system"].GetBorderTopForeground()
+	if blockStyles["confirm"].GetBorderTopForeground() == system {
+		t.Error("confirm border matches system — a prompt awaiting input must stand out")
+	}
+	if blockStyles["denied"].GetBorderTopForeground() == system {
+		t.Error("denied border matches system — a rejection must stand out")
+	}
+	if got, want := blockStyles["denied"].GetBorderTopForeground(), blockStyles["error"].GetBorderTopForeground(); got != want {
+		t.Errorf("denied border = %v, want it to match error %v", got, want)
+	}
+}
+
+// fill adds enough turns that the conversation is taller than the viewport.
+func fill(t *testing.T, m *App, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		m.newLine("system", "line")
+	}
+}
+
+func TestScroll_PositionSurvivesARedraw(t *testing.T) {
+	f := &fakeAgent{ch: make(chan agent.Event, 8)}
+	m := newTestApp(t, f)
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 10})
+	fill(t, m, 40)
+
+	m.Update(key("up"))
+	scrolled := m.Conversation.YOffset()
+	if m.Conversation.AtBottom() {
+		t.Fatal("still at the bottom after scrolling up — test setup is wrong")
+	}
+
+	// A streamed chunk redraws; the user's position must survive it.
+	m.Update(agentEventMsg{Kind: "chunk", Payload: "more text"})
+
+	if got := m.Conversation.YOffset(); got != scrolled {
+		t.Errorf("YOffset = %d after a redraw, want %d — scroll position was discarded", got, scrolled)
+	}
+}
+
+func TestScroll_FollowsTailWhenAlreadyAtBottom(t *testing.T) {
+	f := &fakeAgent{ch: make(chan agent.Event, 8)}
+	m := newTestApp(t, f)
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 10})
+	fill(t, m, 40)
+
+	if !m.Conversation.AtBottom() {
+		t.Fatal("not at the bottom after filling")
+	}
+	m.newLine("system", "newest")
+
+	if !m.Conversation.AtBottom() {
+		t.Error("did not follow the tail while the user was already at the bottom")
+	}
+}
+
+func TestScroll_SubmittingRejoinsTheTail(t *testing.T) {
+	f := &fakeAgent{ch: make(chan agent.Event, 8)}
+	m := newTestApp(t, f)
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 10})
+	fill(t, m, 40)
+
+	m.Update(key("up"))
+	if m.Conversation.AtBottom() {
+		t.Fatal("test setup: expected to be scrolled away from the bottom")
+	}
+
+	submit(t, m, "a new question")
+
+	if !m.Conversation.AtBottom() {
+		t.Error("submitting did not return to the tail — the user can't see their own prompt")
 	}
 }
