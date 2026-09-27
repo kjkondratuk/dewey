@@ -16,6 +16,7 @@ import (
 
 	"github.com/kjkondratuk/dewey/internal/compaction"
 	"github.com/kjkondratuk/dewey/internal/safety"
+	"github.com/kjkondratuk/dewey/prompts"
 )
 
 // compactionThreshold is the fraction of the context window that triggers
@@ -26,12 +27,9 @@ const compactionThreshold = 0.90
 // It deliberately avoids the word "error" and states outright that the
 // capability exists, because the failure mode being guarded against is the
 // model reading a denial as a missing capability and reporting that it is
-// unable to perform the action at all.
-const deniedToolResult = "The user was shown this exact tool call and chose to DENY it. " +
-	"This is not an error and not a missing capability — the tool works and you are " +
-	"allowed to use it, but the user declined this specific invocation. Do not retry " +
-	"the same call. Briefly acknowledge the denial, then either propose a different " +
-	"approach or ask the user how they'd like to proceed."
+// unable to perform the action at all. The text lives in
+// prompts/tool_denied.md.
+var deniedToolResult = prompts.ToolDenied
 
 // toolResult builds a tool-result message with the originating tool's name
 // attached. Both name fields are set on purpose: eino's WithToolName only
