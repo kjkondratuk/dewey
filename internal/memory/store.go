@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -118,4 +119,52 @@ func parseMemory(filename, raw string) (Memory, error) {
 	}
 
 	return Memory{ID: id, Text: text, Org: fm.Org, Tags: fm.Tags, Created: created}, nil
+}
+
+// validIDPattern keeps an id usable as a filename inside the memory directory.
+var validIDPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+
+func (s *FileStore) Save(ctx context.Context, m Memory) error {
+	// The id becomes a path, and ids can originate from model output, so this
+	// is a containment check rather than a formatting preference.
+	if !validIDPattern.MatchString(m.ID) {
+		return fmt.Errorf("invalid memory id %q: want lowercase words joined by hyphens", m.ID)
+	}
+	if err := os.MkdirAll(s.dir, 0o755); err != nil {
+		return fmt.Errorf("creating memory dir %s: %w", s.dir, err)
+	}
+
+	var b strings.Builder
+	b.WriteString("---\n")
+	fmt.Fprintf(&b, "id: %s\n", m.ID)
+	if !m.Created.IsZero() {
+		fmt.Fprintf(&b, "created: %s\n", m.Created.Format("2006-01-02"))
+	}
+	if m.Org != "" {
+		fmt.Fprintf(&b, "org: %s\n", m.Org)
+	}
+	if len(m.Tags) > 0 {
+		fmt.Fprintf(&b, "tags: [%s]\n", strings.Join(m.Tags, ", "))
+	}
+	b.WriteString("---\n")
+	b.WriteString(strings.TrimSpace(m.Text))
+	b.WriteString("\n")
+
+	path := filepath.Join(s.dir, m.ID+".md")
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		return fmt.Errorf("writing %s: %w", path, err)
+	}
+	s.gen.Add(1)
+	return nil
+}
+
+// Revision combines an in-process write counter with the directory's mtime:
+// the counter catches this process's own saves immediately, and the mtime
+// catches a file edited by hand while a session is running.
+func (s *FileStore) Revision(ctx context.Context) string {
+	var mtime int64
+	if info, err := os.Stat(s.dir); err == nil {
+		mtime = info.ModTime().UnixNano()
+	}
+	return fmt.Sprintf("%d:%d", s.gen.Load(), mtime)
 }

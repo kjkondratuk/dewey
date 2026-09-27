@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func writeMemFile(t *testing.T, dir, name, contents string) {
@@ -100,5 +101,59 @@ func TestFileStore_IgnoresNonMarkdownFiles(t *testing.T) {
 	res, _ := NewFileStore(dir).Load(context.Background())
 	if len(res.Memories) != 1 || res.Memories[0].ID != "real" {
 		t.Errorf("Memories = %+v, want only the .md file", res.Memories)
+	}
+}
+
+func TestFileStore_SaveRoundTrips(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "created-on-demand")
+	s := NewFileStore(dir)
+
+	want := Memory{
+		ID:      "uses-mise",
+		Text:    "Pins Go with mise; the system toolchain is wrong.",
+		Org:     "acme",
+		Tags:    []string{"go"},
+		Created: time.Date(2026, 9, 27, 0, 0, 0, 0, time.UTC),
+	}
+	if err := s.Save(context.Background(), want); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	res, err := s.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(res.Memories) != 1 {
+		t.Fatalf("loaded %d memories, want 1", len(res.Memories))
+	}
+	got := res.Memories[0]
+	if got.ID != want.ID || got.Text != want.Text || got.Org != want.Org {
+		t.Errorf("round trip = %+v, want %+v", got, want)
+	}
+	if len(got.Tags) != 1 || got.Tags[0] != "go" {
+		t.Errorf("Tags = %v, want [go]", got.Tags)
+	}
+	if !got.Created.Equal(want.Created) {
+		t.Errorf("Created = %v, want %v", got.Created, want.Created)
+	}
+}
+
+func TestFileStore_SaveRejectsAnUnsafeID(t *testing.T) {
+	s := NewFileStore(t.TempDir())
+	err := s.Save(context.Background(), Memory{ID: "../escape", Text: "nope"})
+	if err == nil {
+		t.Fatal("expected an error for an id that escapes the memory directory")
+	}
+}
+
+func TestFileStore_RevisionChangesOnSave(t *testing.T) {
+	s := NewFileStore(t.TempDir())
+	before := s.Revision(context.Background())
+
+	if err := s.Save(context.Background(), Memory{ID: "x", Text: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if after := s.Revision(context.Background()); after == before {
+		t.Errorf("Revision unchanged after Save (%q) — cached memories would go stale", after)
 	}
 }
