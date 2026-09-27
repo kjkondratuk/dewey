@@ -11,6 +11,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 	"github.com/kjkondratuk/dewey/internal/agent"
 	"github.com/kjkondratuk/dewey/internal/app"
+	"github.com/kjkondratuk/dewey/internal/compaction"
 	"github.com/kjkondratuk/dewey/internal/config"
 	"github.com/kjkondratuk/dewey/internal/safety"
 	tools2 "github.com/kjkondratuk/dewey/internal/tools"
@@ -39,6 +40,8 @@ func main() {
 		log.Fatalf("failed to create simple model: %v", err)
 	}
 	classifier := safety.NewLLMClassifier(simpleModel)
+	summarizer := compaction.NewLLMSummarizer(simpleModel)
+	contextWindow := config.DiscoverContextWindow(ctx, cfg.Intermediate)
 
 	// register tools
 	tools := tools2.NewToolFactory().DefaultInvokableToolset()
@@ -55,7 +58,7 @@ func main() {
 		log.Fatalf("failed to bind tools: %v", err)
 	}
 
-	agt := agent.New(tm, tools, classifier, cfg.Overrides)
+	agt := agent.New(tm, tools, classifier, cfg.Overrides, contextWindow, summarizer)
 
 	prog := tea.NewProgram(initModel(agt))
 	_, err = prog.Run()
