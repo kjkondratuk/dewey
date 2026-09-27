@@ -4,14 +4,17 @@ Date: 2026-09-27
 
 ## Problem
 
-dewey starts every session knowing nothing about the person using it. Anything
-learned — that this machine needs `GOTOOLCHAIN=local`, that the user wants table
--driven tests, that one client's repos use a different commit convention — has to
-be re-established by hand every time, in every project.
+dewey has no memory today, so anything learned — that this machine needs
+`GOTOOLCHAIN=local`, that the user wants table-driven tests, that one client's
+repos use a different commit convention — has to be re-established by hand every
+session, in every project.
 
 The gap this fills is specifically **user-shaped** context: preferences, working
-style, and durable environment facts that customize how the agent behaves, and
-that don't belong committed inside any one project.
+style, and durable environment facts that customize how the agent behaves.
+
+Once this exists, dewey starts a session already knowing these things: memories
+are read from disk at launch, before the first prompt, not discovered during the
+conversation.
 
 ## Goals
 
@@ -24,8 +27,11 @@ that don't belong committed inside any one project.
 
 ## Non-goals
 
-- **Project knowledge** (architecture, where things live, why a decision was
-  made). That belongs in the project, and is a different lifecycle.
+- **Project documentation** — architecture notes, where things live, why a
+  decision was made. A project-local memory directory exists (see Storage), but
+  it is for behavioral conventions that should apply while working in that repo,
+  not a replacement for the project's own docs. The content guidance stays the
+  same in both locations: how to work, not what the code is.
 - **Verbatim conversation recall.** Compaction already handles in-session
   history; searchable transcripts are a separate feature.
 - **A `forget` tool.** Files are hand-editable and `rm` works. Revisit when the
@@ -55,7 +61,24 @@ day.
 
 ## Storage
 
-One memory per file under `~/.dewey/memory/*.md`:
+Memories are read from **two** locations at launch, mirroring how `config.Load`
+already merges global and project configuration:
+
+| Location | Purpose |
+|---|---|
+| `~/.dewey/memory/*.md` | Global. Travels with the user across every project. |
+| `<project>/.dewey/memory/*.md` | Project-local. Can be committed, so conventions travel with the repo and apply to anyone working in it. |
+
+Both are loaded and merged. On an `id` collision the project copy wins, matching
+the precedence config already uses — the more specific location overrides the
+more general one. Either directory may be absent.
+
+New memories written by the `remember` tool go to the **global** directory by
+default. Project-local memories are expected to be authored and committed
+deliberately rather than accumulated by the agent, so promoting one is a
+deliberate `git mv`.
+
+One memory per file, in either location:
 
 ```markdown
 ---
@@ -112,17 +135,22 @@ Project config comes first because git-remote parsing is too fragile to be the
 sole basis for an isolation guarantee, and because repos without remotes need a
 way to declare their org at all.
 
-## Immediate effect
+## Loading and refresh
 
-The selected set is assembled into the system prompt before **each** `Stream`
-call, not once at startup, so a memory saved mid-turn applies to the very next
-model call.
+Memories are loaded from disk at launch, so the first prompt of a session
+already carries them.
 
-This is backed by a cache rather than re-reading the directory every time. The
-store reports a revision; the provider reloads only when it changes. The file
-store's revision advances when it writes a memory itself, and when the memory
+They are then re-assembled into the system prompt before **each** `Stream` call
+rather than only at startup, so a memory saved mid-session takes effect on the
+very next model call instead of after a restart.
+
+This is backed by a cache rather than re-reading both directories every time.
+Each store reports a revision and the provider reloads only when it changes. A
+file store's revision advances when it writes a memory itself, and when its
 directory's modification time advances — so hand-editing a file mid-session is
-also picked up.
+picked up too. `MergedStore`'s revision advances when either underlying store's
+does, meaning an edit in the project directory is noticed just like one in the
+global directory.
 
 ## System prompt
 
@@ -164,7 +192,8 @@ failure mode is silent cross-org leakage.
 | Unit | Responsibility |
 |---|---|
 | `Memory` | The struct: ID, Text, Org, Tags, Created. |
-| `Store` | Load/Save/Revision. File-backed; skips and reports malformed files rather than failing the session. |
+| `Store` | Load/Save/Revision over a single directory. File-backed; skips and reports malformed files rather than failing the session. |
+| `MergedStore` | Composes the global and project stores: loads both, applies project-over-global precedence, writes to global, and reports a revision that advances when either changes. |
 | `Retriever` | **The seam.** `Select(memories, context) []Memory`. |
 | `TagRetriever` | The only implementation for v1. |
 | `DetectContext(cwd, projectOrg)` | Builds the context tag set and resolves the org. |
@@ -178,10 +207,14 @@ system prompt.
 ```yaml
 memory:
   enabled: true              # default true
-  dir: ~/.dewey/memory       # default
+  dir: ~/.dewey/memory       # global store; default shown
   max_tokens: 4000           # budget for the injected block
 org: acme                    # project-level, in the project's .dewey/config.yaml
 ```
+
+The project-local store is always `<projectDir>/.dewey/memory` and is not
+configurable — it sits beside the project config file that dewey already looks
+for, so there is nothing to point at.
 
 Exceeding `max_tokens` drops the oldest memories first and surfaces a notice —
 silent truncation of a profile the user curated would be worse than the overflow.
@@ -190,9 +223,10 @@ silent truncation of a profile the user curated would be worse than the overflow
 
 | Condition | Behavior |
 |---|---|
-| Memory dir missing | Treated as empty. Created lazily on first save. |
+| Either memory dir missing | Treated as empty. The global one is created lazily on first save. |
 | Malformed frontmatter | That file is skipped and reported; the rest load. |
-| Duplicate `id` | Last one wins, reported. |
+| Duplicate `id` across the two stores | Project wins, silently — that is the documented override mechanism, not an error. |
+| Duplicate `id` within one store | Last one wins, reported. |
 | Budget exceeded | Oldest dropped, notice surfaced. |
 | `enabled: false` | No injection, no `remember` tool registered. |
 
@@ -203,6 +237,9 @@ today's behavior.
 
 - Store: round-trip, frontmatter parsing, malformed-file tolerance, duplicate ids,
   missing directory, revision advancing on save.
+- MergedStore: both directories load, project overrides global on matching id,
+  either directory absent, saves land in the global store, and the revision
+  advances when either underlying store changes.
 - Selection: org gate (matching, mismatched, unknown, absent), tag intersection,
   and specifically that `[go, acme]` does **not** select under a different org.
 - Detection: each stack marker, project-config precedence over git remote, remote
