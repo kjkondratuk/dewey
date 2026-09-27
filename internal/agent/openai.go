@@ -95,9 +95,10 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 			}
 		}()
 
-		if estimated := a.estimateTokens(); a.shouldCompact(estimated) {
+		if estimated := a.estimateTokens(); truncateLen > 0 && a.shouldCompact(estimated) {
 			if err := a.compact(ctx, truncateLen); err != nil {
 				if errors.Is(err, context.Canceled) {
+					a.history = a.history[:truncateLen]
 					ch <- Event{Kind: "cancelled"}
 					return
 				}

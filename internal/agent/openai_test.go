@@ -383,3 +383,59 @@ func TestRun_CompactionFailureSurfacesAsError(t *testing.T) {
 		t.Fatalf("events = %+v, want exactly one error event", events)
 	}
 }
+
+func TestRun_CancelDuringCompactionRollsBackHistory(t *testing.T) {
+	invoked := 0
+	tl := newRecordingTool(t, &invoked)
+	m := &fakeStreamModel{responses: [][]*schema.Message{}}
+	fakeSumm := &fakeSummarizer{err: context.Canceled}
+
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 10, fakeSumm)
+	agt.history = []*schema.Message{
+		{Role: schema.User, Content: strings.Repeat("filler content ", 200)},
+	}
+	preRunLen := len(agt.history)
+
+	ch, err := agt.Run(context.Background(), "continue")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	var events []Event
+	for evt := range ch {
+		events = append(events, evt)
+	}
+
+	if len(events) != 1 || events[0].Kind != "cancelled" {
+		t.Fatalf("events = %+v, want exactly one cancelled event", events)
+	}
+	if len(agt.history) != preRunLen {
+		t.Errorf("history len = %d, want %d (rolled back, as if the turn never happened)", len(agt.history), preRunLen)
+	}
+}
+
+func TestRun_SkipsCompactionOnFirstTurn(t *testing.T) {
+	m := &fakeStreamModel{responses: [][]*schema.Message{
+		finalResponse("done"),
+	}}
+	fakeSumm := &fakeSummarizer{result: "should not be used"}
+
+	// contextWindow of 1 guarantees even a tiny first message would trip
+	// shouldCompact if truncateLen==0 weren't special-cased.
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 1, fakeSumm)
+
+	ch, err := agt.Run(context.Background(), strings.Repeat("filler content ", 200))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events := drain(t, ch, func(Event) bool { return true })
+
+	for _, e := range events {
+		if e.Kind == "compacted" {
+			t.Errorf("got compacted event on first turn (truncateLen=0): %+v", e)
+		}
+	}
+	if fakeSumm.lastMsg != nil {
+		t.Errorf("summarizer was invoked on first turn, want it skipped entirely")
+	}
+}
