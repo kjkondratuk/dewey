@@ -21,7 +21,8 @@ const classifierSystemPrompt = `You are a safety classifier for an autonomous ag
 Given a tool name, its description, and the exact arguments it is about to be called with, decide:
 - "kind": "read" if the call only observes state, "write" if it can change state (files, network resources, external systems).
 - "risk": "safe" for read-only or clearly inconsequential actions, "moderate" for reversible writes with limited blast radius, "dangerous" for irreversible, destructive, or wide-blast-radius actions.
-Respond with ONLY a single JSON object of the form {"kind":"read"|"write","risk":"safe"|"moderate"|"dangerous"}. No other text, no markdown fences.`
+- "summary": one short sentence of plain English describing what this call does and what it would change. Write it for someone who cannot read shell syntax: name the effect, not the flags. No jargon, and do not quote the command back.
+Respond with ONLY a single JSON object of the form {"kind":"read"|"write","risk":"safe"|"moderate"|"dangerous","summary":"..."}. No other text, no markdown fences.`
 
 // failSafeClassification is returned whenever classification cannot be
 // trusted — a model error, a malformed response, or an unrecognized field
@@ -70,8 +71,9 @@ func parseClassification(raw string) (Classification, error) {
 	}
 
 	var parsed struct {
-		Kind string `json:"kind"`
-		Risk string `json:"risk"`
+		Kind    string `json:"kind"`
+		Risk    string `json:"risk"`
+		Summary string `json:"summary"`
 	}
 	if err := json.Unmarshal([]byte(raw[start:end+1]), &parsed); err != nil {
 		return Classification{}, fmt.Errorf("invalid classifier JSON: %w", err)
@@ -86,5 +88,12 @@ func parseClassification(raw string) (Classification, error) {
 		return Classification{}, fmt.Errorf("unrecognized classifier risk: %w", err)
 	}
 
-	return Classification{Kind: parsed.Kind, Risk: risk}, nil
+	// Summary is deliberately not validated: it is cosmetic, so a model that
+	// omits it should still produce a usable classification rather than being
+	// forced down the fail-safe path.
+	return Classification{
+		Kind:    parsed.Kind,
+		Risk:    risk,
+		Summary: strings.TrimSpace(parsed.Summary),
+	}, nil
 }

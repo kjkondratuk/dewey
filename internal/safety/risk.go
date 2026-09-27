@@ -50,6 +50,13 @@ type Classification struct {
 	// override rather than the classifier.
 	Kind string
 	Risk RiskTier
+
+	// Summary is a one-sentence plain-English description of what the call
+	// does, shown in the confirmation prompt so a user who can't read the
+	// tool's argument syntax can still evaluate it. Cosmetic and
+	// best-effort: empty when the classification came from a config
+	// override, from the fail-safe path, or when the model omitted it.
+	Summary string
 }
 
 // RiskOverrides pins specific tool names to a fixed RiskTier, bypassing the

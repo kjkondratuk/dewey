@@ -112,3 +112,60 @@ func TestLLMClassifier_UnrecognizedRiskFailsSafe(t *testing.T) {
 		t.Errorf("Classify() = %+v, want fail-safe %+v", got, failSafeClassification)
 	}
 }
+
+func TestLLMClassifier_ParsesAndTrimsSummary(t *testing.T) {
+	classifier := NewLLMClassifier(&fakeGenerateModel{
+		content: `{"kind":"write","risk":"dangerous","summary":"  Deletes the build output directory.  "}`,
+	})
+
+	got, err := classifier.Classify(context.Background(), "run_shell_command", "runs a shell command", `{"command":"rm -rf ./dist"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := Classification{Kind: "write", Risk: Dangerous, Summary: "Deletes the build output directory."}
+	if got != want {
+		t.Errorf("Classify() = %+v, want %+v", got, want)
+	}
+}
+
+// Summary is cosmetic, so its absence must not drag the classification down
+// the fail-safe path the way a bad kind or risk does.
+func TestLLMClassifier_MissingSummaryIsNotFatal(t *testing.T) {
+	classifier := NewLLMClassifier(&fakeGenerateModel{content: `{"kind":"read","risk":"safe"}`})
+
+	got, err := classifier.Classify(context.Background(), "run_shell_command", "runs a shell command", `{"command":"ls"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := Classification{Kind: "read", Risk: Safe}
+	if got != want {
+		t.Errorf("Classify() = %+v, want %+v (summary absent but kind/risk intact)", got, want)
+	}
+}
+
+func TestLLMClassifier_EmptySummaryIsNotFatal(t *testing.T) {
+	classifier := NewLLMClassifier(&fakeGenerateModel{content: `{"kind":"write","risk":"moderate","summary":"   "}`})
+
+	got, err := classifier.Classify(context.Background(), "run_shell_command", "runs a shell command", `{"command":"touch f"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Risk != Moderate || got.Kind != "write" || got.Summary != "" {
+		t.Errorf("Classify() = %+v, want write/moderate with an empty summary", got)
+	}
+}
+
+// A summary must not rescue an otherwise-invalid classification.
+func TestLLMClassifier_BadKindStillFailsSafeDespiteSummary(t *testing.T) {
+	classifier := NewLLMClassifier(&fakeGenerateModel{
+		content: `{"kind":"maybe","risk":"safe","summary":"Lists files."}`,
+	})
+
+	got, err := classifier.Classify(context.Background(), "run_shell_command", "runs a shell command", `{"command":"ls"}`)
+	if err == nil {
+		t.Fatal("expected an error for an unrecognized kind")
+	}
+	if got != failSafeClassification {
+		t.Errorf("Classify() = %+v, want the fail-safe classification %+v", got, failSafeClassification)
+	}
+}
