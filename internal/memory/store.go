@@ -84,6 +84,29 @@ func (s *FileStore) Load(ctx context.Context) (LoadResult, error) {
 	return res, nil
 }
 
+// frontmatterEnd locates the closing fence: the first line that is exactly
+// "---". Accepting any line merely starting with "---" would cut the block at
+// a four-dash fence typo or at a dashed line inside the YAML, yielding a body
+// with a stray dash rather than an error the user can act on. Returns where
+// the YAML ends and where the body begins, or -1 if the fence never closes.
+func frontmatterEnd(rest string) (yamlEnd, bodyStart int) {
+	for i := 0; ; {
+		j := strings.Index(rest[i:], "\n---")
+		if j < 0 {
+			return -1, -1
+		}
+		end := i + j
+		after := end + len("\n---")
+		if after == len(rest) {
+			return end, after
+		}
+		if rest[after] == '\n' {
+			return end, after + 1
+		}
+		i = end + 1
+	}
+}
+
 // parseMemory splits a memory file into its YAML frontmatter and prose body.
 func parseMemory(filename, raw string) (Memory, error) {
 	body := raw
@@ -91,14 +114,14 @@ func parseMemory(filename, raw string) (Memory, error) {
 
 	if strings.HasPrefix(raw, "---\n") {
 		rest := raw[len("---\n"):]
-		end := strings.Index(rest, "\n---")
+		end, bodyStart := frontmatterEnd(rest)
 		if end < 0 {
 			return Memory{}, fmt.Errorf("frontmatter is never closed")
 		}
 		if err := yaml.Unmarshal([]byte(rest[:end]), &fm); err != nil {
 			return Memory{}, fmt.Errorf("invalid frontmatter: %w", err)
 		}
-		body = strings.TrimPrefix(rest[end+len("\n---"):], "\n")
+		body = rest[bodyStart:]
 	}
 
 	id := fm.ID

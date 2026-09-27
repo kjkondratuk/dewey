@@ -93,6 +93,46 @@ func TestFileStore_MissingIDFallsBackToFilename(t *testing.T) {
 	}
 }
 
+// A "----" rule is a normal way to open a body, and the fence above it has
+// already done its job by then. This one is a guard rather than a regression:
+// it held before the terminator was tightened too.
+func TestFileStore_BodyMayOpenWithAHorizontalRule(t *testing.T) {
+	dir := t.TempDir()
+	writeMemFile(t, dir, "ruled.md", "---\nid: ruled\ntags: [go]\n---\n----\nPrefers ASCII rules.\n")
+
+	res, _ := NewFileStore(dir).Load(context.Background())
+	if len(res.Memories) != 1 {
+		t.Fatalf("loaded %d memories, want 1 (skipped: %+v)", len(res.Memories), res.Skipped)
+	}
+	m := res.Memories[0]
+	if len(m.Tags) != 1 || m.Tags[0] != "go" {
+		t.Errorf("Tags = %v, want [go]", m.Tags)
+	}
+	if m.Text != "----\nPrefers ASCII rules." {
+		t.Errorf("Text = %q, want the body including its leading rule", m.Text)
+	}
+}
+
+// A fence typed with four dashes never closes the frontmatter. Matching any
+// line that merely starts with "---" turned that typo into a memory whose text
+// carried the leftover dash, so the user got a subtly corrupted preference and
+// no indication anything was wrong. Refusing the file surfaces it instead.
+func TestFileStore_UnclosedFrontmatterIsReportedNotMangled(t *testing.T) {
+	dir := t.TempDir()
+	writeMemFile(t, dir, "typo.md", "---\nid: typo\ntags: [go]\n----\nPins Go with mise.\n")
+
+	res, err := NewFileStore(dir).Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(res.Memories) != 0 {
+		t.Errorf("Memories = %+v, want none — the frontmatter is never closed", res.Memories)
+	}
+	if len(res.Skipped) != 1 || res.Skipped[0].File != "typo.md" {
+		t.Fatalf("Skipped = %+v, want typo.md reported", res.Skipped)
+	}
+}
+
 func TestFileStore_IgnoresNonMarkdownFiles(t *testing.T) {
 	dir := t.TempDir()
 	writeMemFile(t, dir, "notes.txt", "not a memory")
