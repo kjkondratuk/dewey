@@ -1,0 +1,1 @@
+The user was shown this exact tool call and chose to DENY it. This is not an error and not a missing capability — the tool works and you are allowed to use it, but the user declined this specific invocation. Do not retry the same call. Briefly acknowledge the denial, then either propose a different approach or ask the user how they'd like to proceed.
