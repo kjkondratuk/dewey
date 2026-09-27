@@ -188,14 +188,30 @@ func TestRun_DenialSkipsToolAndFeedsHistoryBack(t *testing.T) {
 		t.Errorf("last event = %+v, want done", events[len(events)-1])
 	}
 
-	found := false
+	var denial *schema.Message
 	for _, msg := range agt.history {
-		if msg.Role == schema.Tool && msg.Content == "error: user denied permission for this action" {
-			found = true
+		if msg.Role == schema.Tool && msg.Content == deniedToolResult {
+			denial = msg
 		}
 	}
-	if !found {
-		t.Error("expected a denial tool message in history")
+	if denial == nil {
+		t.Fatal("expected a denial tool message in history")
+	}
+	if denial.ToolName != "do_thing" {
+		t.Errorf("denial ToolName = %q, want %q", denial.ToolName, "do_thing")
+	}
+}
+
+// The model must be able to tell "you were told no" apart from "you can't do
+// this" — reading a denial as a missing capability is the bug this guards.
+func TestDeniedToolResult_ReadsAsADecisionNotACapabilityError(t *testing.T) {
+	if strings.Contains(strings.ToLower(deniedToolResult), "error:") {
+		t.Errorf("deniedToolResult should not look like a tool error: %q", deniedToolResult)
+	}
+	for _, want := range []string{"DENY", "not a missing capability", "allowed to use it"} {
+		if !strings.Contains(deniedToolResult, want) {
+			t.Errorf("deniedToolResult missing %q: %q", want, deniedToolResult)
+		}
 	}
 }
 
@@ -437,5 +453,171 @@ func TestRun_SkipsCompactionOnFirstTurn(t *testing.T) {
 	}
 	if fakeSumm.lastMsg != nil {
 		t.Errorf("summarizer was invoked on first turn, want it skipped entirely")
+	}
+}
+
+func TestDescribeArgs_UnwrapsALoneStringArgument(t *testing.T) {
+	got := describeArgs(`{"command":"grep -rn foo ."}`)
+	if got != "grep -rn foo ." {
+		t.Errorf("describeArgs() = %q, want the bare command", got)
+	}
+}
+
+func TestDescribeArgs_PreservesRealNewlines(t *testing.T) {
+	got := describeArgs(`{"command":"line one\nline two"}`)
+	if got != "line one\nline two" {
+		t.Errorf("describeArgs() = %q, want real newlines, not escaped ones", got)
+	}
+	if strings.Contains(got, `\n`) {
+		t.Errorf("describeArgs() = %q, still contains an escaped newline", got)
+	}
+}
+
+func TestDescribeArgs_FallsBackToJSONForMultipleFields(t *testing.T) {
+	got := describeArgs(`{"a":"1","b":"2"}`)
+	if !strings.Contains(got, `"a"`) || !strings.Contains(got, `"b"`) {
+		t.Errorf("describeArgs() = %q, want indented JSON keeping both fields", got)
+	}
+}
+
+func TestDescribeArgs_FallsBackForNonStringAndMalformedInput(t *testing.T) {
+	if got := describeArgs(`{"n":5}`); !strings.Contains(got, "5") {
+		t.Errorf("describeArgs() = %q, want the number preserved via JSON fallback", got)
+	}
+	if got := describeArgs(`not json at all`); got != "not json at all" {
+		t.Errorf("describeArgs() = %q, want the raw input echoed back", got)
+	}
+}
+
+func TestFence_OutgrowsBackticksInTheBody(t *testing.T) {
+	body := "echo '```'"
+	got := fence(body)
+	if !strings.HasPrefix(got, "````") {
+		t.Errorf("fence() = %q, want a delimiter longer than the body's backtick run", got)
+	}
+	if !strings.Contains(got, body) {
+		t.Errorf("fence() = %q, want it to contain the body verbatim", got)
+	}
+}
+
+func TestFence_UsesThreeBackticksWhenBodyHasNone(t *testing.T) {
+	got := fence("ls -la")
+	if got != "```\nls -la\n```" {
+		t.Errorf("fence() = %q, want a plain triple-backtick fence", got)
+	}
+}
+
+func TestFormatConfirmMessage_IncludesSummaryAndBareCommand(t *testing.T) {
+	c := safety.Classification{Kind: "write", Risk: safety.Dangerous, Summary: "Deletes the build output directory."}
+	got := formatConfirmMessage("run_shell_command", c, `{"command":"rm -rf ./dist"}`)
+
+	for _, want := range []string{
+		"run_shell_command wants to run (WRITE) [risk: dangerous]",
+		"Deletes the build output directory.",
+		"rm -rf ./dist",
+		"Allow? [y/n]",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("formatConfirmMessage() = %q, missing %q", got, want)
+		}
+	}
+	if strings.Contains(got, `{"command"`) {
+		t.Errorf("formatConfirmMessage() = %q, should not show the raw JSON object", got)
+	}
+}
+
+func TestFormatConfirmMessage_OmitsSummaryLineWhenEmpty(t *testing.T) {
+	c := safety.Classification{Risk: safety.Moderate}
+	got := formatConfirmMessage("run_shell_command", c, `{"command":"touch f"}`)
+
+	if strings.Contains(got, "\n\n\n") {
+		t.Errorf("formatConfirmMessage() = %q, left a blank gap where the summary would go", got)
+	}
+	if !strings.Contains(got, "touch f") || !strings.Contains(got, "Allow? [y/n]") {
+		t.Errorf("formatConfirmMessage() = %q, missing the command or the prompt", got)
+	}
+}
+
+func TestRun_ApprovedCallEmitsBriefInvocationAndSafeCallEmitsFull(t *testing.T) {
+	// Approved: the command was already shown in the confirm prompt.
+	invoked := 0
+	tl := newRecordingTool(t, &invoked)
+	m := &fakeStreamModel{responses: [][]*schema.Message{
+		toolCallResponse("do_thing", `{"command":"rm -rf ./dist"}`),
+		finalResponse("done"),
+	}}
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Kind: "write", Risk: safety.Dangerous}}, nil, 0, nil)
+
+	ch, err := agt.Run(context.Background(), "go")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events := drain(t, ch, func(Event) bool { return true }) // allow
+
+	var toolPayload string
+	for _, e := range events {
+		if e.Kind == "tool" {
+			toolPayload = e.Payload
+		}
+	}
+	if toolPayload != formatToolInvocationBrief() {
+		t.Errorf("approved tool payload = %q, want the brief form %q", toolPayload, formatToolInvocationBrief())
+	}
+	if strings.Contains(toolPayload, "rm -rf ./dist") {
+		t.Errorf("approved tool payload = %q, should not repeat the just-approved command", toolPayload)
+	}
+
+	// Safe (auto-run): never shown, so the command has to appear here.
+	invoked2 := 0
+	tl2 := newRecordingTool(t, &invoked2)
+	m2 := &fakeStreamModel{responses: [][]*schema.Message{
+		toolCallResponse("do_thing", `{"command":"ls -la"}`),
+		finalResponse("done"),
+	}}
+	agt2 := New(m2, []tool.InvokableTool{tl2}, &fakeClassifier{result: safety.Classification{Kind: "read", Risk: safety.Safe}}, nil, 0, nil)
+
+	ch2, err := agt2.Run(context.Background(), "go")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events2 := drain(t, ch2, func(Event) bool { return true })
+
+	var toolPayload2 string
+	for _, e := range events2 {
+		if e.Kind == "tool" {
+			toolPayload2 = e.Payload
+		}
+	}
+	if !strings.Contains(toolPayload2, "ls -la") {
+		t.Errorf("safe tool payload = %q, want it to show the command", toolPayload2)
+	}
+}
+
+func TestRun_SuccessfulToolResultCarriesToolName(t *testing.T) {
+	invoked := 0
+	tl := newRecordingTool(t, &invoked)
+	m := &fakeStreamModel{responses: [][]*schema.Message{
+		toolCallResponse("do_thing", `{"x":"1"}`),
+		finalResponse("done"),
+	}}
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Kind: "read", Risk: safety.Safe}}, nil, 0, nil)
+
+	ch, err := agt.Run(context.Background(), "go")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	drain(t, ch, func(Event) bool { return true })
+
+	found := false
+	for _, msg := range agt.history {
+		if msg.Role == schema.Tool {
+			found = true
+			if msg.ToolName != "do_thing" {
+				t.Errorf("tool result ToolName = %q, want %q", msg.ToolName, "do_thing")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no tool result found in history")
 	}
 }

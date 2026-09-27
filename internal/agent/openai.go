@@ -22,6 +22,17 @@ import (
 // automatic compaction.
 const compactionThreshold = 0.90
 
+// deniedToolResult is what the model sees when the user declines a tool call.
+// It deliberately avoids the word "error" and states outright that the
+// capability exists, because the failure mode being guarded against is the
+// model reading a denial as a missing capability and reporting that it is
+// unable to perform the action at all.
+const deniedToolResult = "The user was shown this exact tool call and chose to DENY it. " +
+	"This is not an error and not a missing capability — the tool works and you are " +
+	"allowed to use it, but the user declined this specific invocation. Do not retry " +
+	"the same call. Briefly acknowledge the denial, then either propose a different " +
+	"approach or ask the user how they'd like to proceed."
+
 type openaiAgent struct {
 	cm         model.ToolCallingChatModel
 	tools      map[string]tool.InvokableTool
@@ -160,13 +171,19 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 
 			// resolve all tool calls
 			for _, tc := range full.ToolCalls {
+				named := schema.WithToolName(tc.Function.Name)
+
 				t, ok := a.tools[tc.Function.Name]
 				if !ok {
 					a.history = append(a.history, schema.ToolMessage(
-						"error: unknown tool "+tc.Function.Name, tc.ID))
+						"error: unknown tool "+tc.Function.Name, tc.ID, named))
 					continue
 				}
 
+				// confirmed records whether the user was just shown this exact
+				// call and approved it, so the status line below doesn't repeat
+				// a command that's already on screen.
+				confirmed := false
 				classification := a.classify(ctx, tc.Function.Name, tc.Function.Arguments)
 				if classification.Risk != safety.Safe {
 					allowed, cancelled := a.awaitConfirmation(ctx, ch, tc.Function.Name, classification, tc.Function.Arguments)
@@ -176,18 +193,23 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 						return
 					}
 					if !allowed {
-						a.history = append(a.history, schema.ToolMessage(
-							"error: user denied permission for this action", tc.ID))
+						a.history = append(a.history, schema.ToolMessage(deniedToolResult, tc.ID, named))
 						continue
 					}
+					confirmed = true
 				}
 
-				ch <- Event{Kind: "tool", Payload: formatToolInvocation(tc.Function.Name, tc.Function.Arguments)}
+				if confirmed {
+					ch <- Event{Kind: "tool", Payload: formatToolInvocationBrief()}
+				} else {
+					ch <- Event{Kind: "tool", Payload: formatToolInvocation(tc.Function.Name, tc.Function.Arguments)}
+				}
+
 				result, err := t.InvokableRun(ctx, tc.Function.Arguments)
 				if err != nil {
 					result = "error: " + err.Error()
 				}
-				a.history = append(a.history, schema.ToolMessage(result, tc.ID))
+				a.history = append(a.history, schema.ToolMessage(result, tc.ID, named))
 			}
 			// loop back around and stream again with tool results in history
 		}
@@ -282,8 +304,52 @@ func prettyPrintArgs(argsJSON string) string {
 	return argsJSON
 }
 
+// describeArgs renders tool arguments for a human reader. A lone string
+// argument — the shape of run_shell_command's {"command": "..."} — is returned
+// bare, so a command reads as a command, with real newlines instead of
+// JSON-escaped ones. Anything else falls back to indented JSON rather than
+// risk silently dropping fields.
+func describeArgs(argsJSON string) string {
+	var fields map[string]any
+	if err := json.Unmarshal([]byte(argsJSON), &fields); err == nil && len(fields) == 1 {
+		for _, v := range fields {
+			if s, ok := v.(string); ok {
+				return strings.TrimRight(s, "\n")
+			}
+		}
+	}
+	return prettyPrintArgs(argsJSON)
+}
+
+// fence wraps body in a code fence long enough that no backtick run inside it
+// can terminate the block early — tool arguments are arbitrary text, and a
+// command containing a fence would otherwise break out into the surrounding
+// markdown.
+func fence(body string) string {
+	longest, run := 0, 0
+	for _, r := range body {
+		if r != '`' {
+			run = 0
+			continue
+		}
+		run++
+		if run > longest {
+			longest = run
+		}
+	}
+	delim := strings.Repeat("`", max(3, longest+1))
+	return delim + "\n" + body + "\n" + delim
+}
+
 func formatToolInvocation(name, argsJSON string) string {
-	return fmt.Sprintf("Running %s:\n%s", name, prettyPrintArgs(argsJSON))
+	return fmt.Sprintf("Running %s:\n%s", name, fence(describeArgs(argsJSON)))
+}
+
+// formatToolInvocationBrief is used when the user just approved this exact
+// call. The command is already on screen immediately above, so repeating it
+// only adds noise.
+func formatToolInvocationBrief() string {
+	return "Running…"
 }
 
 func formatConfirmMessage(name string, c safety.Classification, argsJSON string) string {
@@ -292,5 +358,13 @@ func formatConfirmMessage(name string, c safety.Classification, argsJSON string)
 		kind = " (" + strings.ToUpper(c.Kind) + ")"
 	}
 
-	return fmt.Sprintf("%s wants to run%s [risk: %s]\n%s\nAllow? [y/n]", name, kind, c.Risk, prettyPrintArgs(argsJSON))
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s wants to run%s [risk: %s]\n", name, kind, c.Risk)
+	if c.Summary != "" {
+		fmt.Fprintf(&b, "\n%s\n", c.Summary)
+	}
+	b.WriteString("\n")
+	b.WriteString(fence(describeArgs(argsJSON)))
+	b.WriteString("\nAllow? [y/n]")
+	return b.String()
 }
