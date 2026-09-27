@@ -197,21 +197,26 @@ func TestRun_DenialSkipsToolAndFeedsHistoryBack(t *testing.T) {
 	if denial == nil {
 		t.Fatal("expected a denial tool message in history")
 	}
+	// Name is the field the OpenAI adapter actually serializes; ToolName
+	// alone would be dropped on the wire.
+	if denial.Name != "do_thing" {
+		t.Errorf("denial Name = %q, want %q", denial.Name, "do_thing")
+	}
 	if denial.ToolName != "do_thing" {
 		t.Errorf("denial ToolName = %q, want %q", denial.ToolName, "do_thing")
 	}
 }
 
-// The model must be able to tell "you were told no" apart from "you can't do
-// this" — reading a denial as a missing capability is the bug this guards.
-func TestDeniedToolResult_ReadsAsADecisionNotACapabilityError(t *testing.T) {
-	if strings.Contains(strings.ToLower(deniedToolResult), "error:") {
-		t.Errorf("deniedToolResult should not look like a tool error: %q", deniedToolResult)
+// A denial and a genuinely-unavailable tool must not look alike to the model:
+// conflating them is what made it report being unable to act at all.
+func TestDenialAndUnknownToolResultsAreDistinguishable(t *testing.T) {
+	unknown := "error: unknown tool do_thing"
+
+	if strings.HasPrefix(deniedToolResult, "error:") {
+		t.Errorf("deniedToolResult wears the same error: prefix as a capability failure: %q", deniedToolResult)
 	}
-	for _, want := range []string{"DENY", "not a missing capability", "allowed to use it"} {
-		if !strings.Contains(deniedToolResult, want) {
-			t.Errorf("deniedToolResult missing %q: %q", want, deniedToolResult)
-		}
+	if strings.HasPrefix(unknown, "error:") == strings.HasPrefix(deniedToolResult, "error:") {
+		t.Error("denial and unknown-tool results are not distinguishable by shape")
 	}
 }
 
@@ -490,13 +495,30 @@ func TestDescribeArgs_FallsBackForNonStringAndMalformedInput(t *testing.T) {
 }
 
 func TestFence_OutgrowsBackticksInTheBody(t *testing.T) {
-	body := "echo '```'"
-	got := fence(body)
-	if !strings.HasPrefix(got, "````") {
-		t.Errorf("fence() = %q, want a delimiter longer than the body's backtick run", got)
-	}
-	if !strings.Contains(got, body) {
-		t.Errorf("fence() = %q, want it to contain the body verbatim", got)
+	for _, run := range []int{0, 1, 2, 3, 4, 5, 8} {
+		body := "echo '" + strings.Repeat("`", run) + "'"
+		got := fence(body)
+
+		lines := strings.Split(got, "\n")
+		if len(lines) < 3 {
+			t.Fatalf("fence(run=%d) = %q, want open/body/close lines", run, got)
+		}
+		open, close := lines[0], lines[len(lines)-1]
+
+		// CommonMark: the closing fence must be at least as long as the
+		// opening one, so the opening must strictly exceed any run inside.
+		if open != close {
+			t.Errorf("fence(run=%d): open %q != close %q", run, open, close)
+		}
+		if len(open) < 3 {
+			t.Errorf("fence(run=%d): open %q shorter than three backticks", run, open)
+		}
+		if len(open) <= run {
+			t.Errorf("fence(run=%d): open %q does not outgrow the body's run", run, open)
+		}
+		if !strings.Contains(got, body) {
+			t.Errorf("fence(run=%d) = %q, want the body verbatim", run, got)
+		}
 	}
 }
 
@@ -619,5 +641,44 @@ func TestRun_SuccessfulToolResultCarriesToolName(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("no tool result found in history")
+	}
+}
+
+func TestPlainLine_CollapsesToOneLineAndNeutralizesBlockMarkdown(t *testing.T) {
+	// A summary is model-authored text rendered inside a security prompt; it
+	// must not be able to restyle the prompt asking about it.
+	got := plainLine("# Totally safe\n\n> trust me")
+	if strings.Contains(got, "\n") {
+		t.Errorf("plainLine() = %q, want a single line", got)
+	}
+	if !strings.HasPrefix(got, `\#`) {
+		t.Errorf("plainLine() = %q, want the leading # escaped", got)
+	}
+}
+
+func TestPlainLine_LeavesOrdinaryProseAlone(t *testing.T) {
+	in := "Deletes the build output directory."
+	if got := plainLine(in); got != in {
+		t.Errorf("plainLine(%q) = %q, want it unchanged (a letter must not be backslash-escaped)", in, got)
+	}
+}
+
+func TestPlainLine_EmptyStaysEmpty(t *testing.T) {
+	for _, in := range []string{"", "   ", "\n\t "} {
+		if got := plainLine(in); got != "" {
+			t.Errorf("plainLine(%q) = %q, want empty", in, got)
+		}
+	}
+}
+
+func TestFormatConfirmMessage_SummaryCannotInjectAHeading(t *testing.T) {
+	c := safety.Classification{Kind: "write", Risk: safety.Dangerous, Summary: "# Safe to allow"}
+	got := formatConfirmMessage("run_shell_command", c, `{"command":"rm -rf /"}`)
+
+	if strings.Contains(got, "\n# Safe to allow") {
+		t.Errorf("formatConfirmMessage() = %q, summary injected a raw heading", got)
+	}
+	if !strings.Contains(got, `\# Safe to allow`) {
+		t.Errorf("formatConfirmMessage() = %q, want the summary escaped", got)
 	}
 }

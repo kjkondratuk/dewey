@@ -33,6 +33,16 @@ const deniedToolResult = "The user was shown this exact tool call and chose to D
 	"the same call. Briefly acknowledge the denial, then either propose a different " +
 	"approach or ask the user how they'd like to proceed."
 
+// toolResult builds a tool-result message with the originating tool's name
+// attached. Both name fields are set on purpose: eino's WithToolName only
+// populates Message.ToolName, but the OpenAI adapter serializes Message.Name,
+// so setting either one alone silently drops the attribution on the wire.
+func toolResult(content, toolCallID, toolName string) *schema.Message {
+	msg := schema.ToolMessage(content, toolCallID, schema.WithToolName(toolName))
+	msg.Name = toolName
+	return msg
+}
+
 type openaiAgent struct {
 	cm         model.ToolCallingChatModel
 	tools      map[string]tool.InvokableTool
@@ -139,8 +149,12 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 				}
 				if errors.Is(err, context.Canceled) {
 					sr.Close()
-					// drop the user turn too, as if the question was never asked
-					a.history = a.history[:len(a.history)-1]
+					// Roll the whole turn back, as if the question was never
+					// asked. Dropping just the last message is only equivalent
+					// on the first pass: cancelling during a later model turn
+					// would strip one tool result and leave an assistant
+					// message with orphaned ToolCalls, which the API rejects.
+					a.history = a.history[:truncateLen]
 					ch <- Event{Kind: "cancelled"}
 					return
 				}
@@ -171,12 +185,10 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 
 			// resolve all tool calls
 			for _, tc := range full.ToolCalls {
-				named := schema.WithToolName(tc.Function.Name)
-
 				t, ok := a.tools[tc.Function.Name]
 				if !ok {
-					a.history = append(a.history, schema.ToolMessage(
-						"error: unknown tool "+tc.Function.Name, tc.ID, named))
+					a.history = append(a.history, toolResult(
+						"error: unknown tool "+tc.Function.Name, tc.ID, tc.Function.Name))
 					continue
 				}
 
@@ -193,7 +205,7 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 						return
 					}
 					if !allowed {
-						a.history = append(a.history, schema.ToolMessage(deniedToolResult, tc.ID, named))
+						a.history = append(a.history, toolResult(deniedToolResult, tc.ID, tc.Function.Name))
 						continue
 					}
 					confirmed = true
@@ -209,7 +221,7 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 				if err != nil {
 					result = "error: " + err.Error()
 				}
-				a.history = append(a.history, schema.ToolMessage(result, tc.ID, named))
+				a.history = append(a.history, toolResult(result, tc.ID, tc.Function.Name))
 			}
 			// loop back around and stream again with tool results in history
 		}
@@ -341,6 +353,30 @@ func fence(body string) string {
 	return delim + "\n" + body + "\n" + delim
 }
 
+// plainLine flattens model-authored text into a single line that can't take
+// over the markdown around it. The classifier's summary is untrusted output
+// rendered inside a security prompt, so it should describe the command, not
+// restyle the prompt asking about it.
+func plainLine(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if s == "" {
+		return ""
+	}
+	// Collapsing to one line already removes every interior line start, so
+	// block constructs (headings, lists, quotes, fences) can only trigger
+	// from the very first character. Escape it when it's punctuation —
+	// CommonMark only permits backslash-escaping ASCII punctuation, so doing
+	// this unconditionally would leave a literal backslash before a letter.
+	if isASCIIPunct(s[0]) {
+		return `\` + s
+	}
+	return s
+}
+
+func isASCIIPunct(b byte) bool {
+	return strings.IndexByte("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", b) >= 0
+}
+
 func formatToolInvocation(name, argsJSON string) string {
 	return fmt.Sprintf("Running %s:\n%s", name, fence(describeArgs(argsJSON)))
 }
@@ -360,8 +396,8 @@ func formatConfirmMessage(name string, c safety.Classification, argsJSON string)
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s wants to run%s [risk: %s]\n", name, kind, c.Risk)
-	if c.Summary != "" {
-		fmt.Fprintf(&b, "\n%s\n", c.Summary)
+	if summary := plainLine(c.Summary); summary != "" {
+		fmt.Fprintf(&b, "\n%s\n", summary)
 	}
 	b.WriteString("\n")
 	b.WriteString(fence(describeArgs(argsJSON)))

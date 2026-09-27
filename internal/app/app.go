@@ -21,8 +21,10 @@ const abortArmWindow = 1500 * time.Millisecond
 type agentEventMsg agent.Event
 
 // abortDisarmMsg fires when a first escape has gone unanswered long enough
-// that it should no longer arm an abort.
-type abortDisarmMsg struct{}
+// that it should no longer arm an abort. gen identifies which arming it
+// belongs to: a timer from an earlier arm must not disarm a later one, or a
+// genuine double-press can be silently swallowed.
+type abortDisarmMsg struct{ gen int }
 
 func waitForAgentEvent(ch <-chan agent.Event) tea.Cmd {
 	return func() tea.Msg {
@@ -76,8 +78,11 @@ type App struct {
 	// from racing the first one on the agent's history.
 	busy bool
 	// abortArmed is set by a first escape press while busy; a second press
-	// within abortArmWindow cancels the turn.
+	// within abortArmWindow cancels the turn. abortGen invalidates the
+	// pending disarm timer whenever the armed state changes for any other
+	// reason.
 	abortArmed    bool
+	abortGen      int
 	width, height int
 }
 
@@ -102,12 +107,12 @@ func (m *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.pendingConfirm <- true
 				m.pendingConfirm = nil
 				m.newLine("system", "Allowed.")
-				return m, waitForAgentEvent(m.agentChan)
+				return m, m.resumeWaiting()
 			case "n":
 				m.pendingConfirm <- false
 				m.pendingConfirm = nil
 				m.newLine("system", "Denied.")
-				return m, waitForAgentEvent(m.agentChan)
+				return m, m.resumeWaiting()
 			case "esc":
 				m.pendingConfirm = nil
 				if m.cancel != nil {
@@ -139,15 +144,17 @@ func (m *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			case "esc":
 				if m.abortArmed {
-					m.abortArmed = false
+					m.disarmAbort()
 					if m.cancel != nil {
 						m.cancel()
 					}
 					return m, nil
 				}
 				m.abortArmed = true
+				m.abortGen++
+				gen := m.abortGen
 				return m, tea.Tick(abortArmWindow, func(time.Time) tea.Msg {
-					return abortDisarmMsg{}
+					return abortDisarmMsg{gen: gen}
 				})
 			case "pageup":
 				m.Conversation.PageUp()
@@ -200,16 +207,19 @@ func (m *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "enter":
-			m.newLine("user", m.Entry.Value())
+			input := m.Entry.Value()
+			m.newLine("user", input)
 			ctx, cancel := context.WithCancel(context.Background())
 			m.cancel = cancel
-			ch, err := m.Agent.Run(ctx, m.Entry.Value())
-			m.Entry.SetValue("")
+			ch, err := m.Agent.Run(ctx, input)
 			if err != nil {
+				// Leave the prompt in the entry — the turn never started, so
+				// the user shouldn't have to retype it.
 				m.cancel = nil
 				m.newLine("error", "Error: "+err.Error())
 				return m, nil
 			}
+			m.Entry.SetValue("")
 			m.agentChan = ch
 			m.busy = true
 			m.abortArmed = false
@@ -218,13 +228,18 @@ func (m *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case abortDisarmMsg:
-		m.abortArmed = false
+		// Ignore a timer left over from an arming that has already been
+		// resolved; only the newest one may disarm.
+		if msg.gen == m.abortGen {
+			m.abortArmed = false
+		}
 		return m, nil
 
 	case spinner.TickMsg:
-		// Only keep the tick chain alive while busy, so it stops on its own
-		// once the turn ends rather than spinning forever.
-		if !m.busy {
+		// Only keep the tick chain alive while the spinner is actually on
+		// screen, so it stops on its own once the turn ends and doesn't wake
+		// the runtime 12x/second while a confirmation prompt sits unanswered.
+		if !m.busy || m.pendingConfirm != nil {
 			return m, nil
 		}
 		var cmd tea.Cmd
@@ -241,6 +256,10 @@ func (m *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "confirm":
 			m.streaming = false
 			m.pendingConfirm = msg.Confirm
+			// An escape armed before the prompt appeared must not carry over:
+			// the prompt's own esc means "cancel" on the first press, so a
+			// leftover armed state would make that single press an abort.
+			m.disarmAbort()
 			// The agent emits complete markdown (fencing only the argument
 			// text), so render it verbatim rather than fencing it again.
 			m.newLine("system", msg.Payload)
@@ -270,6 +289,11 @@ func (m *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streaming = false
 			m.cancel = nil
 			return m, m.finishTurn()
+		default:
+			// An unrecognized event kind must still keep the channel drained.
+			// Falling through to Entry.Update would strand the reader and
+			// leave the input disabled for the rest of the session.
+			return m, waitForAgentEvent(m.agentChan)
 		}
 	}
 
@@ -297,23 +321,57 @@ func (m *App) render() {
 // finishTurn clears the in-flight state and hands the input back to the user.
 func (m *App) finishTurn() tea.Cmd {
 	m.busy = false
-	m.abortArmed = false
+	m.disarmAbort()
 	return m.Entry.Focus()
+}
+
+// disarmAbort clears the armed abort and invalidates any disarm timer still
+// in flight for it, so a stale timer can't disarm a later arming.
+func (m *App) disarmAbort() {
+	m.abortArmed = false
+	m.abortGen++
+}
+
+// resumeWaiting goes back to reading agent events after a confirmation
+// prompt, restarting the spinner that was parked while the prompt was up.
+func (m *App) resumeWaiting() tea.Cmd {
+	return tea.Batch(waitForAgentEvent(m.agentChan), m.spinner.Tick)
 }
 
 // statusLine is what replaces the input while a turn is in flight. It stands
 // in for the entry rather than occupying an extra row, so the conversation
-// viewport never resizes mid-turn.
+// viewport never resizes mid-turn. Both variants are clamped to the terminal
+// width: the renderer clips rather than wraps, and these lines are exactly
+// where the user is told which keys work.
 func (m *App) statusLine() string {
 	if m.pendingConfirm != nil {
-		return statusStyle.Render("Awaiting your approval — y to allow, n to deny, esc to cancel")
+		return statusStyle.Render(truncateToWidth("y allow · n deny · esc cancel", m.width))
 	}
 
 	hint := "esc esc to abort"
 	if m.abortArmed {
 		hint = "press esc again to abort"
 	}
-	return m.spinner.View() + " " + statusStyle.Render("Thinking… ("+hint+")")
+	spin := m.spinner.View()
+	room := m.width - lipgloss.Width(spin) - 1
+	return spin + " " + statusStyle.Render(truncateToWidth("Thinking… · "+hint, room))
+}
+
+// truncateToWidth trims s to at most width display columns. It must run on
+// unstyled text — styling is applied afterwards so ANSI sequences are never
+// cut mid-escape.
+func truncateToWidth(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= width {
+		return s
+	}
+	r := []rune(s)
+	for len(r) > 0 && lipgloss.Width(string(r)) > width {
+		r = r[:len(r)-1]
+	}
+	return string(r)
 }
 
 // newLine commits a complete turn (the user's prompt, an error, a system note).

@@ -134,10 +134,13 @@ the resulting `tea.Cmd`). `abortDisarmMsg` clears `abortArmed`.
 This also closes the pre-existing reentrancy gap where `enter` during an in-flight
 turn could start a second `Run()` racing the first on `a.history`.
 
-**Tests:** `internal/app` has no test file today and the Bubble Tea model is
-awkward to drive headlessly; verification for tasks 4–5 is `go build` + `go vet`
-plus a manual smoke run. Note this gap explicitly rather than pretending
-coverage.
+**Tests:** this was originally planned as a coverage gap (`internal/app` had no
+test file, and the Bubble Tea model looked awkward to drive headlessly). Review
+showed the gap was hiding a real bug, so `internal/app/app_test.go` now drives
+`Update` directly with synthetic `tea.KeyPressMsg`/`agentEventMsg` values and a
+fake agent. It covers the busy/focus lifecycle across every terminal event, the
+double-escape abort including the stale-timer case, confirm-prompt interaction,
+spinner tick gating, status-line width clamping, and cursor publication.
 
 ---
 
