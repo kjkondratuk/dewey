@@ -1819,27 +1819,50 @@ func (r *Recorder) Record(ctx context.Context, text string, tags []string) error
 	})
 }
 
-// slugify builds a filename-safe id from the first words of the memory.
+// CORRECTED: the original version here split on whitespace and then deleted
+// non-alphanumerics *inside* each field, so "Prefers Table-Driven Tests!"
+// produced "prefers-tabledriven-tests" — failing this plan's own asserted
+// value. Every non-[a-z0-9] rune must act as a separator instead. A length cap
+// is also required: a single long word slips past a word-count cap, and the id
+// has to satisfy validIDPattern or the memory the user approved is never
+// saved. Truncate at a hyphen, since a trailing hyphen fails that pattern.
 func slugify(text string) string {
+	const maxSlugLength = 60
+
 	var words []string
-	for _, field := range strings.Fields(strings.ToLower(text)) {
-		var cleaned strings.Builder
-		for _, r := range field {
-			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-				cleaned.WriteRune(r)
-			}
+	var cur strings.Builder
+	for _, r := range strings.ToLower(text) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			cur.WriteRune(r)
+			continue
 		}
-		if cleaned.Len() > 0 {
-			words = append(words, cleaned.String())
+		if cur.Len() > 0 {
+			words = append(words, cur.String())
+			cur.Reset()
 		}
 		if len(words) == 6 {
 			break
 		}
 	}
+	if cur.Len() > 0 && len(words) < 6 {
+		words = append(words, cur.String())
+	}
 	if len(words) == 0 {
 		return "memory"
 	}
-	return strings.Join(words, "-")
+
+	slug := strings.Join(words, "-")
+	if len(slug) > maxSlugLength {
+		slug = slug[:maxSlugLength]
+		if i := strings.LastIndex(slug, "-"); i > 0 {
+			slug = slug[:i]
+		}
+		slug = strings.Trim(slug, "-")
+	}
+	if slug == "" {
+		return "memory"
+	}
+	return slug
 }
 ```
 
@@ -2058,11 +2081,20 @@ In `merge`, before the return:
 	if home, err := os.UserHomeDir(); err == nil {
 		memory.Dir = filepath.Join(home, configDirName, "memory")
 	}
+	// CORRECTED: `Enabled` must be a *bool on the file-config struct, applied
+	// only when present. With a plain bool, a project section that sets only
+	// `dir:` unmarshals Enabled as false and silently disables memory — asking
+	// where memories live would uninstall the feature. A pointer on the
+	// section distinguishes an absent section; this distinguishes an absent
+	// key. Use a separate memoryFileConfig for the file shape and keep
+	// MemoryConfig as the plain resolved struct.
 	for _, fc := range []fileConfig{global, project} {
 		if fc.Memory == nil {
 			continue
 		}
-		memory.Enabled = fc.Memory.Enabled
+		if fc.Memory.Enabled != nil {
+			memory.Enabled = *fc.Memory.Enabled
+		}
 		if fc.Memory.Dir != "" {
 			memory.Dir = fc.Memory.Dir
 		}
