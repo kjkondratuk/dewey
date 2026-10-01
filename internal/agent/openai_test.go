@@ -17,6 +17,11 @@ import (
 type fakeStreamModel struct {
 	responses [][]*schema.Message
 	calls     int
+
+	// seen records the exact message slice handed to each Stream call, which
+	// is the only way to assert what the model was actually sent as opposed
+	// to what the agent kept in history.
+	seen [][]*schema.Message
 }
 
 func (f *fakeStreamModel) Generate(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.Message, error) {
@@ -24,6 +29,7 @@ func (f *fakeStreamModel) Generate(ctx context.Context, in []*schema.Message, op
 }
 
 func (f *fakeStreamModel) Stream(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	f.seen = append(f.seen, in)
 	resp := f.responses[f.calls]
 	f.calls++
 	return schema.StreamReaderFromArray(resp), nil
@@ -59,6 +65,19 @@ func (f *fakeSummarizer) Summarize(ctx context.Context, messages []*schema.Messa
 		return "", f.err
 	}
 	return f.result, nil
+}
+
+type fakeSystemProvider struct {
+	text  string
+	calls int
+}
+
+func (f *fakeSystemProvider) System(ctx context.Context) (*schema.Message, error) {
+	f.calls++
+	if f.text == "" {
+		return nil, nil
+	}
+	return &schema.Message{Role: schema.System, Content: f.text}, nil
 }
 
 type echoInput struct {
@@ -680,5 +699,81 @@ func TestFormatConfirmMessage_SummaryCannotInjectAHeading(t *testing.T) {
 	}
 	if !strings.Contains(got, `\# Safe to allow`) {
 		t.Errorf("formatConfirmMessage() = %q, want the summary escaped", got)
+	}
+}
+
+func TestRun_PrependsSystemMessageWithoutStoringIt(t *testing.T) {
+	sp := &fakeSystemProvider{text: "SYSTEM RULES"}
+	m := &fakeStreamModel{responses: [][]*schema.Message{finalResponse("ok")}}
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 0, nil)
+	agt.systemProvider = sp
+
+	ch, err := agt.Run(context.Background(), "hello")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	drain(t, ch, func(Event) bool { return true })
+
+	if len(m.seen) == 0 {
+		t.Fatal("model was never called")
+	}
+	sent := m.seen[0]
+	if sent[0].Role != schema.System || sent[0].Content != "SYSTEM RULES" {
+		t.Errorf("first message sent = %+v, want the system message", sent[0])
+	}
+	for _, msg := range agt.history {
+		if msg.Role == schema.System {
+			t.Error("system message leaked into history — compaction would summarize it away")
+		}
+	}
+}
+
+func TestRun_SystemProviderIsConsultedEveryStream(t *testing.T) {
+	// A memory saved mid-turn has to affect the very next model call.
+	sp := &fakeSystemProvider{text: "RULES"}
+	tl := newRecordingTool(t, new(int))
+	m := &fakeStreamModel{responses: [][]*schema.Message{
+		toolCallResponse("do_thing", `{"x":"1"}`),
+		finalResponse("done"),
+	}}
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 0, nil)
+	agt.systemProvider = sp
+
+	ch, _ := agt.Run(context.Background(), "go")
+	drain(t, ch, func(Event) bool { return true })
+
+	if sp.calls < 2 {
+		t.Errorf("system provider consulted %d times, want once per Stream call", sp.calls)
+	}
+}
+
+func TestRun_NilSystemProviderSendsHistoryUnchanged(t *testing.T) {
+	m := &fakeStreamModel{responses: [][]*schema.Message{finalResponse("ok")}}
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 0, nil)
+
+	ch, _ := agt.Run(context.Background(), "hello")
+	drain(t, ch, func(Event) bool { return true })
+
+	if m.seen[0][0].Role == schema.System {
+		t.Error("a system message appeared with no provider configured")
+	}
+}
+
+func TestCompact_DoesNotTouchTheSystemMessage(t *testing.T) {
+	sp := &fakeSystemProvider{text: "RULES"}
+	agt := New(nil, nil, nil, nil, 1000, &fakeSummarizer{result: "summary"})
+	agt.systemProvider = sp
+	agt.history = []*schema.Message{
+		{Role: schema.User, Content: "one"},
+		{Role: schema.Assistant, Content: "two"},
+	}
+
+	if err := agt.compact(context.Background(), 2); err != nil {
+		t.Fatalf("compact() error = %v", err)
+	}
+
+	sys, _ := sp.System(context.Background())
+	if sys == nil || sys.Content != "RULES" {
+		t.Error("system message was affected by compaction")
 	}
 }

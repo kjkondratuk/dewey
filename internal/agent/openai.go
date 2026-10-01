@@ -41,6 +41,13 @@ func toolResult(content, toolCallID, toolName string) *schema.Message {
 	return msg
 }
 
+// SystemPromptProvider supplies the system message for each model call. It is
+// consulted per Stream rather than once per session so a memory saved mid-turn
+// takes effect immediately.
+type SystemPromptProvider interface {
+	System(ctx context.Context) (*schema.Message, error)
+}
+
 type openaiAgent struct {
 	cm         model.ToolCallingChatModel
 	tools      map[string]tool.InvokableTool
@@ -48,6 +55,11 @@ type openaiAgent struct {
 	classifier safety.Classifier
 	overrides  safety.RiskOverrides
 	history    []*schema.Message
+
+	// systemProvider is deliberately not part of history: compact() rewrites
+	// history[:truncateLen], so a system message stored there would be
+	// summarized away the first time compaction fired.
+	systemProvider SystemPromptProvider
 
 	contextWindow int
 	summarizer    compaction.Summarizer
@@ -96,6 +108,29 @@ func New(
 	}
 }
 
+// WithSystemPrompt attaches a system prompt provider. Separate from New so the
+// existing call sites and their tests stay unchanged.
+func (a *openaiAgent) WithSystemPrompt(p SystemPromptProvider) *openaiAgent {
+	a.systemProvider = p
+	return a
+}
+
+// messages returns what to send: the system message, if any, followed by the
+// conversation. The system message is rebuilt per call.
+func (a *openaiAgent) messages(ctx context.Context) ([]*schema.Message, error) {
+	if a.systemProvider == nil {
+		return a.history, nil
+	}
+	sys, err := a.systemProvider.System(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if sys == nil {
+		return a.history, nil
+	}
+	return append([]*schema.Message{sys}, a.history...), nil
+}
+
 func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, error) {
 	truncateLen := len(a.history)
 	a.history = append(a.history, &schema.Message{
@@ -133,7 +168,12 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 		// any tool calls it asked for. Loops back around with the tool
 		// results appended to history until the model stops calling tools.
 		for {
-			sr, err := a.cm.Stream(ctx, a.history)
+			outbound, err := a.messages(ctx)
+			if err != nil {
+				ch <- Event{Kind: "error", Payload: "system prompt unavailable: " + err.Error()}
+				return
+			}
+			sr, err := a.cm.Stream(ctx, outbound)
 			if err != nil {
 				ch <- Event{Kind: "error", Payload: err.Error()}
 				return
@@ -268,12 +308,20 @@ func (a *openaiAgent) recordUsage(full *schema.Message) {
 // estimateTokens returns the current context usage: the last provider-
 // reported total plus a tokenizer-based estimate of everything appended
 // since, or a full tokenizer estimate if no provider total was ever
-// recorded.
+// recorded. The system message is added on top in either case — it is sent
+// with every request but lives outside history, so neither the baseline nor
+// the delta covers it.
 func (a *openaiAgent) estimateTokens() int {
-	if a.lastKnownAt > 0 && a.lastKnownAt <= len(a.history) {
-		return a.lastKnownTokens + compaction.EstimateTokens(a.history[a.lastKnownAt:])
+	total := 0
+	if a.systemProvider != nil {
+		if sys, err := a.systemProvider.System(context.Background()); err == nil && sys != nil {
+			total += compaction.EstimateTokens([]*schema.Message{sys})
+		}
 	}
-	return compaction.EstimateTokens(a.history)
+	if a.lastKnownAt > 0 && a.lastKnownAt <= len(a.history) {
+		return total + a.lastKnownTokens + compaction.EstimateTokens(a.history[a.lastKnownAt:])
+	}
+	return total + compaction.EstimateTokens(a.history)
 }
 
 // shouldCompact reports whether estimated tokens have crossed
