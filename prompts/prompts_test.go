@@ -13,6 +13,7 @@ func TestPromptsAreNonEmptyAndTrimmed(t *testing.T) {
 		"Classifier": Classifier,
 		"Summarizer": Summarizer,
 		"ToolDenied": ToolDenied,
+		"SystemBase": SystemBase,
 	} {
 		if got == "" {
 			t.Errorf("%s is empty — is its markdown file missing?", name)
@@ -34,6 +35,19 @@ func TestClassifierPromptStillDemandsBareJSON(t *testing.T) {
 	}
 	if !strings.Contains(Classifier, "no markdown fences") {
 		t.Error("classifier prompt dropped the no-fences instruction the parser depends on")
+	}
+}
+
+func TestSystemBaseIsPresentAndMentionsMemoryRules(t *testing.T) {
+	if SystemBase == "" {
+		t.Fatal("SystemBase is empty — is prompts/system_base.md missing?")
+	}
+	// The remember tool is useless if the model is never told when to reach
+	// for it, and harmful if it records project trivia.
+	for _, want := range []string{"remember", "preference"} {
+		if !strings.Contains(strings.ToLower(SystemBase), want) {
+			t.Errorf("SystemBase does not mention %q", want)
+		}
 	}
 }
 

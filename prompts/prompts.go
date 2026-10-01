@@ -22,6 +22,9 @@ var summarizerMD string
 //go:embed tool_denied.md
 var toolDeniedMD string
 
+//go:embed system_base.md
+var systemBaseMD string
+
 var (
 	// Classifier is the system prompt for the tool-call safety classifier.
 	// It must keep instructing the model to answer with a bare JSON object —
@@ -38,4 +41,8 @@ var (
 	// its exact wording is what stops a denial being read as a missing
 	// capability.
 	ToolDenied = strings.TrimSpace(toolDeniedMD)
+
+	// SystemBase is the base system prompt: how dewey behaves before any of
+	// the user's own remembered preferences are layered on.
+	SystemBase = strings.TrimSpace(systemBaseMD)
 )
