@@ -494,3 +494,49 @@ func TestScroll_SubmittingRejoinsTheTail(t *testing.T) {
 		t.Error("submitting did not return to the tail — the user can't see their own prompt")
 	}
 }
+
+func TestNoticesAreShownOnStartup(t *testing.T) {
+	f := &fakeAgent{ch: make(chan agent.Event, 8)}
+	entry := textinput.New()
+	entry.SetVirtualCursor(false)
+	m := &App{Conversation: viewport.New(), Entry: entry, Agent: f,
+		Notices: []string{"skipped memory bad.md: invalid frontmatter"}}
+	m.Init()
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	// A memory the user curated going missing silently is worse than the
+	// omission itself, so the warning has to be on screen before they type.
+	if len(m.turns) != 1 {
+		t.Fatalf("turns = %d, want the notice rendered as one turn", len(m.turns))
+	}
+	if !strings.Contains(m.turns[0].text, "bad.md") {
+		t.Errorf("turn text = %q, want the notice", m.turns[0].text)
+	}
+}
+
+func TestMultipleNoticesShareOneTurn(t *testing.T) {
+	f := &fakeAgent{ch: make(chan agent.Event, 8)}
+	entry := textinput.New()
+	entry.SetVirtualCursor(false)
+	m := &App{Conversation: viewport.New(), Entry: entry, Agent: f,
+		Notices: []string{"skipped memory bad.md: invalid frontmatter", "memory budget of 10 tokens exceeded; 2 memories omitted"}}
+	m.Init()
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	if len(m.turns) != 1 {
+		t.Fatalf("turns = %d, want one block for all startup notices", len(m.turns))
+	}
+	for _, want := range []string{"bad.md", "2 memories omitted"} {
+		if !strings.Contains(m.turns[0].text, want) {
+			t.Errorf("turn text = %q, missing notice %q", m.turns[0].text, want)
+		}
+	}
+}
+
+func TestNoNoticesRendersNothing(t *testing.T) {
+	f := &fakeAgent{ch: make(chan agent.Event, 8)}
+	m := newTestApp(t, f)
+	if len(m.turns) != 0 {
+		t.Errorf("turns = %d, want none without notices", len(m.turns))
+	}
+}

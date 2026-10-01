@@ -76,9 +76,12 @@ var blockStyles = map[string]lipgloss.Style{
 var statusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 
 type App struct {
-	Agent          agent.Agent
-	Conversation   viewport.Model
-	Entry          textinput.Model
+	Agent        agent.Agent
+	Conversation viewport.Model
+	Entry        textinput.Model
+	// Notices are startup warnings (unreadable memory files, dropped
+	// memories) shown once before the first prompt.
+	Notices        []string
 	agentChan      <-chan agent.Event
 	cancel         context.CancelFunc
 	renderer       *glamour.TermRenderer
@@ -101,6 +104,11 @@ type App struct {
 
 func (m *App) Init() tea.Cmd {
 	m.spinner = spinner.New(spinner.WithSpinner(spinner.MiniDot))
+	// One block for all of them: these are a single "here's what went wrong
+	// loading your profile" report, not separate events in the conversation.
+	if len(m.Notices) > 0 {
+		m.newLine("system", strings.Join(m.Notices, "\n"))
+	}
 	return m.Entry.Focus()
 }
 

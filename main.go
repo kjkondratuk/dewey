@@ -46,7 +46,19 @@ func main() {
 	summarizer := compaction.NewLLMSummarizer(simpleModel)
 	contextWindow := config.DiscoverContextWindow(ctx, cfg.Intermediate)
 
-	systemPrompt, toolRecorder, _ := buildMemory(cwd, cfg)
+	systemPrompt, toolRecorder, provider := buildMemory(cwd, cfg)
+
+	// Force one load here so an unreadable memory directory or a dropped
+	// memory is reported at startup, rather than surfacing mid-turn as a
+	// failed model call.
+	var notices []string
+	if provider != nil {
+		if _, err := provider.Block(ctx); err != nil {
+			notices = append(notices, "memory unavailable: "+err.Error())
+		} else {
+			notices = provider.Notices()
+		}
+	}
 
 	// register tools
 	tools := tools2.NewToolFactory(toolRecorder).DefaultInvokableToolset()
@@ -66,7 +78,7 @@ func main() {
 	agt := agent.New(tm, tools, classifier, cfg.Overrides, contextWindow, summarizer).
 		WithSystemPrompt(systemPrompt)
 
-	prog := tea.NewProgram(initModel(agt))
+	prog := tea.NewProgram(initModel(agt, notices))
 	_, err = prog.Run()
 	if err != nil {
 		log.Fatalf("program exited with error: %v", err)
@@ -109,12 +121,12 @@ func buildMemory(cwd string, cfg config.Config) (*memory.SystemPrompt, tools2.Me
 	return systemPrompt, toolRecorder, provider
 }
 
-func initModel(agt agent.Agent) *app.App {
+func initModel(agt agent.Agent, notices []string) *app.App {
 	conversation := viewport.New()
 
 	entry := textinput.New()
 	entry.Prompt = "> "
 	entry.SetVirtualCursor(false)
 
-	return &app.App{Conversation: conversation, Entry: entry, Agent: agt}
+	return &app.App{Conversation: conversation, Entry: entry, Agent: agt, Notices: notices}
 }
