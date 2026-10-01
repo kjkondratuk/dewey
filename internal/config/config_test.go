@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kjkondratuk/dewey/internal/safety"
@@ -39,8 +40,12 @@ func TestLoad_DefaultsWhenNoFilesExist(t *testing.T) {
 	if cfg.Simple != wantIntermediate {
 		t.Errorf("Simple = %+v, want fallback to intermediate %+v", cfg.Simple, wantIntermediate)
 	}
-	if len(cfg.Overrides) != 0 {
-		t.Errorf("Overrides = %+v, want empty", cfg.Overrides)
+	// remember is pinned by default; see builtinOverrides.
+	if got := cfg.Overrides["remember"]; got != safety.Moderate {
+		t.Errorf("Overrides[remember] = %v, want Moderate", got)
+	}
+	if len(cfg.Overrides) != len(builtinOverrides) {
+		t.Errorf("Overrides = %+v, want only the built-ins", cfg.Overrides)
 	}
 }
 
@@ -281,5 +286,70 @@ func TestDiscoverContextWindow_NoMatchingModelFallsThrough(t *testing.T) {
 	got := DiscoverContextWindow(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "test-model", ContextWindow: 2048})
 	if got != 2048 {
 		t.Errorf("DiscoverContextWindow() = %d, want 2048 (fallback since no matching model)", got)
+	}
+}
+
+// The remember tool writes to the system prompt of every future session, so
+// its confirmation gate must not depend on the classifier agreeing it is a
+// write. A classifier answering read/safe would otherwise skip the prompt.
+func TestLoad_RememberIsPinnedSoApprovalCannotBeSkipped(t *testing.T) {
+	home, project := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+
+	cfg, err := Load(project)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Overrides["remember"] != safety.Moderate {
+		t.Errorf("Overrides[remember] = %v, want Moderate so the gate always fires", cfg.Overrides["remember"])
+	}
+}
+
+// Pinned, not hardcoded: a user who really wants it ungated can say so.
+func TestLoad_UserCanOverrideTheBuiltinPin(t *testing.T) {
+	home, project := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	writeConfig(t, project, "overrides:\n  remember: safe\n")
+
+	cfg, err := Load(project)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Overrides["remember"] != safety.Safe {
+		t.Errorf("Overrides[remember] = %v, want the user's value to win", cfg.Overrides["remember"])
+	}
+}
+
+// "~/.dewey/memory" is the value the design doc documents. Taken literally it
+// makes the real profile invisible and creates a directory named "~" in
+// whatever project the user launched from.
+func TestLoad_MemoryDirExpandsLeadingTilde(t *testing.T) {
+	home, project := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	writeConfig(t, project, "memory:\n  dir: ~/.dewey/memory\n")
+
+	cfg, err := Load(project)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if strings.HasPrefix(cfg.Memory.Dir, "~") {
+		t.Errorf("Memory.Dir = %q, want the tilde expanded", cfg.Memory.Dir)
+	}
+	if want := filepath.Join(home, ".dewey", "memory"); cfg.Memory.Dir != want {
+		t.Errorf("Memory.Dir = %q, want %q", cfg.Memory.Dir, want)
+	}
+}
+
+func TestLoad_MemoryDirWithoutTildeIsUnchanged(t *testing.T) {
+	home, project := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	writeConfig(t, project, "memory:\n  dir: /opt/memories\n")
+
+	cfg, err := Load(project)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Memory.Dir != "/opt/memories" {
+		t.Errorf("Memory.Dir = %q, want it untouched", cfg.Memory.Dir)
 	}
 }

@@ -77,7 +77,19 @@ func (s *FileStore) Load(ctx context.Context) (LoadResult, error) {
 
 	var res LoadResult
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+		if e.IsDir() || !isMarkdownName(e.Name()) {
+			continue
+		}
+		// Refuse anything that is not a regular file. A project memory
+		// directory is meant to be committed, so a cloned repo can contain a
+		// symlink -- and these files are read straight into the system
+		// message, the highest-authority slot there is. A link pointing at
+		// ~/.ssh/id_ed25519 would put key material in the model's context.
+		if !e.Type().IsRegular() {
+			res.Skipped = append(res.Skipped, SkipNotice{
+				File:   e.Name(),
+				Reason: "not a regular file; refusing to read it into the system prompt",
+			})
 			continue
 		}
 		raw, err := os.ReadFile(filepath.Join(s.dir, e.Name()))
@@ -93,6 +105,14 @@ func (s *FileStore) Load(ctx context.Context) (LoadResult, error) {
 		res.Memories = append(res.Memories, m)
 	}
 	return res, nil
+}
+
+// isMarkdownName matches the .md extension case-insensitively. A file named
+// Pref.MD was previously ignored in silence -- exactly the "a memory the user
+// believes is in effect" failure SkipNotice exists to prevent -- and on a
+// case-insensitive filesystem it is indistinguishable from pref.md anyway.
+func isMarkdownName(name string) bool {
+	return len(name) > 3 && strings.EqualFold(name[len(name)-3:], ".md")
 }
 
 // isFenceLine reports whether a line is a frontmatter delimiter: exactly

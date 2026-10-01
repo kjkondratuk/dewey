@@ -33,6 +33,16 @@ type MemoryConfig struct {
 	MaxTokens int
 }
 
+// builtinOverrides pins tools whose risk tier must not be left to the
+// classifier's judgement.
+var builtinOverrides = safety.RiskOverrides{
+	// remember writes to the system prompt of every future session. A
+	// classifier answering {"kind":"read","risk":"safe"} would let the model
+	// save a memory with no confirmation at all, while the system prompt tells
+	// it approval is required.
+	"remember": safety.Moderate,
+}
+
 // ModelConfig is the connection details for one model tier.
 type ModelConfig struct {
 	BaseURL string `yaml:"base_url"`
@@ -144,6 +154,15 @@ func merge(global, project fileConfig) (Config, error) {
 	applyModelDefaults(&embedding, "")
 
 	overrides := safety.RiskOverrides{}
+	// remember writes to the system prompt of every future session, so its
+	// confirmation gate cannot rest on the classifier agreeing that it is a
+	// write. A classifier answering {"kind":"read","risk":"safe"} would
+	// otherwise let the model save a memory with no prompt at all, while the
+	// system prompt tells it approval is required. Seeded before the file
+	// loops so a user who really wants it ungated can still override.
+	for name, tier := range builtinOverrides {
+		overrides[name] = tier
+	}
 	for name, raw := range global.Overrides {
 		tier, err := safety.ParseRiskTier(raw)
 		if err != nil {
@@ -171,7 +190,7 @@ func merge(global, project fileConfig) (Config, error) {
 			memory.Enabled = *fc.Memory.Enabled
 		}
 		if fc.Memory.Dir != "" {
-			memory.Dir = fc.Memory.Dir
+			memory.Dir = expandHome(fc.Memory.Dir)
 		}
 		if fc.Memory.MaxTokens > 0 {
 			memory.MaxTokens = fc.Memory.MaxTokens
@@ -197,6 +216,24 @@ func pickModelConfig(global, project ModelConfig) ModelConfig {
 		return project
 	}
 	return global
+}
+
+// expandHome resolves a leading ~/ in a configured path. Without it the
+// documented example value "~/.dewey/memory" is taken literally: the real
+// profile becomes invisible and saves create a directory actually named "~"
+// in whatever project the user happened to launch from.
+func expandHome(path string) string {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	if path == "~" {
+		return home
+	}
+	return filepath.Join(home, path[len("~/"):])
 }
 
 func applyModelDefaults(m *ModelConfig, defaultModel string) {

@@ -585,3 +585,49 @@ func TestFileStore_CreatedIsParsedFromHandWrittenFrontmatter(t *testing.T) {
 		t.Errorf("Created = %v, want %v", got, want)
 	}
 }
+
+// A project memory directory is meant to be committed, so a cloned repo can
+// contain a symlink — and these files are read into the system message, the
+// highest-authority slot. A link to a private key would put key material in
+// the model's context.
+func TestFileStore_RefusesSymlinksAndReportsThem(t *testing.T) {
+	dir := t.TempDir()
+	secret := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(secret, []byte("---\nid: s\n---\nSUPERSECRETKEYMATERIAL\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(dir, "note.md")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	writeMemFile(t, dir, "real.md", "---\nid: real\n---\nReal.\n")
+
+	res, err := NewFileStore(dir).Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	for _, m := range res.Memories {
+		if strings.Contains(m.Text, "SUPERSECRETKEYMATERIAL") {
+			t.Fatal("followed a symlink: linked file contents would reach the system prompt")
+		}
+	}
+	if len(res.Memories) != 1 || res.Memories[0].ID != "real" {
+		t.Errorf("memories = %+v, want only the regular file", res.Memories)
+	}
+	if len(res.Skipped) != 1 {
+		t.Errorf("Skipped = %+v, want the symlink reported rather than ignored", res.Skipped)
+	}
+}
+
+// A silently ignored memory is a preference the user believes is in effect.
+func TestFileStore_MatchesTheExtensionCaseInsensitively(t *testing.T) {
+	dir := t.TempDir()
+	writeMemFile(t, dir, "shouty.MD", "---\nid: shouty\n---\nStill a memory.\n")
+
+	res, err := NewFileStore(dir).Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(res.Memories) != 1 {
+		t.Errorf("memories = %+v, want the .MD file loaded", res.Memories)
+	}
+}
