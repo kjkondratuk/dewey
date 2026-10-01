@@ -23,7 +23,15 @@ const (
 	defaultIntermediateModel = "gemma-4-31b-it-turboquant-mlx"
 	configDirName            = ".dewey"
 	configFileName           = "config.yaml"
+	defaultMemoryMaxTokens   = 4000
 )
+
+// MemoryConfig controls the long-term memory store.
+type MemoryConfig struct {
+	Enabled   bool
+	Dir       string
+	MaxTokens int
+}
 
 // ModelConfig is the connection details for one model tier.
 type ModelConfig struct {
@@ -43,6 +51,20 @@ type Config struct {
 	Hard         ModelConfig
 	Embedding    ModelConfig
 	Overrides    safety.RiskOverrides
+	Memory       MemoryConfig
+	// Org names the organization this project's work belongs to. Set in the
+	// project's config file; takes precedence over git-remote detection.
+	Org string
+}
+
+// memoryFileConfig mirrors MemoryConfig with every field optional. Enabled is
+// a pointer because a plain bool cannot distinguish `enabled: false` from a
+// section that only sets `dir`, and conflating them would mean configuring
+// where memories live silently switches memory off.
+type memoryFileConfig struct {
+	Enabled   *bool  `yaml:"enabled"`
+	Dir       string `yaml:"dir"`
+	MaxTokens int    `yaml:"max_tokens"`
 }
 
 type fileConfig struct {
@@ -53,6 +75,12 @@ type fileConfig struct {
 		Embedding    ModelConfig `yaml:"embedding"`
 	} `yaml:"models"`
 	Overrides map[string]string `yaml:"overrides"`
+	// Memory is a pointer so an absent section is distinguishable from one
+	// that explicitly sets enabled: false.
+	Memory *memoryFileConfig `yaml:"memory"`
+	// Org is read from the project file only: it describes this checkout, so a
+	// global value would scope every project to the same organization.
+	Org string `yaml:"org"`
 }
 
 // Load reads ~/.dewey/config.yaml and <projectDir>/.dewey/config.yaml,
@@ -131,12 +159,33 @@ func merge(global, project fileConfig) (Config, error) {
 		overrides[name] = tier
 	}
 
+	memory := MemoryConfig{Enabled: true, MaxTokens: defaultMemoryMaxTokens}
+	if home, err := os.UserHomeDir(); err == nil {
+		memory.Dir = filepath.Join(home, configDirName, "memory")
+	}
+	for _, fc := range []fileConfig{global, project} {
+		if fc.Memory == nil {
+			continue
+		}
+		if fc.Memory.Enabled != nil {
+			memory.Enabled = *fc.Memory.Enabled
+		}
+		if fc.Memory.Dir != "" {
+			memory.Dir = fc.Memory.Dir
+		}
+		if fc.Memory.MaxTokens > 0 {
+			memory.MaxTokens = fc.Memory.MaxTokens
+		}
+	}
+
 	return Config{
 		Simple:       simple,
 		Intermediate: intermediate,
 		Hard:         hard,
 		Embedding:    embedding,
 		Overrides:    overrides,
+		Memory:       memory,
+		Org:          project.Org,
 	}, nil
 }
 

@@ -108,6 +108,113 @@ func TestLoad_InvalidOverrideValueIsAnError(t *testing.T) {
 	}
 }
 
+func TestLoad_MemoryDefaults(t *testing.T) {
+	home, project := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+
+	cfg, err := Load(project)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Memory.Enabled {
+		t.Error("Memory.Enabled = false, want true by default")
+	}
+	if cfg.Memory.MaxTokens != defaultMemoryMaxTokens {
+		t.Errorf("Memory.MaxTokens = %d, want %d", cfg.Memory.MaxTokens, defaultMemoryMaxTokens)
+	}
+	if cfg.Memory.Dir == "" {
+		t.Error("Memory.Dir is empty, want a default under the home directory")
+	}
+}
+
+func TestLoad_MemoryCanBeDisabled(t *testing.T) {
+	home, project := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	writeConfig(t, project, "memory:\n  enabled: false\n")
+
+	cfg, err := Load(project)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Memory.Enabled {
+		t.Error("Memory.Enabled = true, want false when explicitly disabled")
+	}
+}
+
+// A memory section that only moves the directory must not also switch the
+// feature off: `enabled` absent and `enabled: false` have to stay distinct, or
+// configuring the store silently uninstalls it.
+func TestLoad_MemorySectionWithoutEnabledKeepsItOn(t *testing.T) {
+	home, project := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	writeConfig(t, project, "memory:\n  dir: /custom/memories\n  max_tokens: 1234\n")
+
+	cfg, err := Load(project)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Memory.Enabled {
+		t.Error("Memory.Enabled = false, want it left on by a section that never mentions enabled")
+	}
+	if cfg.Memory.Dir != "/custom/memories" {
+		t.Errorf("Memory.Dir = %q, want /custom/memories", cfg.Memory.Dir)
+	}
+	if cfg.Memory.MaxTokens != 1234 {
+		t.Errorf("Memory.MaxTokens = %d, want 1234", cfg.Memory.MaxTokens)
+	}
+}
+
+func TestLoad_MemoryProjectOverridesGlobal(t *testing.T) {
+	home, project := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	writeConfig(t, home, "memory:\n  enabled: false\n  dir: /global/memories\n  max_tokens: 100\n")
+	writeConfig(t, project, "memory:\n  enabled: true\n  max_tokens: 200\n")
+
+	cfg, err := Load(project)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Memory.Enabled {
+		t.Error("Memory.Enabled = false, want the project's true to win")
+	}
+	if cfg.Memory.Dir != "/global/memories" {
+		t.Errorf("Memory.Dir = %q, want the global value to survive a project section that omits it", cfg.Memory.Dir)
+	}
+	if cfg.Memory.MaxTokens != 200 {
+		t.Errorf("Memory.MaxTokens = %d, want the project's 200", cfg.Memory.MaxTokens)
+	}
+}
+
+func TestLoad_ProjectOrgIsRead(t *testing.T) {
+	home, project := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	writeConfig(t, project, "org: acme\n")
+
+	cfg, err := Load(project)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Org != "acme" {
+		t.Errorf("Org = %q, want acme", cfg.Org)
+	}
+}
+
+// The org names which organization's work this checkout is, so it is a
+// property of the project and a global default would apply it everywhere.
+func TestLoad_GlobalOrgIsIgnored(t *testing.T) {
+	home, project := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	writeConfig(t, home, "org: globex\n")
+
+	cfg, err := Load(project)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Org != "" {
+		t.Errorf("Org = %q, want empty: a global org would scope every project to it", cfg.Org)
+	}
+}
+
 func TestBuildChatModel(t *testing.T) {
 	cm, err := BuildChatModel(context.Background(), ModelConfig{BaseURL: defaultBaseURL, APIKey: defaultAPIKey, Model: "test-model"})
 	if err != nil {
