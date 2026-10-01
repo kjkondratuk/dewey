@@ -396,3 +396,63 @@ func TestLoad_ProjectConfigCannotDeclareAnOrg(t *testing.T) {
 		t.Errorf("MaxTokens = %d, want the section still honored", cfg.Memory.MaxTokens)
 	}
 }
+
+// Setting just simple.model is the common case: one server, two models. If the
+// unset fields came from the built-in LM Studio defaults instead of from
+// intermediate, the classifier and summarizer would point at a server that
+// isn't running whenever intermediate is somewhere else — and because the
+// classifier fails safe, the symptom is an approval prompt on every tool call
+// plus failing compaction.
+func TestLoad_PartialSimpleTierInheritsFromIntermediate(t *testing.T) {
+	home, project := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	writeConfig(t, project, `models:
+  intermediate:
+    base_url: "http://localhost:7800/v1"
+    api_key: "real-key"
+    model: "big-model"
+    context_window: 32768
+  simple:
+    model: "tiny-model"
+`)
+
+	cfg, err := Load(project)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Simple.BaseURL != "http://localhost:7800/v1" {
+		t.Errorf("Simple.BaseURL = %q, want intermediate's server", cfg.Simple.BaseURL)
+	}
+	if cfg.Simple.APIKey != "real-key" {
+		t.Errorf("Simple.APIKey = %q, want intermediate's key", cfg.Simple.APIKey)
+	}
+	if cfg.Simple.Model != "tiny-model" {
+		t.Errorf("Simple.Model = %q, want the explicitly configured model", cfg.Simple.Model)
+	}
+	if cfg.Simple.ContextWindow != 32768 {
+		t.Errorf("Simple.ContextWindow = %d, want inherited 32768", cfg.Simple.ContextWindow)
+	}
+}
+
+// A simple tier that names its own server must keep it.
+func TestLoad_SimpleTierCanPointAtADifferentServer(t *testing.T) {
+	home, project := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	writeConfig(t, project, `models:
+  intermediate:
+    base_url: "http://localhost:7800/v1"
+    model: "big-model"
+  simple:
+    base_url: "http://localhost:1234/v1"
+    model: "tiny-model"
+`)
+
+	cfg, err := Load(project)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Simple.BaseURL != "http://localhost:1234/v1" {
+		t.Errorf("Simple.BaseURL = %q, want its own explicit value", cfg.Simple.BaseURL)
+	}
+}

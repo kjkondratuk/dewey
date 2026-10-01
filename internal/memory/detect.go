@@ -35,10 +35,17 @@ var stackMarkers = map[string]string{
 // both problems — at the cost that a repo with no remote cannot be
 // org-scoped, which fails closed.
 func DetectContext(dir string) Context {
+	// Markers are looked for upward from dir, because org detection already
+	// walks up (git does it) and so does project config. Statting only dir
+	// meant running from a subdirectory kept the org but silently lost the
+	// stack tag, so every tags-filtered memory stopped applying one level
+	// down from the repo root.
 	var tags []string
-	for marker, tag := range stackMarkers {
-		if _, err := os.Stat(filepath.Join(dir, marker)); err == nil && !contains(tags, tag) {
-			tags = append(tags, tag)
+	for _, root := range markerSearchPath(dir) {
+		for marker, tag := range stackMarkers {
+			if _, err := os.Stat(filepath.Join(root, marker)); err == nil && !contains(tags, tag) {
+				tags = append(tags, tag)
+			}
 		}
 	}
 	sortStrings(tags)
@@ -48,6 +55,29 @@ func DetectContext(dir string) Context {
 	// normalize or the comparison simply never succeeds.
 	org := normalizeTag(parseOrgFromRemote(gitRemote(dir)))
 	return Context{Org: org, Tags: normalizeTags(tags)}
+}
+
+// markerSearchPath returns dir and its ancestors up to the repository root,
+// nearest first. It stops at a .git directory so detection cannot wander into
+// unrelated parents, and is bounded by the filesystem root otherwise.
+func markerSearchPath(dir string) []string {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return []string{dir}
+	}
+
+	var path []string
+	for cur := abs; ; {
+		path = append(path, cur)
+		if _, err := os.Stat(filepath.Join(cur, ".git")); err == nil {
+			return path
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return path
+		}
+		cur = parent
+	}
 }
 
 // gitRemote is bounded because DetectContext runs before the TUI exists: on a

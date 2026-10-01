@@ -170,11 +170,18 @@ func merge(global, project fileConfig) (Config, error) {
 	intermediate := pickModelConfig(global.Models.Intermediate, project.Models.Intermediate)
 	applyModelDefaults(&intermediate, defaultIntermediateModel)
 
+	// A partially-specified simple tier inherits from intermediate, not from
+	// the built-in defaults. Setting just `simple.model` is the common case —
+	// one server, two models — and filling base_url from the LM Studio default
+	// would silently point the classifier and summarizer at a server that
+	// isn't there whenever intermediate is somewhere else. The classifier
+	// fails safe, so the symptom is an approval prompt on every single tool
+	// call plus failing compaction, which is a miserable thing to debug.
 	simple := pickModelConfig(global.Models.Simple, project.Models.Simple)
 	if simple == (ModelConfig{}) {
 		simple = intermediate
 	} else {
-		applyModelDefaults(&simple, intermediate.Model)
+		inheritFrom(&simple, intermediate)
 	}
 
 	hard := pickModelConfig(global.Models.Hard, project.Models.Hard)
@@ -263,6 +270,24 @@ func expandHome(path string) string {
 		return home
 	}
 	return filepath.Join(home, path[len("~/"):])
+}
+
+// inheritFrom fills a partially-specified tier from another resolved tier,
+// so an unset field means "same as that one" rather than "same as the
+// built-in default".
+func inheritFrom(m *ModelConfig, from ModelConfig) {
+	if m.BaseURL == "" {
+		m.BaseURL = from.BaseURL
+	}
+	if m.APIKey == "" {
+		m.APIKey = from.APIKey
+	}
+	if m.Model == "" {
+		m.Model = from.Model
+	}
+	if m.ContextWindow == 0 {
+		m.ContextWindow = from.ContextWindow
+	}
 }
 
 func applyModelDefaults(m *ModelConfig, defaultModel string) {
