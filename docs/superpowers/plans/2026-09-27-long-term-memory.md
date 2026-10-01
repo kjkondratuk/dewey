@@ -939,13 +939,13 @@ func TestTagRetriever_OrgGatesRegardlessOfTagMatch(t *testing.T) {
 	// because its topical tag happened to match.
 	all := []Memory{{ID: "acme-go-style", Org: "acme", Tags: []string{"go"}, Text: "x"}}
 
-	if got := TagRetriever{}.Select(all, Context{Org: "acme", Tags: []string{"go"}}); len(got) != 1 {
+	if got := (TagRetriever{}).Select(all, Context{Org: "acme", Tags: []string{"go"}}); len(got) != 1 {
 		t.Errorf("Select() at acme = %v, want the memory to apply", ids(got))
 	}
-	if got := TagRetriever{}.Select(all, Context{Org: "other", Tags: []string{"go"}}); len(got) != 0 {
+	if got := (TagRetriever{}).Select(all, Context{Org: "other", Tags: []string{"go"}}); len(got) != 0 {
 		t.Errorf("Select() at another org = %v, want nothing — org must gate", ids(got))
 	}
-	if got := TagRetriever{}.Select(all, Context{Tags: []string{"go"}}); len(got) != 0 {
+	if got := (TagRetriever{}).Select(all, Context{Tags: []string{"go"}}); len(got) != 0 {
 		t.Errorf("Select() with unknown org = %v, want nothing — fail closed", ids(got))
 	}
 }
@@ -964,7 +964,7 @@ func TestTagRetriever_TagsMatchByIntersection(t *testing.T) {
 
 func TestTagRetriever_TaggedMemoryExcludedWhenContextHasNoTags(t *testing.T) {
 	all := []Memory{{ID: "go-thing", Tags: []string{"go"}, Text: "x"}}
-	if got := TagRetriever{}.Select(all, Context{}); len(got) != 0 {
+	if got := (TagRetriever{}).Select(all, Context{}); len(got) != 0 {
 		t.Errorf("Select() = %v, want nothing in an unidentified directory", ids(got))
 	}
 }
@@ -1202,7 +1202,9 @@ func TestProvider_BudgetDropsOldestFirstAndReportsIt(t *testing.T) {
 		{ID: "old", Text: strings.Repeat("old fact ", 40), Created: old},
 		{ID: "recent", Text: strings.Repeat("recent fact ", 40), Created: recent},
 	}}
-	p := NewProvider(store, TagRetriever{}, Context{}, 60)
+	// Each fixture memory encodes to ~82 tokens, so 100 is the budget that
+	// admits exactly one of them — which is what this test is asserting.
+	p := NewProvider(store, TagRetriever{}, Context{}, 100)
 
 	block, err := p.Block(context.Background())
 	if err != nil {
@@ -1302,8 +1304,11 @@ func (p *Provider) Block(ctx context.Context) (string, error) {
 	selected := p.retriever.Select(res.Memories, p.mc)
 	selected, dropped := applyBudget(selected, p.maxTokens)
 	if dropped > 0 {
+		// Deliberately not "older memories": selection is newest-first
+		// best-fit, so an oversized memory can be skipped while an older but
+		// smaller one is kept. Claiming age here would misdescribe it.
 		notices = append(notices, fmt.Sprintf(
-			"memory budget of %d tokens exceeded; %d older memories omitted", p.maxTokens, dropped))
+			"memory budget of %d tokens exceeded; %d memories omitted", p.maxTokens, dropped))
 	}
 
 	p.block = render(selected)

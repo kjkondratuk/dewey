@@ -52,8 +52,11 @@ func (p *Provider) Block(ctx context.Context) (string, error) {
 	selected := p.retriever.Select(res.Memories, p.mc)
 	selected, dropped := applyBudget(selected, p.maxTokens)
 	if dropped > 0 {
+		// Deliberately not "older memories": selection is newest-first
+		// best-fit, so an oversized memory can be skipped while an older but
+		// smaller one is kept. Claiming age here would misdescribe it.
 		notices = append(notices, fmt.Sprintf(
-			"memory budget of %d tokens exceeded; %d older memories omitted", p.maxTokens, dropped))
+			"memory budget of %d tokens exceeded; %d memories omitted", p.maxTokens, dropped))
 	}
 
 	p.block = render(selected)
