@@ -10,10 +10,11 @@ import (
 // behaving worse.
 func TestPromptsAreNonEmptyAndTrimmed(t *testing.T) {
 	for name, got := range map[string]string{
-		"Classifier": Classifier,
-		"Summarizer": Summarizer,
-		"ToolDenied": ToolDenied,
-		"SystemBase": SystemBase,
+		"Classifier":   Classifier,
+		"Summarizer":   Summarizer,
+		"ToolDenied":   ToolDenied,
+		"SystemBase":   SystemBase,
+		"SystemMemory": SystemMemory,
 	} {
 		if got == "" {
 			t.Errorf("%s is empty — is its markdown file missing?", name)
@@ -38,16 +39,22 @@ func TestClassifierPromptStillDemandsBareJSON(t *testing.T) {
 	}
 }
 
-func TestSystemBaseIsPresentAndMentionsMemoryRules(t *testing.T) {
-	if SystemBase == "" {
-		t.Fatal("SystemBase is empty — is prompts/system_base.md missing?")
-	}
-	// The remember tool is useless if the model is never told when to reach
-	// for it, and harmful if it records project trivia.
-	for _, want := range []string{"remember", "preference"} {
-		if !strings.Contains(strings.ToLower(SystemBase), want) {
-			t.Errorf("SystemBase does not mention %q", want)
+// The remember tool is useless if the model is never told when to reach for
+// it, and harmful if it records project trivia.
+func TestSystemMemoryExplainsWhenToRemember(t *testing.T) {
+	for _, want := range []string{"remember", "preference", "approval"} {
+		if !strings.Contains(strings.ToLower(SystemMemory), want) {
+			t.Errorf("SystemMemory does not mention %q", want)
 		}
+	}
+}
+
+// The memory instructions must live outside SystemBase so they can be withheld
+// when memory is disabled; describing an unbound tool invites the model to
+// promise something it cannot do.
+func TestSystemBaseSaysNothingAboutMemory(t *testing.T) {
+	if strings.Contains(strings.ToLower(SystemBase), "remember") {
+		t.Error("SystemBase mentions the remember tool; it belongs in SystemMemory")
 	}
 }
 

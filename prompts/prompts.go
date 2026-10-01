@@ -25,6 +25,9 @@ var toolDeniedMD string
 //go:embed system_base.md
 var systemBaseMD string
 
+//go:embed system_memory.md
+var systemMemoryMD string
+
 var (
 	// Classifier is the system prompt for the tool-call safety classifier.
 	// It must keep instructing the model to answer with a bare JSON object —
@@ -45,4 +48,10 @@ var (
 	// SystemBase is the base system prompt: how dewey behaves before any of
 	// the user's own remembered preferences are layered on.
 	SystemBase = strings.TrimSpace(systemBaseMD)
+
+	// SystemMemory explains the remember tool. It is a separate fragment
+	// because it must only be sent when memory is actually enabled — telling
+	// the model about a tool that was never bound invites it to promise
+	// something it cannot do, or to call a tool that does not exist.
+	SystemMemory = strings.TrimSpace(systemMemoryMD)
 )

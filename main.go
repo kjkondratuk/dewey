@@ -98,7 +98,7 @@ func buildMemory(cwd string, cfg config.Config) (*memory.SystemPrompt, tools2.Me
 		recorder *memory.Recorder
 		provider *memory.Provider
 	)
-	systemPrompt := memory.NewSystemPrompt(prompts.SystemBase, nil)
+	systemPrompt := memory.NewSystemPrompt(prompts.SystemBase, prompts.SystemMemory, nil)
 
 	if cfg.Memory.Enabled {
 		mc := memory.DetectContext(cwd, cfg.Org)
@@ -107,7 +107,7 @@ func buildMemory(cwd string, cfg config.Config) (*memory.SystemPrompt, tools2.Me
 			memory.NewFileStore(filepath.Join(cwd, ".dewey", "memory")),
 		)
 		provider = memory.NewProvider(store, memory.TagRetriever{}, mc, cfg.Memory.MaxTokens)
-		systemPrompt = memory.NewSystemPrompt(prompts.SystemBase, provider)
+		systemPrompt = memory.NewSystemPrompt(prompts.SystemBase, prompts.SystemMemory, provider)
 		recorder = memory.NewRecorder(store, mc)
 	}
 
