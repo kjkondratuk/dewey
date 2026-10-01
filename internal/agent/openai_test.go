@@ -829,3 +829,85 @@ func TestCompact_DoesNotTouchTheSystemMessage(t *testing.T) {
 		t.Error("system message was affected by compaction")
 	}
 }
+
+// noticingProvider reports notices that change between calls, mimicking a
+// memory evicted for budget partway through a session.
+type noticingProvider struct {
+	calls   int
+	notices []string
+}
+
+func (p *noticingProvider) System(ctx context.Context) (*schema.Message, error) {
+	p.calls++
+	if p.calls > 1 {
+		p.notices = []string{"memory budget of 30 tokens exceeded; 1 memories omitted"}
+	}
+	return &schema.Message{Role: schema.System, Content: "RULES"}, nil
+}
+
+func (p *noticingProvider) Notices() []string { return p.notices }
+
+// A memory evicted for budget right after the user was told "Saved." must not
+// vanish silently — the startup report cannot cover something that happens
+// mid-session.
+func TestRun_MidSessionNoticesAreSurfaced(t *testing.T) {
+	sp := &noticingProvider{}
+	tl := newRecordingTool(t, new(int))
+	m := &fakeStreamModel{responses: [][]*schema.Message{
+		toolCallResponse("do_thing", `{"x":"1"}`),
+		finalResponse("done"),
+	}}
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 0, nil)
+	agt.systemProvider = sp
+
+	ch, err := agt.Run(context.Background(), "go")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events := drain(t, ch, func(Event) bool { return true })
+
+	var notices []string
+	for _, e := range events {
+		if e.Kind == "notice" {
+			notices = append(notices, e.Payload)
+		}
+	}
+	if len(notices) != 1 {
+		t.Fatalf("notice events = %v, want exactly one", notices)
+	}
+	if !strings.Contains(notices[0], "budget") {
+		t.Errorf("notice = %q, want the budget message", notices[0])
+	}
+}
+
+// A steady-state problem must be reported once, not before every model call.
+func TestRun_UnchangedNoticesAreNotRepeated(t *testing.T) {
+	sp := &fakeNoticeProvider{notices: []string{"skipped memory bad.md: invalid frontmatter"}}
+	tl := newRecordingTool(t, new(int))
+	m := &fakeStreamModel{responses: [][]*schema.Message{
+		toolCallResponse("do_thing", `{"x":"1"}`),
+		finalResponse("done"),
+	}}
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 0, nil)
+	agt.systemProvider = sp
+
+	ch, _ := agt.Run(context.Background(), "go")
+	events := drain(t, ch, func(Event) bool { return true })
+
+	count := 0
+	for _, e := range events {
+		if e.Kind == "notice" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("notice events = %d across two Stream calls, want 1 — a standing problem must not repeat", count)
+	}
+}
+
+type fakeNoticeProvider struct{ notices []string }
+
+func (p *fakeNoticeProvider) System(ctx context.Context) (*schema.Message, error) {
+	return &schema.Message{Role: schema.System, Content: "RULES"}, nil
+}
+func (p *fakeNoticeProvider) Notices() []string { return p.notices }

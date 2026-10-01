@@ -49,3 +49,14 @@ func (s *SystemPrompt) System(ctx context.Context) (*schema.Message, error) {
 
 	return &schema.Message{Role: schema.System, Content: b.String()}, nil
 }
+
+// Notices reports anything the user should know about the last load. It exists
+// so the agent can surface problems that arise mid-session: the startup report
+// only covers the first load, but a memory saved later can evict another for
+// budget, and a file can become malformed while a session is running.
+func (s *SystemPrompt) Notices() []string {
+	if s.provider == nil {
+		return nil
+	}
+	return s.provider.Notices()
+}

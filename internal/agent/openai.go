@@ -48,6 +48,13 @@ type SystemPromptProvider interface {
 	System(ctx context.Context) (*schema.Message, error)
 }
 
+// noticeReporter is an optional capability of a SystemPromptProvider: anything
+// the user should be told about the state of their profile. Optional so the
+// core interface stays a single method.
+type noticeReporter interface {
+	Notices() []string
+}
+
 type openaiAgent struct {
 	cm         model.ToolCallingChatModel
 	tools      map[string]tool.InvokableTool
@@ -69,6 +76,10 @@ type openaiAgent struct {
 	// so estimateTokens only needs to estimate the delta since then.
 	lastKnownTokens int
 	lastKnownAt     int
+
+	// lastNotices is the set already shown, so a steady-state problem is
+	// reported once rather than before every model call.
+	lastNotices []string
 }
 
 // New builds an agent backed by cm, which must already have the tool schemas
@@ -173,6 +184,14 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 				ch <- Event{Kind: "error", Payload: "system prompt unavailable: " + err.Error()}
 				return
 			}
+			// Report profile problems that appeared since the last call. The
+			// startup report only covers the first load, but saving a memory
+			// can evict another for budget -- precisely when the user has just
+			// been told "Saved."
+			if notice := a.newNotices(); notice != "" {
+				ch <- Event{Kind: "notice", Payload: notice}
+			}
+
 			sr, err := a.cm.Stream(ctx, outbound)
 			if err != nil {
 				ch <- Event{Kind: "error", Payload: err.Error()}
@@ -266,6 +285,35 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 	}()
 
 	return ch, nil
+}
+
+// newNotices returns any notices not yet shown, joined, or "" if nothing is
+// new. Must be called after messages(), which is what triggers the reload the
+// notices describe.
+func (a *openaiAgent) newNotices() string {
+	reporter, ok := a.systemProvider.(noticeReporter)
+	if !ok {
+		return ""
+	}
+
+	current := reporter.Notices()
+	seen := make(map[string]bool, len(a.lastNotices))
+	for _, n := range a.lastNotices {
+		seen[n] = true
+	}
+
+	var fresh []string
+	for _, n := range current {
+		if !seen[n] {
+			fresh = append(fresh, n)
+		}
+	}
+	a.lastNotices = current
+
+	if len(fresh) == 0 {
+		return ""
+	}
+	return strings.Join(fresh, "\n")
 }
 
 // classify resolves the risk classification for a tool call: a config
