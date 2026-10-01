@@ -469,3 +469,119 @@ func TestFileStore_SaveLeavesNoTempFilesBehind(t *testing.T) {
 		t.Errorf("directory has %d entries, want 1", len(entries))
 	}
 }
+
+// The in-place-edit test changes body length, so size alone carries it and a
+// digest that ignored mtime would still pass. This pins mtime specifically.
+func TestFileStore_RevisionNoticesASameLengthEdit(t *testing.T) {
+	dir := t.TempDir()
+	writeMemFile(t, dir, "x.md", "---\nid: x\n---\nAAAA.\n")
+	s := NewFileStore(dir)
+	before := s.Revision(context.Background())
+
+	writeMemFile(t, dir, "x.md", "---\nid: x\n---\nBBBB.\n")
+	// Force a distinct mtime: the write may land inside the same timestamp tick.
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(filepath.Join(dir, "x.md"), future, future); err != nil {
+		t.Fatal(err)
+	}
+
+	if after := s.Revision(context.Background()); after == before {
+		t.Error("Revision ignored a same-length edit — the digest is not covering mtime")
+	}
+}
+
+// A directory named *.md must not be read as a memory.
+func TestFileStore_IgnoresDirectoriesNamedLikeMemories(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "notamemory.md"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeMemFile(t, dir, "real.md", "---\nid: real\n---\nReal.\n")
+
+	res, err := NewFileStore(dir).Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(res.Memories) != 1 || res.Memories[0].ID != "real" {
+		t.Errorf("memories = %+v, want only the actual file", res.Memories)
+	}
+	if len(res.Skipped) != 0 {
+		t.Errorf("Skipped = %+v, want a directory to be ignored silently", res.Skipped)
+	}
+}
+
+// The id becomes a filename and can come from model output, so this is a
+// containment check. One input asserting only err != nil would also pass if
+// Save rejected everything, so this walks the parent afterwards.
+func TestFileStore_SaveRejectsEveryUnsafeIDAndWritesNothingOutside(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "memory")
+	s := NewFileStore(dir)
+
+	hostile := []string{
+		"../escape", "a/b", "..", ".", "", "ok\n../escape", "../escape\nok",
+		"ok-id\x00", "A-B", "a_b", "a.b", "/abs", "a//b", "-lead", "trail-",
+	}
+	for _, id := range hostile {
+		if err := s.Save(context.Background(), Memory{ID: id, Text: "Body."}); err == nil {
+			t.Errorf("Save(id=%q) was accepted, want rejected", id)
+		}
+	}
+
+	// A legitimate id must still work, or the test would pass by rejecting all.
+	if err := s.Save(context.Background(), Memory{ID: "legitimate-id", Text: "Body."}); err != nil {
+		t.Fatalf("Save of a valid id failed: %v", err)
+	}
+
+	var outside []string
+	err := filepath.WalkDir(parent, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if filepath.Dir(path) != dir {
+			outside = append(outside, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outside) != 0 {
+		t.Errorf("files written outside the memory directory: %v", outside)
+	}
+}
+
+// The "no body text" rule is reachable three ways and was asserted none.
+func TestFileStore_BodylessMemoriesAreReportedNotLoaded(t *testing.T) {
+	dir := t.TempDir()
+	writeMemFile(t, dir, "frontmatter-only.md", "---\nid: a\n---\n")
+	writeMemFile(t, dir, "whitespace-body.md", "---\nid: b\n---\n   \n\t\n")
+
+	res, err := NewFileStore(dir).Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(res.Memories) != 0 {
+		t.Errorf("memories = %+v, want none — neither file has body text", res.Memories)
+	}
+	if len(res.Skipped) != 2 {
+		t.Errorf("Skipped = %+v, want both files reported", res.Skipped)
+	}
+}
+
+func TestFileStore_CreatedIsParsedFromHandWrittenFrontmatter(t *testing.T) {
+	dir := t.TempDir()
+	writeMemFile(t, dir, "dated.md", "---\nid: dated\ncreated: 2026-09-27\n---\nBody.\n")
+
+	res, _ := NewFileStore(dir).Load(context.Background())
+	if len(res.Memories) != 1 {
+		t.Fatalf("loaded %d memories, want 1", len(res.Memories))
+	}
+	want := time.Date(2026, 9, 27, 0, 0, 0, 0, time.UTC)
+	if got := res.Memories[0].Created; !got.Equal(want) {
+		t.Errorf("Created = %v, want %v", got, want)
+	}
+}

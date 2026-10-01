@@ -292,11 +292,16 @@ func (s *FileStore) writeAtomic(name, contents string) error {
 // in-process write counter. It deliberately does not use the directory's own
 // mtime, which moves only when an entry is added or removed: rewriting a file
 // in place leaves it untouched, so a hand-edited memory would never be
-// reloaded. The counter covers this process's own saves without depending on
-// filesystem timestamp granularity, which can be as coarse as a second.
+// reloaded.
 //
-// This runs before every model call, so it stays to one read of the directory
-// and a fixed-size digest rather than an unbounded string.
+// The counter makes this process's own saves register without relying on
+// timestamp resolution. External edits do rely on it, so an edit that changes
+// neither size nor mtime is invisible — unreachable for a real editor save on
+// a filesystem with nanosecond mtimes, but worth knowing.
+//
+// This runs before every model call. The digest is fixed-size, though the work
+// is O(files): one directory read plus a stat per entry, which is what
+// dominates.
 func (s *FileStore) Revision(ctx context.Context) string {
 	h := fnv.New64a()
 	buf := binary.LittleEndian.AppendUint64(make([]byte, 0, 64), s.gen.Load())
