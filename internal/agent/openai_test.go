@@ -17,6 +17,11 @@ import (
 type fakeStreamModel struct {
 	responses [][]*schema.Message
 	calls     int
+
+	// seen records the exact message slice handed to each Stream call, which
+	// is the only way to assert what the model was actually sent as opposed
+	// to what the agent kept in history.
+	seen [][]*schema.Message
 }
 
 func (f *fakeStreamModel) Generate(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.Message, error) {
@@ -24,6 +29,7 @@ func (f *fakeStreamModel) Generate(ctx context.Context, in []*schema.Message, op
 }
 
 func (f *fakeStreamModel) Stream(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	f.seen = append(f.seen, in)
 	resp := f.responses[f.calls]
 	f.calls++
 	return schema.StreamReaderFromArray(resp), nil
@@ -59,6 +65,19 @@ func (f *fakeSummarizer) Summarize(ctx context.Context, messages []*schema.Messa
 		return "", f.err
 	}
 	return f.result, nil
+}
+
+type fakeSystemProvider struct {
+	text  string
+	calls int
+}
+
+func (f *fakeSystemProvider) System(ctx context.Context) (*schema.Message, error) {
+	f.calls++
+	if f.text == "" {
+		return nil, nil
+	}
+	return &schema.Message{Role: schema.System, Content: f.text}, nil
 }
 
 type echoInput struct {
@@ -188,14 +207,35 @@ func TestRun_DenialSkipsToolAndFeedsHistoryBack(t *testing.T) {
 		t.Errorf("last event = %+v, want done", events[len(events)-1])
 	}
 
-	found := false
+	var denial *schema.Message
 	for _, msg := range agt.history {
-		if msg.Role == schema.Tool && msg.Content == "error: user denied permission for this action" {
-			found = true
+		if msg.Role == schema.Tool && msg.Content == deniedToolResult {
+			denial = msg
 		}
 	}
-	if !found {
-		t.Error("expected a denial tool message in history")
+	if denial == nil {
+		t.Fatal("expected a denial tool message in history")
+	}
+	// Name is the field the OpenAI adapter actually serializes; ToolName
+	// alone would be dropped on the wire.
+	if denial.Name != "do_thing" {
+		t.Errorf("denial Name = %q, want %q", denial.Name, "do_thing")
+	}
+	if denial.ToolName != "do_thing" {
+		t.Errorf("denial ToolName = %q, want %q", denial.ToolName, "do_thing")
+	}
+}
+
+// A denial and a genuinely-unavailable tool must not look alike to the model:
+// conflating them is what made it report being unable to act at all.
+func TestDenialAndUnknownToolResultsAreDistinguishable(t *testing.T) {
+	unknown := "error: unknown tool do_thing"
+
+	if strings.HasPrefix(deniedToolResult, "error:") {
+		t.Errorf("deniedToolResult wears the same error: prefix as a capability failure: %q", deniedToolResult)
+	}
+	if strings.HasPrefix(unknown, "error:") == strings.HasPrefix(deniedToolResult, "error:") {
+		t.Error("denial and unknown-tool results are not distinguishable by shape")
 	}
 }
 
@@ -439,3 +479,435 @@ func TestRun_SkipsCompactionOnFirstTurn(t *testing.T) {
 		t.Errorf("summarizer was invoked on first turn, want it skipped entirely")
 	}
 }
+
+func TestDescribeArgs_UnwrapsALoneStringArgument(t *testing.T) {
+	got := describeArgs(`{"command":"grep -rn foo ."}`)
+	if got != "grep -rn foo ." {
+		t.Errorf("describeArgs() = %q, want the bare command", got)
+	}
+}
+
+func TestDescribeArgs_PreservesRealNewlines(t *testing.T) {
+	got := describeArgs(`{"command":"line one\nline two"}`)
+	if got != "line one\nline two" {
+		t.Errorf("describeArgs() = %q, want real newlines, not escaped ones", got)
+	}
+	if strings.Contains(got, `\n`) {
+		t.Errorf("describeArgs() = %q, still contains an escaped newline", got)
+	}
+}
+
+func TestDescribeArgs_FallsBackToJSONForMultipleFields(t *testing.T) {
+	got := describeArgs(`{"a":"1","b":"2"}`)
+	if !strings.Contains(got, `"a"`) || !strings.Contains(got, `"b"`) {
+		t.Errorf("describeArgs() = %q, want indented JSON keeping both fields", got)
+	}
+}
+
+func TestDescribeArgs_FallsBackForNonStringAndMalformedInput(t *testing.T) {
+	if got := describeArgs(`{"n":5}`); !strings.Contains(got, "5") {
+		t.Errorf("describeArgs() = %q, want the number preserved via JSON fallback", got)
+	}
+	if got := describeArgs(`not json at all`); got != "not json at all" {
+		t.Errorf("describeArgs() = %q, want the raw input echoed back", got)
+	}
+}
+
+func TestFence_OutgrowsBackticksInTheBody(t *testing.T) {
+	for _, run := range []int{0, 1, 2, 3, 4, 5, 8} {
+		body := "echo '" + strings.Repeat("`", run) + "'"
+		got := fence(body)
+
+		lines := strings.Split(got, "\n")
+		if len(lines) < 3 {
+			t.Fatalf("fence(run=%d) = %q, want open/body/close lines", run, got)
+		}
+		open, close := lines[0], lines[len(lines)-1]
+
+		// CommonMark: the closing fence must be at least as long as the
+		// opening one, so the opening must strictly exceed any run inside.
+		if open != close {
+			t.Errorf("fence(run=%d): open %q != close %q", run, open, close)
+		}
+		if len(open) < 3 {
+			t.Errorf("fence(run=%d): open %q shorter than three backticks", run, open)
+		}
+		if len(open) <= run {
+			t.Errorf("fence(run=%d): open %q does not outgrow the body's run", run, open)
+		}
+		if !strings.Contains(got, body) {
+			t.Errorf("fence(run=%d) = %q, want the body verbatim", run, got)
+		}
+	}
+}
+
+func TestFence_UsesThreeBackticksWhenBodyHasNone(t *testing.T) {
+	got := fence("ls -la")
+	if got != "```\nls -la\n```" {
+		t.Errorf("fence() = %q, want a plain triple-backtick fence", got)
+	}
+}
+
+func TestFormatConfirmMessage_IncludesSummaryAndBareCommand(t *testing.T) {
+	c := safety.Classification{Kind: "write", Risk: safety.Dangerous, Summary: "Deletes the build output directory."}
+	got := formatConfirmMessage("run_shell_command", c, `{"command":"rm -rf ./dist"}`)
+
+	for _, want := range []string{
+		"run_shell_command wants to run (WRITE) [risk: dangerous]",
+		"Deletes the build output directory.",
+		"rm -rf ./dist",
+		"Allow? [y/n]",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("formatConfirmMessage() = %q, missing %q", got, want)
+		}
+	}
+	if strings.Contains(got, `{"command"`) {
+		t.Errorf("formatConfirmMessage() = %q, should not show the raw JSON object", got)
+	}
+}
+
+func TestFormatConfirmMessage_OmitsSummaryLineWhenEmpty(t *testing.T) {
+	c := safety.Classification{Risk: safety.Moderate}
+	got := formatConfirmMessage("run_shell_command", c, `{"command":"touch f"}`)
+
+	if strings.Contains(got, "\n\n\n") {
+		t.Errorf("formatConfirmMessage() = %q, left a blank gap where the summary would go", got)
+	}
+	if !strings.Contains(got, "touch f") || !strings.Contains(got, "Allow? [y/n]") {
+		t.Errorf("formatConfirmMessage() = %q, missing the command or the prompt", got)
+	}
+}
+
+func TestRun_ApprovedCallEmitsBriefInvocationAndSafeCallEmitsFull(t *testing.T) {
+	// Approved: the command was already shown in the confirm prompt.
+	invoked := 0
+	tl := newRecordingTool(t, &invoked)
+	m := &fakeStreamModel{responses: [][]*schema.Message{
+		toolCallResponse("do_thing", `{"command":"rm -rf ./dist"}`),
+		finalResponse("done"),
+	}}
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Kind: "write", Risk: safety.Dangerous}}, nil, 0, nil)
+
+	ch, err := agt.Run(context.Background(), "go")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events := drain(t, ch, func(Event) bool { return true }) // allow
+
+	var toolPayload string
+	for _, e := range events {
+		if e.Kind == "tool" {
+			toolPayload = e.Payload
+		}
+	}
+	if toolPayload != formatToolInvocationBrief() {
+		t.Errorf("approved tool payload = %q, want the brief form %q", toolPayload, formatToolInvocationBrief())
+	}
+	if strings.Contains(toolPayload, "rm -rf ./dist") {
+		t.Errorf("approved tool payload = %q, should not repeat the just-approved command", toolPayload)
+	}
+
+	// Safe (auto-run): never shown, so the command has to appear here.
+	invoked2 := 0
+	tl2 := newRecordingTool(t, &invoked2)
+	m2 := &fakeStreamModel{responses: [][]*schema.Message{
+		toolCallResponse("do_thing", `{"command":"ls -la"}`),
+		finalResponse("done"),
+	}}
+	agt2 := New(m2, []tool.InvokableTool{tl2}, &fakeClassifier{result: safety.Classification{Kind: "read", Risk: safety.Safe}}, nil, 0, nil)
+
+	ch2, err := agt2.Run(context.Background(), "go")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events2 := drain(t, ch2, func(Event) bool { return true })
+
+	var toolPayload2 string
+	for _, e := range events2 {
+		if e.Kind == "tool" {
+			toolPayload2 = e.Payload
+		}
+	}
+	if !strings.Contains(toolPayload2, "ls -la") {
+		t.Errorf("safe tool payload = %q, want it to show the command", toolPayload2)
+	}
+}
+
+func TestRun_SuccessfulToolResultCarriesToolName(t *testing.T) {
+	invoked := 0
+	tl := newRecordingTool(t, &invoked)
+	m := &fakeStreamModel{responses: [][]*schema.Message{
+		toolCallResponse("do_thing", `{"x":"1"}`),
+		finalResponse("done"),
+	}}
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Kind: "read", Risk: safety.Safe}}, nil, 0, nil)
+
+	ch, err := agt.Run(context.Background(), "go")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	drain(t, ch, func(Event) bool { return true })
+
+	found := false
+	for _, msg := range agt.history {
+		if msg.Role == schema.Tool {
+			found = true
+			if msg.ToolName != "do_thing" {
+				t.Errorf("tool result ToolName = %q, want %q", msg.ToolName, "do_thing")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no tool result found in history")
+	}
+}
+
+func TestPlainLine_CollapsesToOneLineAndNeutralizesBlockMarkdown(t *testing.T) {
+	// A summary is model-authored text rendered inside a security prompt; it
+	// must not be able to restyle the prompt asking about it.
+	got := plainLine("# Totally safe\n\n> trust me")
+	if strings.Contains(got, "\n") {
+		t.Errorf("plainLine() = %q, want a single line", got)
+	}
+	if !strings.HasPrefix(got, `\#`) {
+		t.Errorf("plainLine() = %q, want the leading # escaped", got)
+	}
+}
+
+func TestPlainLine_LeavesOrdinaryProseAlone(t *testing.T) {
+	in := "Deletes the build output directory."
+	if got := plainLine(in); got != in {
+		t.Errorf("plainLine(%q) = %q, want it unchanged (a letter must not be backslash-escaped)", in, got)
+	}
+}
+
+func TestPlainLine_EmptyStaysEmpty(t *testing.T) {
+	for _, in := range []string{"", "   ", "\n\t "} {
+		if got := plainLine(in); got != "" {
+			t.Errorf("plainLine(%q) = %q, want empty", in, got)
+		}
+	}
+}
+
+func TestFormatConfirmMessage_SummaryCannotInjectAHeading(t *testing.T) {
+	c := safety.Classification{Kind: "write", Risk: safety.Dangerous, Summary: "# Safe to allow"}
+	got := formatConfirmMessage("run_shell_command", c, `{"command":"rm -rf /"}`)
+
+	if strings.Contains(got, "\n# Safe to allow") {
+		t.Errorf("formatConfirmMessage() = %q, summary injected a raw heading", got)
+	}
+	if !strings.Contains(got, `\# Safe to allow`) {
+		t.Errorf("formatConfirmMessage() = %q, want the summary escaped", got)
+	}
+}
+
+func TestRun_PrependsSystemMessageWithoutStoringIt(t *testing.T) {
+	sp := &fakeSystemProvider{text: "SYSTEM RULES"}
+	m := &fakeStreamModel{responses: [][]*schema.Message{finalResponse("ok")}}
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 0, nil)
+	agt.systemProvider = sp
+
+	ch, err := agt.Run(context.Background(), "hello")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	drain(t, ch, func(Event) bool { return true })
+
+	if len(m.seen) == 0 {
+		t.Fatal("model was never called")
+	}
+	sent := m.seen[0]
+	if sent[0].Role != schema.System || sent[0].Content != "SYSTEM RULES" {
+		t.Errorf("first message sent = %+v, want the system message", sent[0])
+	}
+	for _, msg := range agt.history {
+		if msg.Role == schema.System {
+			t.Error("system message leaked into history — compaction would summarize it away")
+		}
+	}
+}
+
+func TestRun_SystemProviderIsConsultedEveryStream(t *testing.T) {
+	// A memory saved mid-turn has to affect the very next model call.
+	sp := &fakeSystemProvider{text: "RULES"}
+	tl := newRecordingTool(t, new(int))
+	m := &fakeStreamModel{responses: [][]*schema.Message{
+		toolCallResponse("do_thing", `{"x":"1"}`),
+		finalResponse("done"),
+	}}
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 0, nil)
+	agt.systemProvider = sp
+
+	ch, _ := agt.Run(context.Background(), "go")
+	drain(t, ch, func(Event) bool { return true })
+
+	if sp.calls < 2 {
+		t.Errorf("system provider consulted %d times, want once per Stream call", sp.calls)
+	}
+}
+
+func TestRun_NilSystemProviderSendsHistoryUnchanged(t *testing.T) {
+	m := &fakeStreamModel{responses: [][]*schema.Message{finalResponse("ok")}}
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 0, nil)
+
+	ch, _ := agt.Run(context.Background(), "hello")
+	drain(t, ch, func(Event) bool { return true })
+
+	if m.seen[0][0].Role == schema.System {
+		t.Error("a system message appeared with no provider configured")
+	}
+}
+
+// Asserting that the provider still returns its own text proves nothing: that
+// holds even if compact() ate the message, if messages() stopped prepending
+// it, or if WithSystemPrompt were a no-op. Drive a real compaction and inspect
+// what actually reached the model.
+func TestRun_SystemMessageSurvivesARealCompaction(t *testing.T) {
+	sp := &fakeSystemProvider{text: "SYSTEM RULES"}
+	m := &fakeStreamModel{responses: [][]*schema.Message{finalResponse("ok")}}
+
+	// A tiny context window guarantees the seeded history trips the threshold.
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 10,
+		&fakeSummarizer{result: "the summary"})
+	agt.systemProvider = sp
+	agt.history = []*schema.Message{
+		{Role: schema.User, Content: strings.Repeat("filler content ", 200)},
+		{Role: schema.Assistant, Content: strings.Repeat("more filler ", 200)},
+	}
+
+	ch, err := agt.Run(context.Background(), "continue")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events := drain(t, ch, func(Event) bool { return true })
+
+	compacted := false
+	for _, e := range events {
+		if e.Kind == "compacted" {
+			compacted = true
+		}
+	}
+	if !compacted {
+		t.Fatal("compaction never fired; this test would prove nothing")
+	}
+	if len(m.seen) == 0 {
+		t.Fatal("model was never called")
+	}
+
+	sent := m.seen[len(m.seen)-1]
+	if sent[0].Role != schema.System || sent[0].Content != "SYSTEM RULES" {
+		t.Errorf("first message after compaction = %+v, want the system message intact", sent[0])
+	}
+	// The compaction summary is itself a system-role message, so confirm the
+	// agent's own instructions weren't what got replaced.
+	if len(sent) < 2 || !strings.Contains(sent[1].Content, "the summary") {
+		t.Errorf("second message = %+v, want the compaction summary", sent[1])
+	}
+	for _, msg := range agt.history {
+		if msg.Role == schema.System && msg.Content == "SYSTEM RULES" {
+			t.Error("the system prompt leaked into history, where the next compaction would consume it")
+		}
+	}
+}
+
+func TestCompact_DoesNotTouchTheSystemMessage(t *testing.T) {
+	sp := &fakeSystemProvider{text: "RULES"}
+	agt := New(nil, nil, nil, nil, 1000, &fakeSummarizer{result: "summary"})
+	agt.systemProvider = sp
+	agt.history = []*schema.Message{
+		{Role: schema.User, Content: "one"},
+		{Role: schema.Assistant, Content: "two"},
+	}
+
+	if err := agt.compact(context.Background(), 2); err != nil {
+		t.Fatalf("compact() error = %v", err)
+	}
+
+	sys, _ := sp.System(context.Background())
+	if sys == nil || sys.Content != "RULES" {
+		t.Error("system message was affected by compaction")
+	}
+}
+
+// noticingProvider reports notices that change between calls, mimicking a
+// memory evicted for budget partway through a session.
+type noticingProvider struct {
+	calls   int
+	notices []string
+}
+
+func (p *noticingProvider) System(ctx context.Context) (*schema.Message, error) {
+	p.calls++
+	if p.calls > 1 {
+		p.notices = []string{"memory budget of 30 tokens exceeded; 1 memories omitted"}
+	}
+	return &schema.Message{Role: schema.System, Content: "RULES"}, nil
+}
+
+func (p *noticingProvider) Notices() []string { return p.notices }
+
+// A memory evicted for budget right after the user was told "Saved." must not
+// vanish silently — the startup report cannot cover something that happens
+// mid-session.
+func TestRun_MidSessionNoticesAreSurfaced(t *testing.T) {
+	sp := &noticingProvider{}
+	tl := newRecordingTool(t, new(int))
+	m := &fakeStreamModel{responses: [][]*schema.Message{
+		toolCallResponse("do_thing", `{"x":"1"}`),
+		finalResponse("done"),
+	}}
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 0, nil)
+	agt.systemProvider = sp
+
+	ch, err := agt.Run(context.Background(), "go")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events := drain(t, ch, func(Event) bool { return true })
+
+	var notices []string
+	for _, e := range events {
+		if e.Kind == "notice" {
+			notices = append(notices, e.Payload)
+		}
+	}
+	if len(notices) != 1 {
+		t.Fatalf("notice events = %v, want exactly one", notices)
+	}
+	if !strings.Contains(notices[0], "budget") {
+		t.Errorf("notice = %q, want the budget message", notices[0])
+	}
+}
+
+// A steady-state problem must be reported once, not before every model call.
+func TestRun_UnchangedNoticesAreNotRepeated(t *testing.T) {
+	sp := &fakeNoticeProvider{notices: []string{"skipped memory bad.md: invalid frontmatter"}}
+	tl := newRecordingTool(t, new(int))
+	m := &fakeStreamModel{responses: [][]*schema.Message{
+		toolCallResponse("do_thing", `{"x":"1"}`),
+		finalResponse("done"),
+	}}
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 0, nil)
+	agt.systemProvider = sp
+
+	ch, _ := agt.Run(context.Background(), "go")
+	events := drain(t, ch, func(Event) bool { return true })
+
+	count := 0
+	for _, e := range events {
+		if e.Kind == "notice" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("notice events = %d across two Stream calls, want 1 — a standing problem must not repeat", count)
+	}
+}
+
+type fakeNoticeProvider struct{ notices []string }
+
+func (p *fakeNoticeProvider) System(ctx context.Context) (*schema.Message, error) {
+	return &schema.Message{Role: schema.System, Content: "RULES"}, nil
+}
+func (p *fakeNoticeProvider) Notices() []string { return p.notices }

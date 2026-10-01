@@ -16,11 +16,44 @@ import (
 
 	"github.com/kjkondratuk/dewey/internal/compaction"
 	"github.com/kjkondratuk/dewey/internal/safety"
+	"github.com/kjkondratuk/dewey/prompts"
 )
 
 // compactionThreshold is the fraction of the context window that triggers
 // automatic compaction.
 const compactionThreshold = 0.90
+
+// deniedToolResult is what the model sees when the user declines a tool call.
+// It deliberately avoids the word "error" and states outright that the
+// capability exists, because the failure mode being guarded against is the
+// model reading a denial as a missing capability and reporting that it is
+// unable to perform the action at all. The text lives in
+// prompts/tool_denied.md.
+var deniedToolResult = prompts.ToolDenied
+
+// toolResult builds a tool-result message with the originating tool's name
+// attached. Both name fields are set on purpose: eino's WithToolName only
+// populates Message.ToolName, but the OpenAI adapter serializes Message.Name,
+// so setting either one alone silently drops the attribution on the wire.
+func toolResult(content, toolCallID, toolName string) *schema.Message {
+	msg := schema.ToolMessage(content, toolCallID, schema.WithToolName(toolName))
+	msg.Name = toolName
+	return msg
+}
+
+// SystemPromptProvider supplies the system message for each model call. It is
+// consulted per Stream rather than once per session so a memory saved mid-turn
+// takes effect immediately.
+type SystemPromptProvider interface {
+	System(ctx context.Context) (*schema.Message, error)
+}
+
+// noticeReporter is an optional capability of a SystemPromptProvider: anything
+// the user should be told about the state of their profile. Optional so the
+// core interface stays a single method.
+type noticeReporter interface {
+	Notices() []string
+}
 
 type openaiAgent struct {
 	cm         model.ToolCallingChatModel
@@ -30,6 +63,11 @@ type openaiAgent struct {
 	overrides  safety.RiskOverrides
 	history    []*schema.Message
 
+	// systemProvider is deliberately not part of history: compact() rewrites
+	// history[:truncateLen], so a system message stored there would be
+	// summarized away the first time compaction fired.
+	systemProvider SystemPromptProvider
+
 	contextWindow int
 	summarizer    compaction.Summarizer
 
@@ -38,6 +76,10 @@ type openaiAgent struct {
 	// so estimateTokens only needs to estimate the delta since then.
 	lastKnownTokens int
 	lastKnownAt     int
+
+	// lastNotices is the set already shown, so a steady-state problem is
+	// reported once rather than before every model call.
+	lastNotices []string
 }
 
 // New builds an agent backed by cm, which must already have the tool schemas
@@ -77,6 +119,29 @@ func New(
 	}
 }
 
+// WithSystemPrompt attaches a system prompt provider. Separate from New so the
+// existing call sites and their tests stay unchanged.
+func (a *openaiAgent) WithSystemPrompt(p SystemPromptProvider) *openaiAgent {
+	a.systemProvider = p
+	return a
+}
+
+// messages returns what to send: the system message, if any, followed by the
+// conversation. The system message is rebuilt per call.
+func (a *openaiAgent) messages(ctx context.Context) ([]*schema.Message, error) {
+	if a.systemProvider == nil {
+		return a.history, nil
+	}
+	sys, err := a.systemProvider.System(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if sys == nil {
+		return a.history, nil
+	}
+	return append([]*schema.Message{sys}, a.history...), nil
+}
+
 func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, error) {
 	truncateLen := len(a.history)
 	a.history = append(a.history, &schema.Message{
@@ -114,7 +179,20 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 		// any tool calls it asked for. Loops back around with the tool
 		// results appended to history until the model stops calling tools.
 		for {
-			sr, err := a.cm.Stream(ctx, a.history)
+			outbound, err := a.messages(ctx)
+			if err != nil {
+				ch <- Event{Kind: "error", Payload: "system prompt unavailable: " + err.Error()}
+				return
+			}
+			// Report profile problems that appeared since the last call. The
+			// startup report only covers the first load, but saving a memory
+			// can evict another for budget -- precisely when the user has just
+			// been told "Saved."
+			if notice := a.newNotices(); notice != "" {
+				ch <- Event{Kind: "notice", Payload: notice}
+			}
+
+			sr, err := a.cm.Stream(ctx, outbound)
 			if err != nil {
 				ch <- Event{Kind: "error", Payload: err.Error()}
 				return
@@ -128,8 +206,12 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 				}
 				if errors.Is(err, context.Canceled) {
 					sr.Close()
-					// drop the user turn too, as if the question was never asked
-					a.history = a.history[:len(a.history)-1]
+					// Roll the whole turn back, as if the question was never
+					// asked. Dropping just the last message is only equivalent
+					// on the first pass: cancelling during a later model turn
+					// would strip one tool result and leave an assistant
+					// message with orphaned ToolCalls, which the API rejects.
+					a.history = a.history[:truncateLen]
 					ch <- Event{Kind: "cancelled"}
 					return
 				}
@@ -162,11 +244,15 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 			for _, tc := range full.ToolCalls {
 				t, ok := a.tools[tc.Function.Name]
 				if !ok {
-					a.history = append(a.history, schema.ToolMessage(
-						"error: unknown tool "+tc.Function.Name, tc.ID))
+					a.history = append(a.history, toolResult(
+						"error: unknown tool "+tc.Function.Name, tc.ID, tc.Function.Name))
 					continue
 				}
 
+				// confirmed records whether the user was just shown this exact
+				// call and approved it, so the status line below doesn't repeat
+				// a command that's already on screen.
+				confirmed := false
 				classification := a.classify(ctx, tc.Function.Name, tc.Function.Arguments)
 				if classification.Risk != safety.Safe {
 					allowed, cancelled := a.awaitConfirmation(ctx, ch, tc.Function.Name, classification, tc.Function.Arguments)
@@ -176,24 +262,58 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 						return
 					}
 					if !allowed {
-						a.history = append(a.history, schema.ToolMessage(
-							"error: user denied permission for this action", tc.ID))
+						a.history = append(a.history, toolResult(deniedToolResult, tc.ID, tc.Function.Name))
 						continue
 					}
+					confirmed = true
 				}
 
-				ch <- Event{Kind: "tool", Payload: formatToolInvocation(tc.Function.Name, tc.Function.Arguments)}
+				if confirmed {
+					ch <- Event{Kind: "tool", Payload: formatToolInvocationBrief()}
+				} else {
+					ch <- Event{Kind: "tool", Payload: formatToolInvocation(tc.Function.Name, tc.Function.Arguments)}
+				}
+
 				result, err := t.InvokableRun(ctx, tc.Function.Arguments)
 				if err != nil {
 					result = "error: " + err.Error()
 				}
-				a.history = append(a.history, schema.ToolMessage(result, tc.ID))
+				a.history = append(a.history, toolResult(result, tc.ID, tc.Function.Name))
 			}
 			// loop back around and stream again with tool results in history
 		}
 	}()
 
 	return ch, nil
+}
+
+// newNotices returns any notices not yet shown, joined, or "" if nothing is
+// new. Must be called after messages(), which is what triggers the reload the
+// notices describe.
+func (a *openaiAgent) newNotices() string {
+	reporter, ok := a.systemProvider.(noticeReporter)
+	if !ok {
+		return ""
+	}
+
+	current := reporter.Notices()
+	seen := make(map[string]bool, len(a.lastNotices))
+	for _, n := range a.lastNotices {
+		seen[n] = true
+	}
+
+	var fresh []string
+	for _, n := range current {
+		if !seen[n] {
+			fresh = append(fresh, n)
+		}
+	}
+	a.lastNotices = current
+
+	if len(fresh) == 0 {
+		return ""
+	}
+	return strings.Join(fresh, "\n")
 }
 
 // classify resolves the risk classification for a tool call: a config
@@ -236,12 +356,20 @@ func (a *openaiAgent) recordUsage(full *schema.Message) {
 // estimateTokens returns the current context usage: the last provider-
 // reported total plus a tokenizer-based estimate of everything appended
 // since, or a full tokenizer estimate if no provider total was ever
-// recorded.
+// recorded. The system message is added on top in either case — it is sent
+// with every request but lives outside history, so neither the baseline nor
+// the delta covers it.
 func (a *openaiAgent) estimateTokens() int {
-	if a.lastKnownAt > 0 && a.lastKnownAt <= len(a.history) {
-		return a.lastKnownTokens + compaction.EstimateTokens(a.history[a.lastKnownAt:])
+	total := 0
+	if a.systemProvider != nil {
+		if sys, err := a.systemProvider.System(context.Background()); err == nil && sys != nil {
+			total += compaction.EstimateTokens([]*schema.Message{sys})
+		}
 	}
-	return compaction.EstimateTokens(a.history)
+	if a.lastKnownAt > 0 && a.lastKnownAt <= len(a.history) {
+		return total + a.lastKnownTokens + compaction.EstimateTokens(a.history[a.lastKnownAt:])
+	}
+	return total + compaction.EstimateTokens(a.history)
 }
 
 // shouldCompact reports whether estimated tokens have crossed
@@ -282,8 +410,76 @@ func prettyPrintArgs(argsJSON string) string {
 	return argsJSON
 }
 
+// describeArgs renders tool arguments for a human reader. A lone string
+// argument — the shape of run_shell_command's {"command": "..."} — is returned
+// bare, so a command reads as a command, with real newlines instead of
+// JSON-escaped ones. Anything else falls back to indented JSON rather than
+// risk silently dropping fields.
+func describeArgs(argsJSON string) string {
+	var fields map[string]any
+	if err := json.Unmarshal([]byte(argsJSON), &fields); err == nil && len(fields) == 1 {
+		for _, v := range fields {
+			if s, ok := v.(string); ok {
+				return strings.TrimRight(s, "\n")
+			}
+		}
+	}
+	return prettyPrintArgs(argsJSON)
+}
+
+// fence wraps body in a code fence long enough that no backtick run inside it
+// can terminate the block early — tool arguments are arbitrary text, and a
+// command containing a fence would otherwise break out into the surrounding
+// markdown.
+func fence(body string) string {
+	longest, run := 0, 0
+	for _, r := range body {
+		if r != '`' {
+			run = 0
+			continue
+		}
+		run++
+		if run > longest {
+			longest = run
+		}
+	}
+	delim := strings.Repeat("`", max(3, longest+1))
+	return delim + "\n" + body + "\n" + delim
+}
+
+// plainLine flattens model-authored text into a single line that can't take
+// over the markdown around it. The classifier's summary is untrusted output
+// rendered inside a security prompt, so it should describe the command, not
+// restyle the prompt asking about it.
+func plainLine(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if s == "" {
+		return ""
+	}
+	// Collapsing to one line already removes every interior line start, so
+	// block constructs (headings, lists, quotes, fences) can only trigger
+	// from the very first character. Escape it when it's punctuation —
+	// CommonMark only permits backslash-escaping ASCII punctuation, so doing
+	// this unconditionally would leave a literal backslash before a letter.
+	if isASCIIPunct(s[0]) {
+		return `\` + s
+	}
+	return s
+}
+
+func isASCIIPunct(b byte) bool {
+	return strings.IndexByte("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", b) >= 0
+}
+
 func formatToolInvocation(name, argsJSON string) string {
-	return fmt.Sprintf("Running %s:\n%s", name, prettyPrintArgs(argsJSON))
+	return fmt.Sprintf("Running %s:\n%s", name, fence(describeArgs(argsJSON)))
+}
+
+// formatToolInvocationBrief is used when the user just approved this exact
+// call. The command is already on screen immediately above, so repeating it
+// only adds noise.
+func formatToolInvocationBrief() string {
+	return "Running…"
 }
 
 func formatConfirmMessage(name string, c safety.Classification, argsJSON string) string {
@@ -292,5 +488,13 @@ func formatConfirmMessage(name string, c safety.Classification, argsJSON string)
 		kind = " (" + strings.ToUpper(c.Kind) + ")"
 	}
 
-	return fmt.Sprintf("%s wants to run%s [risk: %s]\n%s\nAllow? [y/n]", name, kind, c.Risk, prettyPrintArgs(argsJSON))
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s wants to run%s [risk: %s]\n", name, kind, c.Risk)
+	if summary := plainLine(c.Summary); summary != "" {
+		fmt.Fprintf(&b, "\n%s\n", summary)
+	}
+	b.WriteString("\n")
+	b.WriteString(fence(describeArgs(argsJSON)))
+	b.WriteString("\nAllow? [y/n]")
+	return b.String()
 }

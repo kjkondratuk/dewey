@@ -23,7 +23,25 @@ const (
 	defaultIntermediateModel = "gemma-4-31b-it-turboquant-mlx"
 	configDirName            = ".dewey"
 	configFileName           = "config.yaml"
+	defaultMemoryMaxTokens   = 4000
 )
+
+// MemoryConfig controls the long-term memory store.
+type MemoryConfig struct {
+	Enabled   bool
+	Dir       string
+	MaxTokens int
+}
+
+// builtinOverrides pins tools whose risk tier must not be left to the
+// classifier's judgement.
+var builtinOverrides = safety.RiskOverrides{
+	// remember writes to the system prompt of every future session. A
+	// classifier answering {"kind":"read","risk":"safe"} would let the model
+	// save a memory with no confirmation at all, while the system prompt tells
+	// it approval is required.
+	"remember": safety.Moderate,
+}
 
 // ModelConfig is the connection details for one model tier.
 type ModelConfig struct {
@@ -43,6 +61,17 @@ type Config struct {
 	Hard         ModelConfig
 	Embedding    ModelConfig
 	Overrides    safety.RiskOverrides
+	Memory       MemoryConfig
+}
+
+// memoryFileConfig mirrors MemoryConfig with every field optional. Enabled is
+// a pointer because a plain bool cannot distinguish `enabled: false` from a
+// section that only sets `dir`, and conflating them would mean configuring
+// where memories live silently switches memory off.
+type memoryFileConfig struct {
+	Enabled   *bool  `yaml:"enabled"`
+	Dir       string `yaml:"dir"`
+	MaxTokens int    `yaml:"max_tokens"`
 }
 
 type fileConfig struct {
@@ -53,6 +82,9 @@ type fileConfig struct {
 		Embedding    ModelConfig `yaml:"embedding"`
 	} `yaml:"models"`
 	Overrides map[string]string `yaml:"overrides"`
+	// Memory is a pointer so an absent section is distinguishable from one
+	// that explicitly sets enabled: false.
+	Memory *memoryFileConfig `yaml:"memory"`
 }
 
 // Load reads ~/.dewey/config.yaml and <projectDir>/.dewey/config.yaml,
@@ -70,13 +102,49 @@ func Load(projectDir string) (Config, error) {
 		return Config{}, err
 	}
 
-	projectPath := filepath.Join(projectDir, configDirName, configFileName)
+	projectPath := filepath.Join(ProjectRoot(projectDir), configDirName, configFileName)
 	project, err := readFileConfig(projectPath)
 	if err != nil {
 		return Config{}, err
 	}
 
 	return merge(global, project)
+}
+
+// ProjectRoot finds the directory whose .dewey/ applies to work in dir,
+// searching upward the way git locates a repository.
+//
+// Without the walk, running dewey from a subdirectory silently lost the
+// project's config and memories while `git -C` kept resolving the repo — so
+// the two halves of the same project disagreed about where they were. The
+// search stops at a .dewey directory, or at a .git directory, so it cannot
+// wander above the repository into unrelated parents.
+func ProjectRoot(dir string) string {
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return dir
+	}
+
+	for cur := dir; ; {
+		if isDir(filepath.Join(cur, configDirName)) {
+			return cur
+		}
+		// A repository boundary with no .dewey/ means this project simply has
+		// no project-level settings; stop rather than inheriting a parent's.
+		if isDir(filepath.Join(cur, ".git")) {
+			return cur
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return dir
+		}
+		cur = parent
+	}
+}
+
+func isDir(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }
 
 func readFileConfig(path string) (fileConfig, error) {
@@ -116,6 +184,15 @@ func merge(global, project fileConfig) (Config, error) {
 	applyModelDefaults(&embedding, "")
 
 	overrides := safety.RiskOverrides{}
+	// remember writes to the system prompt of every future session, so its
+	// confirmation gate cannot rest on the classifier agreeing that it is a
+	// write. A classifier answering {"kind":"read","risk":"safe"} would
+	// otherwise let the model save a memory with no prompt at all, while the
+	// system prompt tells it approval is required. Seeded before the file
+	// loops so a user who really wants it ungated can still override.
+	for name, tier := range builtinOverrides {
+		overrides[name] = tier
+	}
 	for name, raw := range global.Overrides {
 		tier, err := safety.ParseRiskTier(raw)
 		if err != nil {
@@ -131,12 +208,32 @@ func merge(global, project fileConfig) (Config, error) {
 		overrides[name] = tier
 	}
 
+	memory := MemoryConfig{Enabled: true, MaxTokens: defaultMemoryMaxTokens}
+	if home, err := os.UserHomeDir(); err == nil {
+		memory.Dir = filepath.Join(home, configDirName, "memory")
+	}
+	for _, fc := range []fileConfig{global, project} {
+		if fc.Memory == nil {
+			continue
+		}
+		if fc.Memory.Enabled != nil {
+			memory.Enabled = *fc.Memory.Enabled
+		}
+		if fc.Memory.Dir != "" {
+			memory.Dir = expandHome(fc.Memory.Dir)
+		}
+		if fc.Memory.MaxTokens > 0 {
+			memory.MaxTokens = fc.Memory.MaxTokens
+		}
+	}
+
 	return Config{
 		Simple:       simple,
 		Intermediate: intermediate,
 		Hard:         hard,
 		Embedding:    embedding,
 		Overrides:    overrides,
+		Memory:       memory,
 	}, nil
 }
 
@@ -148,6 +245,24 @@ func pickModelConfig(global, project ModelConfig) ModelConfig {
 		return project
 	}
 	return global
+}
+
+// expandHome resolves a leading ~/ in a configured path. Without it the
+// documented example value "~/.dewey/memory" is taken literally: the real
+// profile becomes invisible and saves create a directory actually named "~"
+// in whatever project the user happened to launch from.
+func expandHome(path string) string {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	if path == "~" {
+		return home
+	}
+	return filepath.Join(home, path[len("~/"):])
 }
 
 func applyModelDefaults(m *ModelConfig, defaultModel string) {

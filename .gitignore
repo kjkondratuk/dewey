@@ -30,3 +30,6 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Compiled binary (module name has no extension, so the patterns above miss it)
+/dewey
