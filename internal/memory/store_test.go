@@ -133,6 +133,110 @@ func TestFileStore_UnclosedFrontmatterIsReportedNotMangled(t *testing.T) {
 	}
 }
 
+// The frontmatter fence is what gates a memory to an organization. Any shape
+// the parser fails to recognize turns the whole file into body prose with an
+// empty Org, which quietly promotes a scoped memory into a universal one — and
+// pastes the raw YAML into the system prompt as well. Each of these is a shape
+// a real editor produces.
+func TestFileStore_RecognizesFrontmatterInEveryRealisticFenceShape(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{"crlf", "---\r\nid: scoped\r\norg: acme\r\ntags: [go]\r\n---\r\nAcme only.\r\n"},
+		{"utf8 bom", "\ufeff---\nid: scoped\norg: acme\ntags: [go]\n---\nAcme only.\n"},
+		{"trailing space after the opening fence", "--- \nid: scoped\norg: acme\ntags: [go]\n---\nAcme only.\n"},
+		{"trailing space after the closing fence", "---\nid: scoped\norg: acme\ntags: [go]\n--- \nAcme only.\n"},
+		{"leading blank line", "\n---\nid: scoped\norg: acme\ntags: [go]\n---\nAcme only.\n"},
+		{"crlf with a bom", "\ufeff---\r\nid: scoped\r\norg: acme\r\ntags: [go]\r\n---\r\nAcme only.\r\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeMemFile(t, dir, "scoped.md", c.raw)
+
+			res, err := NewFileStore(dir).Load(context.Background())
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if len(res.Memories) != 1 {
+				t.Fatalf("loaded %d memories, want 1 (skipped: %+v)", len(res.Memories), res.Skipped)
+			}
+			m := res.Memories[0]
+			if m.Org != "acme" {
+				t.Errorf("Org = %q, want acme — an unrecognized fence makes a scoped memory apply everywhere", m.Org)
+			}
+			if len(m.Tags) != 1 || m.Tags[0] != "go" {
+				t.Errorf("Tags = %v, want [go]", m.Tags)
+			}
+			if m.Text != "Acme only." {
+				t.Errorf("Text = %q, want just the body — the frontmatter must not leak into the prompt", m.Text)
+			}
+		})
+	}
+}
+
+// A file with no frontmatter at all is a valid shape: the id comes from the
+// filename and the memory applies everywhere. Fence leniency must not start
+// reading the first prose line as YAML.
+func TestFileStore_FileWithoutFrontmatterLoadsAsBodyOnly(t *testing.T) {
+	dir := t.TempDir()
+	writeMemFile(t, dir, "plain-prose.md", "Writes commit bodies that explain why.\n")
+
+	res, err := NewFileStore(dir).Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(res.Memories) != 1 {
+		t.Fatalf("loaded %d memories, want 1 (skipped: %+v)", len(res.Memories), res.Skipped)
+	}
+	m := res.Memories[0]
+	if m.ID != "plain-prose" || m.Text != "Writes commit bodies that explain why." {
+		t.Errorf("memory = %+v, want the filename as id and the whole file as text", m)
+	}
+}
+
+// An empty frontmatter block is how a user says "this memory is universal".
+// Searching for the terminator inside the text after the opening fence missed a
+// terminator sitting on that text's first line, so this shape was reported as
+// never closed and the memory was dropped.
+func TestFileStore_EmptyFrontmatterBlockIsAccepted(t *testing.T) {
+	dir := t.TempDir()
+	writeMemFile(t, dir, "universal.md", "---\n---\nApplies everywhere.\n")
+
+	res, err := NewFileStore(dir).Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(res.Memories) != 1 {
+		t.Fatalf("loaded %d memories, want 1 (skipped: %+v)", len(res.Memories), res.Skipped)
+	}
+	m := res.Memories[0]
+	if m.ID != "universal" || m.Text != "Applies everywhere." || m.Org != "" {
+		t.Errorf("memory = %+v, want id from the filename, the body, and no org gate", m)
+	}
+}
+
+// Org and tags are written by hand as often as by the agent, and the detected
+// context is lowercase. Comparing them raw fails closed — the memory simply
+// never applies — which is silent and impossible to debug from the UI.
+func TestFileStore_OrgAndTagsAreNormalizedOnLoad(t *testing.T) {
+	dir := t.TempDir()
+	writeMemFile(t, dir, "cased.md", "---\nid: cased\norg: \"  Acme  \"\ntags: [Go, \" Testing \"]\n---\nCased.\n")
+
+	res, _ := NewFileStore(dir).Load(context.Background())
+	if len(res.Memories) != 1 {
+		t.Fatalf("loaded %d memories, want 1 (skipped: %+v)", len(res.Memories), res.Skipped)
+	}
+	m := res.Memories[0]
+	if m.Org != "acme" {
+		t.Errorf("Org = %q, want acme — DetectContext yields lowercase orgs", m.Org)
+	}
+	if len(m.Tags) != 2 || m.Tags[0] != "go" || m.Tags[1] != "testing" {
+		t.Errorf("Tags = %v, want [go testing]", m.Tags)
+	}
+}
+
 func TestFileStore_IgnoresNonMarkdownFiles(t *testing.T) {
 	dir := t.TempDir()
 	writeMemFile(t, dir, "notes.txt", "not a memory")

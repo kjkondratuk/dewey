@@ -87,44 +87,61 @@ func (s *FileStore) Load(ctx context.Context) (LoadResult, error) {
 	return res, nil
 }
 
-// frontmatterEnd locates the closing fence: the first line that is exactly
-// "---". Accepting any line merely starting with "---" would cut the block at
-// a four-dash fence typo or at a dashed line inside the YAML, yielding a body
-// with a stray dash rather than an error the user can act on. Returns where
-// the YAML ends and where the body begins, or -1 if the fence never closes.
-func frontmatterEnd(rest string) (yamlEnd, bodyStart int) {
-	for i := 0; ; {
-		j := strings.Index(rest[i:], "\n---")
-		if j < 0 {
-			return -1, -1
-		}
-		end := i + j
-		after := end + len("\n---")
-		if after == len(rest) {
-			return end, after
-		}
-		if rest[after] == '\n' {
-			return end, after + 1
-		}
-		i = end + 1
-	}
+// isFenceLine reports whether a line is a frontmatter delimiter: exactly
+// "---" once trailing whitespace is ignored. A line merely starting with "---"
+// must not count, or a four-dash typo or a dashed line inside the YAML would
+// cut the block short and yield a mangled body instead of an actionable error.
+func isFenceLine(line string) bool {
+	return strings.TrimRight(line, " \t\r") == "---"
 }
 
 // parseMemory splits a memory file into its YAML frontmatter and prose body.
+//
+// Fence recognition is deliberately lenient about encoding, because failing to
+// recognize frontmatter is not a cosmetic problem: an unparsed file keeps an
+// empty Org, and an empty Org means "applies to every organization". A memory
+// scoped to one client would silently start influencing work for another, and
+// the raw YAML would be fed to the model as prose on top of that. CRLF line
+// endings, a UTF-8 BOM, or a trailing space after the fence are all ordinary
+// things an editor produces, so none of them may cause that.
 func parseMemory(filename, raw string) (Memory, error) {
+	raw = strings.TrimPrefix(raw, "\ufeff")
+	raw = strings.ReplaceAll(raw, "\r\n", "\n")
+
 	body := raw
 	var fm frontmatter
 
-	if strings.HasPrefix(raw, "---\n") {
-		rest := raw[len("---\n"):]
-		end, bodyStart := frontmatterEnd(rest)
-		if end < 0 {
+	lines := strings.Split(raw, "\n")
+
+	// Skip blank lines ahead of the fence. A stray newline at the top of the
+	// file is a trivial editor artifact, and treating it as "no frontmatter"
+	// is the expensive interpretation: it would turn a scoped memory into a
+	// universal one.
+	open := 0
+	for open < len(lines) && strings.TrimSpace(lines[open]) == "" {
+		open++
+	}
+
+	if open < len(lines) && isFenceLine(lines[open]) {
+		closed := false
+		for i := open + 1; i < len(lines); i++ {
+			if !isFenceLine(lines[i]) {
+				continue
+			}
+			// An empty frontmatter block (fence immediately followed by fence)
+			// is a legitimate way to write a universal memory, so the scan
+			// starts at the line after the opening fence rather than requiring
+			// at least one key.
+			if err := yaml.Unmarshal([]byte(strings.Join(lines[open+1:i], "\n")), &fm); err != nil {
+				return Memory{}, fmt.Errorf("invalid frontmatter: %w", err)
+			}
+			body = strings.Join(lines[i+1:], "\n")
+			closed = true
+			break
+		}
+		if !closed {
 			return Memory{}, fmt.Errorf("frontmatter is never closed")
 		}
-		if err := yaml.Unmarshal([]byte(rest[:end]), &fm); err != nil {
-			return Memory{}, fmt.Errorf("invalid frontmatter: %w", err)
-		}
-		body = rest[bodyStart:]
 	}
 
 	id := fm.ID
@@ -144,7 +161,35 @@ func parseMemory(filename, raw string) (Memory, error) {
 		created, _ = time.Parse("2006-01-02", fm.Created)
 	}
 
-	return Memory{ID: id, Text: text, Org: fm.Org, Tags: fm.Tags, Created: created}, nil
+	return Memory{
+		ID:      id,
+		Text:    text,
+		Org:     normalizeTag(fm.Org),
+		Tags:    normalizeTags(fm.Tags),
+		Created: created,
+	}, nil
+}
+
+// normalizeTag lowercases and trims an org or tag. Matching is exact, and
+// DetectContext yields lowercase values, so a hand-written "org: Acme" or
+// "tags: [Go]" would otherwise never match anything. That fails closed — the
+// memory just stops applying — which makes it quiet and confusing rather than
+// dangerous, and it has to be done at both ends to work at all.
+func normalizeTag(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
+func normalizeTags(tags []string) []string {
+	if len(tags) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(tags))
+	for _, t := range tags {
+		if n := normalizeTag(t); n != "" {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // validIDPattern keeps an id usable as a filename inside the memory directory.

@@ -29,11 +29,14 @@ func DetectContext(dir, projectOrg string) Context {
 	}
 	sortStrings(tags)
 
-	org := projectOrg
+	org := normalizeTag(projectOrg)
 	if org == "" {
-		org = parseOrgFromRemote(gitRemote(dir))
+		// A remote of github.com/Acme/repo yields "Acme"; normalizing here is
+		// what lets it match a memory written as "org: acme". Both ends have to
+		// normalize or the comparison simply never succeeds.
+		org = normalizeTag(parseOrgFromRemote(gitRemote(dir)))
 	}
-	return Context{Org: org, Tags: tags}
+	return Context{Org: org, Tags: normalizeTags(tags)}
 }
 
 func gitRemote(dir string) string {
