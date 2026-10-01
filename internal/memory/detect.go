@@ -24,10 +24,17 @@ var stackMarkers = map[string]string{
 }
 
 // DetectContext infers what the work in dir is, so memories can be scoped to
-// it. projectOrg comes from the project's config file and wins outright: git
-// remote parsing is too fragile to be the only basis for keeping one
-// organization's conventions out of another's work.
-func DetectContext(dir, projectOrg string) Context {
+// it.
+//
+// The org comes from the git remote and nothing else. An earlier design let a
+// project's own config file declare it, which was worse in two ways: a
+// checkout's contents come from whoever authored the repo, so a cloned repo
+// could decide which of the user's org-scoped memories were loaded; and config
+// lookup did not walk up to the repo root while `git -C` does, so running from
+// a subdirectory silently swapped one source for the other. One source removes
+// both problems — at the cost that a repo with no remote cannot be
+// org-scoped, which fails closed.
+func DetectContext(dir string) Context {
 	var tags []string
 	for marker, tag := range stackMarkers {
 		if _, err := os.Stat(filepath.Join(dir, marker)); err == nil && !contains(tags, tag) {
@@ -36,13 +43,10 @@ func DetectContext(dir, projectOrg string) Context {
 	}
 	sortStrings(tags)
 
-	org := normalizeTag(projectOrg)
-	if org == "" {
-		// A remote of github.com/Acme/repo yields "Acme"; normalizing here is
-		// what lets it match a memory written as "org: acme". Both ends have to
-		// normalize or the comparison simply never succeeds.
-		org = normalizeTag(parseOrgFromRemote(gitRemote(dir)))
-	}
+	// A remote of github.com/Acme/repo yields "Acme"; normalizing here is what
+	// lets it match a memory written as "org: acme". Both ends have to
+	// normalize or the comparison simply never succeeds.
+	org := normalizeTag(parseOrgFromRemote(gitRemote(dir)))
 	return Context{Org: org, Tags: normalizeTags(tags)}
 }
 

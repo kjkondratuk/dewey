@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -46,17 +47,16 @@ func main() {
 	summarizer := compaction.NewLLMSummarizer(simpleModel)
 	contextWindow := config.DiscoverContextWindow(ctx, cfg.Intermediate)
 
-	systemPrompt, toolRecorder, provider := buildMemory(cwd, cfg)
+	systemPrompt, toolRecorder, provider, notices := buildMemory(cwd, cfg)
 
 	// Force one load here so an unreadable memory directory or a dropped
 	// memory is reported at startup, rather than surfacing mid-turn as a
 	// failed model call.
-	var notices []string
 	if provider != nil {
 		if _, err := provider.Block(ctx); err != nil {
 			notices = append(notices, "memory unavailable: "+err.Error())
 		} else {
-			notices = provider.Notices()
+			notices = append(notices, provider.Notices()...)
 		}
 	}
 
@@ -93,18 +93,28 @@ func main() {
 // It is a function rather than inline setup so the disabled path is testable —
 // see the nil-interface note below, which is not something a reviewer can
 // check by reading main().
-func buildMemory(cwd string, cfg config.Config) (*memory.SystemPrompt, tools2.MemoryRecorder, *memory.Provider) {
+func buildMemory(cwd string, cfg config.Config) (*memory.SystemPrompt, tools2.MemoryRecorder, *memory.Provider, []string) {
 	var (
 		recorder *memory.Recorder
 		provider *memory.Provider
+		notices  []string
 	)
 	systemPrompt := memory.NewSystemPrompt(prompts.SystemBase, prompts.SystemMemory, nil)
 
 	if cfg.Memory.Enabled {
-		mc := memory.DetectContext(cwd, cfg.Org)
+		mc := memory.DetectContext(cwd)
+		// Report the detected scope. Org-scoped memories have to name this
+		// value exactly, and it is derived from the git remote rather than
+		// configured, so without saying it there is nothing to match against.
+		if mc.Org != "" {
+			notices = append(notices, fmt.Sprintf("Memory scope: org %q, tags %v.", mc.Org, mc.Tags))
+		} else {
+			notices = append(notices, fmt.Sprintf(
+				"Memory scope: no organization detected (no git remote), tags %v. Only unscoped memories apply here.", mc.Tags))
+		}
 		store := memory.NewMergedStore(
 			memory.NewFileStore(cfg.Memory.Dir),
-			memory.NewFileStore(filepath.Join(cwd, ".dewey", "memory")),
+			memory.NewFileStore(filepath.Join(config.ProjectRoot(cwd), ".dewey", "memory")),
 		)
 		provider = memory.NewProvider(store, memory.TagRetriever{}, mc, cfg.Memory.MaxTokens)
 		systemPrompt = memory.NewSystemPrompt(prompts.SystemBase, prompts.SystemMemory, provider)
@@ -118,7 +128,7 @@ func buildMemory(cwd string, cfg config.Config) (*memory.SystemPrompt, tools2.Me
 	if recorder != nil {
 		toolRecorder = recorder
 	}
-	return systemPrompt, toolRecorder, provider
+	return systemPrompt, toolRecorder, provider, notices
 }
 
 func initModel(agt agent.Agent, notices []string) *app.App {

@@ -125,15 +125,31 @@ The context tag set is derived from the working directory:
 
 - **Stack** — `go.mod` → `go`, `package.json` → `node`, `Cargo.toml` → `rust`,
   `pyproject.toml`/`requirements.txt` → `python`. Multiple may apply.
-- **Org**, in precedence order:
-  1. `org:` in the project's `.dewey/config.yaml` — explicit and authoritative.
-  2. Parsed from `git remote get-url origin`: the owner segment of
-     `github.com/<owner>/<repo>` and equivalents for other hosts.
-  3. Unknown (empty).
+- **Org** comes from `git remote get-url origin` — the owner segment of
+  `github.com/<owner>/<repo>` and the equivalents for other hosts — and from
+  nothing else. Unknown (empty) when there is no remote.
 
-Project config comes first because git-remote parsing is too fragile to be the
-sole basis for an isolation guarantee, and because repos without remotes need a
-way to declare their org at all.
+An earlier version of this design let the project's own `.dewey/config.yaml`
+declare the org, treating it as explicit and authoritative. That was wrong in
+two ways, both found in review:
+
+- A checkout's contents come from whoever authored the repo. Cloning a repo
+  that ships `org: acme` made dewey load the user's Acme-scoped memories while
+  working in a stranger's code — the repo, not the user, decided which private
+  memories entered the system prompt.
+- Config lookup did not search upward while `git remote` does, so running from
+  a subdirectory silently swapped one source for the other and the same
+  checkout reported two different orgs at two different depths.
+
+A single source removes both. The cost is that a repo with no remote cannot be
+org-scoped at all, so only unscoped memories apply there — which fails closed.
+Because the org is now derived rather than configured, the resolved scope is
+reported as a startup notice; org-scoped memories must name it exactly, and
+there would otherwise be nothing to match against.
+
+Project-level `.dewey/` is still located by searching upward from the working
+directory, stopping at a `.dewey` directory or a repository boundary, so
+launching from a subdirectory keeps the project's config and memories.
 
 ## Loading and refresh
 
@@ -214,10 +230,12 @@ system prompt.
 ```yaml
 memory:
   enabled: true              # default true
-  dir: ~/.dewey/memory       # global store; default shown
+  dir: ~/.dewey/memory       # global store; default shown, leading ~ expanded
   max_tokens: 4000           # budget for the injected block
-org: acme                    # project-level, in the project's .dewey/config.yaml
 ```
+
+There is no `org` setting: see "Context detection" for why it is derived from
+the git remote instead.
 
 The project-local store is always `<projectDir>/.dewey/memory` and is not
 configurable — it sits beside the project config file that dewey already looks
@@ -231,6 +249,8 @@ silent truncation of a profile the user curated would be worse than the overflow
 | Condition | Behavior |
 |---|---|
 | Either memory dir missing | Treated as empty. The global one is created lazily on first save. |
+| A memory file that is not a regular file | Refused and reported. Project memory directories are committed, so a clone can ship a symlink, and these files are read into the system message — a link to a private key would put key material in the model's context. |
+| A new memory whose slug collides | Disambiguated with a numeric suffix. Re-saving identical text keeps its id. Preference statements share opening words constantly, and saves land via rename, so a collision previously destroyed a memory the user had already approved. |
 | Malformed frontmatter | That file is skipped and reported; the rest load. |
 | Duplicate `id` across the two stores | Project wins, silently — that is the documented override mechanism, not an error. |
 | Duplicate `id` within one store | Both load and both apply. Nothing downstream requires ids to be unique within a store, so this needs no special handling. |

@@ -190,36 +190,6 @@ func TestLoad_MemoryProjectOverridesGlobal(t *testing.T) {
 	}
 }
 
-func TestLoad_ProjectOrgIsRead(t *testing.T) {
-	home, project := t.TempDir(), t.TempDir()
-	t.Setenv("HOME", home)
-	writeConfig(t, project, "org: acme\n")
-
-	cfg, err := Load(project)
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if cfg.Org != "acme" {
-		t.Errorf("Org = %q, want acme", cfg.Org)
-	}
-}
-
-// The org names which organization's work this checkout is, so it is a
-// property of the project and a global default would apply it everywhere.
-func TestLoad_GlobalOrgIsIgnored(t *testing.T) {
-	home, project := t.TempDir(), t.TempDir()
-	t.Setenv("HOME", home)
-	writeConfig(t, home, "org: globex\n")
-
-	cfg, err := Load(project)
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if cfg.Org != "" {
-		t.Errorf("Org = %q, want empty: a global org would scope every project to it", cfg.Org)
-	}
-}
-
 func TestBuildChatModel(t *testing.T) {
 	cm, err := BuildChatModel(context.Background(), ModelConfig{BaseURL: defaultBaseURL, APIKey: defaultAPIKey, Model: "test-model"})
 	if err != nil {
@@ -351,5 +321,78 @@ func TestLoad_MemoryDirWithoutTildeIsUnchanged(t *testing.T) {
 	}
 	if cfg.Memory.Dir != "/opt/memories" {
 		t.Errorf("Memory.Dir = %q, want it untouched", cfg.Memory.Dir)
+	}
+}
+
+// Running from a subdirectory must not lose the project's settings. It used to:
+// config lookup did not walk up while `git -C` did, so the two halves of the
+// same project disagreed about where they were.
+func TestProjectRoot_WalksUpToTheDeweyDirectory(t *testing.T) {
+	root := t.TempDir()
+	writeConfig(t, root, "overrides:\n  run_shell_command: moderate\n")
+	deep := filepath.Join(root, "services", "api", "internal")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := ProjectRoot(deep); got != root {
+		t.Errorf("ProjectRoot(%q) = %q, want %q", deep, got, root)
+	}
+
+	// And the config actually loads from down there.
+	t.Setenv("HOME", t.TempDir())
+	cfg, err := Load(deep)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Overrides["run_shell_command"] != safety.Moderate {
+		t.Errorf("override not picked up from a subdirectory: %+v", cfg.Overrides)
+	}
+}
+
+// The search must not wander above the repository and adopt a parent's config.
+func TestProjectRoot_StopsAtARepositoryBoundary(t *testing.T) {
+	outer := t.TempDir()
+	writeConfig(t, outer, "overrides:\n  run_shell_command: dangerous\n")
+
+	inner := filepath.Join(outer, "vendored")
+	if err := os.MkdirAll(filepath.Join(inner, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := ProjectRoot(inner); got != inner {
+		t.Errorf("ProjectRoot(%q) = %q, want it to stop at the repo boundary %q", inner, got, inner)
+	}
+}
+
+func TestProjectRoot_NoDeweyAnywhereReturnsTheStartingDirectory(t *testing.T) {
+	dir := t.TempDir()
+	deep := filepath.Join(dir, "a", "b")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// t.TempDir() lives under /var/folders on macOS, which has no .dewey or
+	// .git above it, so the walk should bottom out at the filesystem root and
+	// fall back to where it started.
+	if got := ProjectRoot(deep); got != deep {
+		t.Errorf("ProjectRoot(%q) = %q, want the starting directory back", deep, got)
+	}
+}
+
+// org: in a project config is no longer read at all. A checkout's contents come
+// from whoever authored the repo, so honoring it let a cloned repo decide which
+// of the user's org-scoped memories were loaded.
+func TestLoad_ProjectConfigCannotDeclareAnOrg(t *testing.T) {
+	home, project := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	writeConfig(t, project, "org: acme\nmemory:\n  max_tokens: 1234\n")
+
+	cfg, err := Load(project)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	// The rest of the section still applies; only org is ignored.
+	if cfg.Memory.MaxTokens != 1234 {
+		t.Errorf("MaxTokens = %d, want the section still honored", cfg.Memory.MaxTokens)
 	}
 }

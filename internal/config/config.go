@@ -62,9 +62,6 @@ type Config struct {
 	Embedding    ModelConfig
 	Overrides    safety.RiskOverrides
 	Memory       MemoryConfig
-	// Org names the organization this project's work belongs to. Set in the
-	// project's config file; takes precedence over git-remote detection.
-	Org string
 }
 
 // memoryFileConfig mirrors MemoryConfig with every field optional. Enabled is
@@ -88,9 +85,6 @@ type fileConfig struct {
 	// Memory is a pointer so an absent section is distinguishable from one
 	// that explicitly sets enabled: false.
 	Memory *memoryFileConfig `yaml:"memory"`
-	// Org is read from the project file only: it describes this checkout, so a
-	// global value would scope every project to the same organization.
-	Org string `yaml:"org"`
 }
 
 // Load reads ~/.dewey/config.yaml and <projectDir>/.dewey/config.yaml,
@@ -108,13 +102,49 @@ func Load(projectDir string) (Config, error) {
 		return Config{}, err
 	}
 
-	projectPath := filepath.Join(projectDir, configDirName, configFileName)
+	projectPath := filepath.Join(ProjectRoot(projectDir), configDirName, configFileName)
 	project, err := readFileConfig(projectPath)
 	if err != nil {
 		return Config{}, err
 	}
 
 	return merge(global, project)
+}
+
+// ProjectRoot finds the directory whose .dewey/ applies to work in dir,
+// searching upward the way git locates a repository.
+//
+// Without the walk, running dewey from a subdirectory silently lost the
+// project's config and memories while `git -C` kept resolving the repo — so
+// the two halves of the same project disagreed about where they were. The
+// search stops at a .dewey directory, or at a .git directory, so it cannot
+// wander above the repository into unrelated parents.
+func ProjectRoot(dir string) string {
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return dir
+	}
+
+	for cur := dir; ; {
+		if isDir(filepath.Join(cur, configDirName)) {
+			return cur
+		}
+		// A repository boundary with no .dewey/ means this project simply has
+		// no project-level settings; stop rather than inheriting a parent's.
+		if isDir(filepath.Join(cur, ".git")) {
+			return cur
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return dir
+		}
+		cur = parent
+	}
+}
+
+func isDir(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }
 
 func readFileConfig(path string) (fileConfig, error) {
@@ -204,7 +234,6 @@ func merge(global, project fileConfig) (Config, error) {
 		Embedding:    embedding,
 		Overrides:    overrides,
 		Memory:       memory,
-		Org:          project.Org,
 	}, nil
 }
 

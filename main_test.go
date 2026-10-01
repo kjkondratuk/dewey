@@ -38,7 +38,7 @@ func hasTool(names []string, want string) bool {
 func TestBuildMemory_DisabledOmitsRememberTool(t *testing.T) {
 	cfg := config.Config{Memory: config.MemoryConfig{Enabled: false}}
 
-	systemPrompt, recorder, provider := buildMemory(t.TempDir(), cfg)
+	systemPrompt, recorder, provider, _ := buildMemory(t.TempDir(), cfg)
 
 	if recorder != nil {
 		t.Errorf("recorder = %#v, want a nil interface so the remember tool is omitted", recorder)
@@ -64,7 +64,7 @@ func TestBuildMemory_DisabledOmitsRememberTool(t *testing.T) {
 func TestBuildMemory_EnabledRegistersRememberTool(t *testing.T) {
 	cfg := config.Config{Memory: config.MemoryConfig{Enabled: true, Dir: t.TempDir(), MaxTokens: 4000}}
 
-	systemPrompt, recorder, provider := buildMemory(t.TempDir(), cfg)
+	systemPrompt, recorder, provider, _ := buildMemory(t.TempDir(), cfg)
 
 	if recorder == nil {
 		t.Fatal("recorder = nil, want a recorder so memories can be saved")
@@ -79,5 +79,40 @@ func TestBuildMemory_EnabledRegistersRememberTool(t *testing.T) {
 	names := toolNames(t, tools2.NewToolFactory(recorder).DefaultInvokableToolset())
 	if !hasTool(names, "remember") {
 		t.Errorf("toolset = %v, want a remember tool with memory enabled", names)
+	}
+}
+
+// Org-scoped memories must name the detected org exactly, and that value comes
+// from the git remote rather than from config — so if it isn't reported there
+// is nothing for the user to match against.
+func TestBuildMemory_ReportsTheDetectedScope(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg, err := config.Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, _, notices := buildMemory(t.TempDir(), cfg)
+	if len(notices) == 0 {
+		t.Fatal("no notices; the user cannot tell what scope memories are matched against")
+	}
+	joined := strings.Join(notices, "\n")
+	if !strings.Contains(joined, "Memory scope") {
+		t.Errorf("notices = %v, want the detected scope reported", notices)
+	}
+}
+
+func TestBuildMemory_DisabledReportsNoScope(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cfg, err := config.Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Memory.Enabled = false
+
+	_, _, _, notices := buildMemory(t.TempDir(), cfg)
+	if len(notices) != 0 {
+		t.Errorf("notices = %v, want none when memory is disabled", notices)
 	}
 }
