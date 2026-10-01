@@ -40,3 +40,17 @@ func TestEstimateTokens_CountsToolCallsAndResults(t *testing.T) {
 		t.Error("expected tool call name/arguments to contribute to the token estimate")
 	}
 }
+
+func TestEstimateText(t *testing.T) {
+	if got := EstimateText(""); got != 0 {
+		t.Errorf("EstimateText(\"\") = %d, want 0", got)
+	}
+	short := EstimateText("hello world")
+	long := EstimateText(strings.Repeat("hello world ", 50))
+	if short <= 0 {
+		t.Errorf("EstimateText(short) = %d, want > 0", short)
+	}
+	if long <= short {
+		t.Errorf("EstimateText(long) = %d, not greater than short %d", long, short)
+	}
+}

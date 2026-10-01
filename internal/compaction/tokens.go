@@ -67,3 +67,17 @@ func messageText(msg *schema.Message) string {
 	}
 	return b.String()
 }
+
+// EstimateText counts tokens in a bare string, sharing the cached encoder with
+// EstimateTokens. Returns 0 if the encoder is unavailable, matching
+// EstimateTokens' failure direction.
+func EstimateText(s string) int {
+	if s == "" {
+		return 0
+	}
+	encoder, err := getEncoder()
+	if err != nil {
+		return 0
+	}
+	return len(encoder.EncodeOrdinary(s))
+}
