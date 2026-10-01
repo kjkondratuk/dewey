@@ -192,3 +192,88 @@ func TestRecorder_SavesThroughFileStore(t *testing.T) {
 		t.Errorf("round-tripped Tags = %v, want [go]", got.Tags)
 	}
 }
+
+// Preference statements share opening words constantly, and the slug is built
+// from them — so a collision destroying an already-approved memory is routine,
+// not exotic. Saves land via rename, so the loss was silent.
+func TestRecorder_CollidingSlugsDoNotDestroyTheEarlierMemory(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFileStore(dir)
+	r := NewRecorder(store, Context{})
+
+	first := "Always run the full test suite with the race detector before pushing."
+	second := "Always run the full test suite in a container, never on the host toolchain."
+	for _, text := range []string{first, second} {
+		if err := r.Record(context.Background(), text, nil); err != nil {
+			t.Fatalf("Record(%q) error = %v", text, err)
+		}
+	}
+
+	res, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(res.Memories) != 2 {
+		t.Fatalf("loaded %d memories, want 2 — the user approved both", len(res.Memories))
+	}
+
+	texts := map[string]bool{}
+	ids := map[string]bool{}
+	for _, m := range res.Memories {
+		texts[m.Text] = true
+		if ids[m.ID] {
+			t.Errorf("duplicate id %q", m.ID)
+		}
+		ids[m.ID] = true
+	}
+	for _, want := range []string{first, second} {
+		if !texts[want] {
+			t.Errorf("missing memory %q", want)
+		}
+	}
+}
+
+// Correcting a memory in place must not accumulate near-duplicates.
+func TestRecorder_ResavingIdenticalTextReusesTheSameID(t *testing.T) {
+	store := NewFileStore(t.TempDir())
+	r := NewRecorder(store, Context{})
+	text := "Prefers table-driven tests."
+
+	for i := 0; i < 3; i++ {
+		if err := r.Record(context.Background(), text, nil); err != nil {
+			t.Fatalf("Record() error = %v", err)
+		}
+	}
+
+	res, _ := store.Load(context.Background())
+	if len(res.Memories) != 1 {
+		t.Errorf("loaded %d memories, want 1 — identical text should be idempotent", len(res.Memories))
+	}
+}
+
+func TestRecorder_DisambiguatedIDStillSatisfiesTheStore(t *testing.T) {
+	store := NewFileStore(t.TempDir())
+	r := NewRecorder(store, Context{})
+
+	// Long shared prefix, so disambiguation has to trim before suffixing.
+	base := "Always remember to verify every single assumption carefully beforehand"
+	for i := 0; i < 4; i++ {
+		text := base + " variant " + string(rune('a'+i)) + "."
+		if err := r.Record(context.Background(), text, nil); err != nil {
+			t.Fatalf("Record() error = %v", err)
+		}
+	}
+
+	res, _ := store.Load(context.Background())
+	if len(res.Memories) != 4 {
+		t.Errorf("loaded %d memories, want 4", len(res.Memories))
+	}
+	for _, m := range res.Memories {
+		if !validIDPattern.MatchString(m.ID) {
+			t.Errorf("id %q does not satisfy the store's id rules", m.ID)
+		}
+		if len(m.ID) > maxSlugLength {
+			t.Errorf("id %q is %d chars, want <= %d", m.ID, len(m.ID), maxSlugLength)
+		}
+	}
+}

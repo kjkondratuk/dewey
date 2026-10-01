@@ -1,11 +1,18 @@
 package memory
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
+
+// gitRemoteTimeout bounds the org-detection subprocess. Reading a remote URL
+// only touches git config, so anything slower than this is a stalled
+// filesystem rather than slow work.
+const gitRemoteTimeout = 2 * time.Second
 
 // stackMarkers maps a file that identifies a stack to the tag it implies.
 var stackMarkers = map[string]string{
@@ -39,8 +46,14 @@ func DetectContext(dir, projectOrg string) Context {
 	return Context{Org: org, Tags: normalizeTags(tags)}
 }
 
+// gitRemote is bounded because DetectContext runs before the TUI exists: on a
+// stalled network checkout an unbounded subprocess would hang dewey at launch
+// with nothing on screen to explain it.
 func gitRemote(dir string) string {
-	cmd := exec.Command("git", "-C", dir, "remote", "get-url", "origin")
+	ctx, cancel := context.WithTimeout(context.Background(), gitRemoteTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "remote", "get-url", "origin")
 	out, err := cmd.Output()
 	if err != nil {
 		return ""

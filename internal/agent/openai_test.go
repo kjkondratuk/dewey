@@ -759,6 +759,58 @@ func TestRun_NilSystemProviderSendsHistoryUnchanged(t *testing.T) {
 	}
 }
 
+// Asserting that the provider still returns its own text proves nothing: that
+// holds even if compact() ate the message, if messages() stopped prepending
+// it, or if WithSystemPrompt were a no-op. Drive a real compaction and inspect
+// what actually reached the model.
+func TestRun_SystemMessageSurvivesARealCompaction(t *testing.T) {
+	sp := &fakeSystemProvider{text: "SYSTEM RULES"}
+	m := &fakeStreamModel{responses: [][]*schema.Message{finalResponse("ok")}}
+
+	// A tiny context window guarantees the seeded history trips the threshold.
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 10,
+		&fakeSummarizer{result: "the summary"})
+	agt.systemProvider = sp
+	agt.history = []*schema.Message{
+		{Role: schema.User, Content: strings.Repeat("filler content ", 200)},
+		{Role: schema.Assistant, Content: strings.Repeat("more filler ", 200)},
+	}
+
+	ch, err := agt.Run(context.Background(), "continue")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events := drain(t, ch, func(Event) bool { return true })
+
+	compacted := false
+	for _, e := range events {
+		if e.Kind == "compacted" {
+			compacted = true
+		}
+	}
+	if !compacted {
+		t.Fatal("compaction never fired; this test would prove nothing")
+	}
+	if len(m.seen) == 0 {
+		t.Fatal("model was never called")
+	}
+
+	sent := m.seen[len(m.seen)-1]
+	if sent[0].Role != schema.System || sent[0].Content != "SYSTEM RULES" {
+		t.Errorf("first message after compaction = %+v, want the system message intact", sent[0])
+	}
+	// The compaction summary is itself a system-role message, so confirm the
+	// agent's own instructions weren't what got replaced.
+	if len(sent) < 2 || !strings.Contains(sent[1].Content, "the summary") {
+		t.Errorf("second message = %+v, want the compaction summary", sent[1])
+	}
+	for _, msg := range agt.history {
+		if msg.Role == schema.System && msg.Content == "SYSTEM RULES" {
+			t.Error("the system prompt leaked into history, where the next compaction would consume it")
+		}
+	}
+}
+
 func TestCompact_DoesNotTouchTheSystemMessage(t *testing.T) {
 	sp := &fakeSystemProvider{text: "RULES"}
 	agt := New(nil, nil, nil, nil, 1000, &fakeSummarizer{result: "summary"})

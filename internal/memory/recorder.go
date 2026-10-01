@@ -29,8 +29,13 @@ func (r *Recorder) Record(ctx context.Context, text string, tags []string) error
 		// problem instead of complaining about an id derived from nothing.
 		return fmt.Errorf("a memory needs some text")
 	}
+	id, err := r.availableID(ctx, slugify(text), text)
+	if err != nil {
+		return err
+	}
+
 	return r.store.Save(ctx, Memory{
-		ID:   slugify(text),
+		ID:   id,
 		Text: text,
 		// Normalized at both ends, like everything compared against a detected
 		// context: tags come straight from the model, so a supplied "Go" would
@@ -40,6 +45,41 @@ func (r *Recorder) Record(ctx context.Context, text string, tags []string) error
 		Tags:    normalizeTags(tags),
 		Created: r.now(),
 	})
+}
+
+// availableID keeps a new memory from overwriting an existing one. The slug is
+// built from the opening words of the text, and preference statements share
+// those constantly ("Always run…", "Prefers that…", "Never commit…"), so
+// collisions are routine rather than exotic — and because a save lands via
+// rename, a collision silently destroyed a memory the user had already
+// approved.
+//
+// Re-saving identical text keeps the same id, so correcting a memory in place
+// stays idempotent instead of accumulating near-duplicates.
+func (r *Recorder) availableID(ctx context.Context, base, text string) (string, error) {
+	res, err := r.store.Load(ctx)
+	if err != nil {
+		return "", fmt.Errorf("checking for an existing memory: %w", err)
+	}
+
+	taken := make(map[string]string, len(res.Memories))
+	for _, m := range res.Memories {
+		taken[m.ID] = m.Text
+	}
+
+	candidate := base
+	for n := 2; ; n++ {
+		existing, clash := taken[candidate]
+		if !clash || existing == text {
+			return candidate, nil
+		}
+		suffix := fmt.Sprintf("-%d", n)
+		trimmed := base
+		if len(trimmed)+len(suffix) > maxSlugLength {
+			trimmed = strings.Trim(trimmed[:maxSlugLength-len(suffix)], "-")
+		}
+		candidate = trimmed + suffix
+	}
 }
 
 const (
