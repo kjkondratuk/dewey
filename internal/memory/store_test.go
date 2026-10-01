@@ -2,8 +2,11 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -327,5 +330,142 @@ func TestFileStore_RevisionIsStableWithoutChanges(t *testing.T) {
 	first := s.Revision(context.Background())
 	if second := s.Revision(context.Background()); second != first {
 		t.Errorf("Revision changed without any edit (%q then %q) — the cache would reload on every call", first, second)
+	}
+}
+
+// Save used to interpolate Org/Tags raw into YAML, so these inputs produced
+// files it accepted and Load could then never read again — the user was told
+// the memory was saved and it was permanently unreadable.
+func TestFileStore_SaveSurvivesHostileFrontmatterValues(t *testing.T) {
+	cases := []struct {
+		name string
+		mem  Memory
+	}{
+		{"newline in org", Memory{ID: "inject-org", Org: "acme\nid: hijacked", Text: "Body."}},
+		{"bracket in tag", Memory{ID: "inject-tag", Tags: []string{"go]\nid: hijacked"}, Text: "Body."}},
+		{"hash in tag", Memory{ID: "hash-tag", Tags: []string{"go #x", "b"}, Text: "Body."}},
+		{"colon in org", Memory{ID: "colon-org", Org: "acme: inc", Text: "Body."}},
+		{"quote in text", Memory{ID: "quote-text", Text: `He said "---" and left.`}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := NewFileStore(t.TempDir())
+			if err := s.Save(context.Background(), c.mem); err != nil {
+				t.Fatalf("Save() error = %v", err)
+			}
+			res, err := s.Load(context.Background())
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if len(res.Skipped) != 0 {
+				t.Errorf("Load reported %+v — Save wrote a file it cannot read", res.Skipped)
+			}
+			if len(res.Memories) != 1 {
+				t.Fatalf("loaded %d memories, want 1", len(res.Memories))
+			}
+			if got := res.Memories[0].Text; got != strings.TrimSpace(c.mem.Text) {
+				t.Errorf("Text = %q, want %q", got, c.mem.Text)
+			}
+		})
+	}
+}
+
+func TestFileStore_SaveRejectsEmptyText(t *testing.T) {
+	s := NewFileStore(t.TempDir())
+	for _, text := range []string{"", "   ", "\n\t "} {
+		if err := s.Save(context.Background(), Memory{ID: "empty", Text: text}); err == nil {
+			t.Errorf("Save(text=%q) succeeded; Load would then reject the file forever", text)
+		}
+	}
+}
+
+// Load must never observe a half-written file. Before writes went through a
+// rename, a concurrent save/load loop produced hundreds of torn reads and a
+// stream of skip notices about a corpus that was actually fine.
+func TestFileStore_ConcurrentSaveAndLoadNeverSeesATornFile(t *testing.T) {
+	s := NewFileStore(t.TempDir())
+	long := Memory{ID: "churn", Text: strings.Repeat("a long body ", 400)}
+	short := Memory{ID: "churn", Text: "tiny"}
+	if err := s.Save(context.Background(), long); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			m := long
+			if i%2 == 0 {
+				m = short
+			}
+			if err := s.Save(context.Background(), m); err != nil {
+				t.Errorf("Save() error = %v", err)
+				return
+			}
+		}
+	}()
+
+	torn := 0
+	for i := 0; i < 400; i++ {
+		res, err := s.Load(context.Background())
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if len(res.Skipped) > 0 {
+			torn++
+		}
+		for _, m := range res.Memories {
+			if m.Text != strings.TrimSpace(long.Text) && m.Text != short.Text {
+				torn++
+			}
+		}
+	}
+	<-done
+
+	if torn != 0 {
+		t.Errorf("observed %d torn or unreadable reads during concurrent saves", torn)
+	}
+}
+
+func TestFileStore_ConcurrentSavesDoNotCorrupt(t *testing.T) {
+	s := NewFileStore(t.TempDir())
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := s.Save(context.Background(), Memory{ID: "shared", Text: fmt.Sprintf("writer %d", i)}); err != nil {
+				t.Errorf("Save() error = %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	res, err := s.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(res.Skipped) != 0 || len(res.Memories) != 1 {
+		t.Errorf("after concurrent saves: memories=%d skipped=%+v, want exactly 1 readable memory", len(res.Memories), res.Skipped)
+	}
+}
+
+func TestFileStore_SaveLeavesNoTempFilesBehind(t *testing.T) {
+	dir := t.TempDir()
+	s := NewFileStore(dir)
+	if err := s.Save(context.Background(), Memory{ID: "ok", Text: "Body."}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".tmp-") {
+			t.Errorf("temp file %q left behind", e.Name())
+		}
+	}
+	if len(entries) != 1 {
+		t.Errorf("directory has %d entries, want 1", len(entries))
 	}
 }

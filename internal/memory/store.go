@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,6 +32,10 @@ type LoadResult struct {
 
 // Store reads and writes memories. Revision is a cheap change token: when it
 // differs from a previously observed value, callers must reload.
+//
+// All three methods are safe to call concurrently. Note that -race cannot
+// prove this: the hazard is in the filesystem, not in Go memory, so writers
+// are serialized explicitly and writes land via a rename.
 type Store interface {
 	Load(ctx context.Context) (LoadResult, error)
 	Save(ctx context.Context, m Memory) error
@@ -41,6 +46,9 @@ type Store interface {
 type FileStore struct {
 	dir string
 	gen atomic.Uint64
+	// writeMu serializes writers. The atomic counter alone would not: two
+	// concurrent saves of the same id both target the same path.
+	writeMu sync.Mutex
 }
 
 func NewFileStore(dir string) *FileStore {
@@ -201,29 +209,80 @@ func (s *FileStore) Save(ctx context.Context, m Memory) error {
 	if !validIDPattern.MatchString(m.ID) {
 		return fmt.Errorf("invalid memory id %q: want lowercase words joined by hyphens", m.ID)
 	}
+	// Symmetry with the id check above: Load rejects a body-less memory, so
+	// accepting one here would report success and write a file that is
+	// unreadable from that moment on.
+	text := strings.TrimSpace(m.Text)
+	if text == "" {
+		return fmt.Errorf("refusing to save memory %q with no text", m.ID)
+	}
 	if err := os.MkdirAll(s.dir, 0o755); err != nil {
 		return fmt.Errorf("creating memory dir %s: %w", s.dir, err)
 	}
 
+	// Marshal rather than Fprintf the frontmatter. Org, Tags and Text can all
+	// originate from model output, and interpolating them raw produced files
+	// that Save accepted and Load could then never read again — a newline in
+	// Org emitted a second `id:` key, a `]` in a tag broke the flow sequence.
+	// The user was told the memory was saved and it was permanently unreadable.
+	head, err := yaml.Marshal(frontmatter{
+		ID:      m.ID,
+		Org:     m.Org,
+		Tags:    m.Tags,
+		Created: createdString(m.Created),
+	})
+	if err != nil {
+		return fmt.Errorf("encoding frontmatter for %s: %w", m.ID, err)
+	}
+
 	var b strings.Builder
 	b.WriteString("---\n")
-	fmt.Fprintf(&b, "id: %s\n", m.ID)
-	if !m.Created.IsZero() {
-		fmt.Fprintf(&b, "created: %s\n", m.Created.Format("2006-01-02"))
-	}
-	if m.Org != "" {
-		fmt.Fprintf(&b, "org: %s\n", m.Org)
-	}
-	if len(m.Tags) > 0 {
-		fmt.Fprintf(&b, "tags: [%s]\n", strings.Join(m.Tags, ", "))
-	}
+	b.Write(head)
 	b.WriteString("---\n")
-	b.WriteString(strings.TrimSpace(m.Text))
+	b.WriteString(text)
 	b.WriteString("\n")
 
-	path := filepath.Join(s.dir, m.ID+".md")
-	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
-		return fmt.Errorf("writing %s: %w", path, err)
+	return s.writeAtomic(m.ID+".md", b.String())
+}
+
+func createdString(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format("2006-01-02")
+}
+
+// writeAtomic writes via a temp file and a rename, so a concurrent Load never
+// observes a half-written file. Without it, Provider revalidating before every
+// model call while the remember tool is mid-write produced torn reads and a
+// stream of spurious skip notices about a corpus that was in fact fine.
+func (s *FileStore) writeAtomic(name, contents string) error {
+	// Serialize writers: two concurrent saves of the same id would otherwise
+	// race on the same destination path.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	tmp, err := os.CreateTemp(s.dir, ".tmp-"+name+"-*")
+	if err != nil {
+		return fmt.Errorf("creating temp file in %s: %w", s.dir, err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op once the rename succeeds
+
+	if _, err := tmp.WriteString(contents); err != nil {
+		tmp.Close()
+		return fmt.Errorf("writing %s: %w", tmpName, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("closing %s: %w", tmpName, err)
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		return fmt.Errorf("setting mode on %s: %w", tmpName, err)
+	}
+
+	path := filepath.Join(s.dir, name)
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("renaming into %s: %w", path, err)
 	}
 	s.gen.Add(1)
 	return nil
