@@ -145,12 +145,19 @@ rather than only at startup, so a memory saved mid-session takes effect on the
 very next model call instead of after a restart.
 
 This is backed by a cache rather than re-reading both directories every time.
-Each store reports a revision and the provider reloads only when it changes. A
-file store's revision advances when it writes a memory itself, and when its
-directory's modification time advances — so hand-editing a file mid-session is
-picked up too. `MergedStore`'s revision advances when either underlying store's
-does, meaning an edit in the project directory is noticed just like one in the
-global directory.
+Each store reports a revision and the provider reloads only when it changes.
+
+A file store's revision is a digest over its `.md` entries — name, size, and
+modification time — combined with an in-process write counter. The digest must
+cover the files rather than the directory: a directory's own mtime advances
+only when an entry is added or removed, not when an existing file is
+overwritten, so a directory-level check would miss the most likely curation
+action of all, which is opening a memory in an editor and rewriting it. The
+write counter is folded in alongside so this process's own saves register
+regardless of filesystem timestamp granularity.
+
+`MergedStore`'s revision advances when either underlying store's does, so an
+edit in the project directory is noticed just like one in the global directory.
 
 ## System prompt
 

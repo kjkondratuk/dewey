@@ -405,6 +405,21 @@ func TestFileStore_RevisionChangesOnSave(t *testing.T) {
 		t.Errorf("Revision unchanged after Save (%q) — cached memories would go stale", after)
 	}
 }
+
+// Editing a memory in place is the most likely way a user curates one, and a
+// directory's mtime does not move when an existing file is overwritten.
+func TestFileStore_RevisionChangesWhenAFileIsEditedInPlace(t *testing.T) {
+	dir := t.TempDir()
+	writeMemFile(t, dir, "x.md", "---\nid: x\n---\nOriginal.\n")
+	s := NewFileStore(dir)
+	before := s.Revision(context.Background())
+
+	writeMemFile(t, dir, "x.md", "---\nid: x\n---\nRewritten, with different length.\n")
+
+	if after := s.Revision(context.Background()); after == before {
+		t.Error("Revision unchanged after an in-place edit — the edit would be invisible until restart")
+	}
+}
 ```
 
 Add `"time"` to the test file's imports.
@@ -456,19 +471,40 @@ func (s *FileStore) Save(ctx context.Context, m Memory) error {
 	return nil
 }
 
-// Revision combines an in-process write counter with the directory's mtime:
-// the counter catches this process's own saves immediately, and the mtime
-// catches a file edited by hand while a session is running.
+// Revision digests the .md entries — name, size, mtime — alongside an
+// in-process write counter.
+//
+// It deliberately does not use the directory's own mtime: that advances only
+// when an entry is added or removed, not when an existing file is overwritten,
+// so it would miss a memory edited in place, which is the most likely way a
+// user curates one. The counter is folded in so this process's own saves
+// register regardless of filesystem timestamp granularity.
 func (s *FileStore) Revision(ctx context.Context) string {
-	var mtime int64
-	if info, err := os.Stat(s.dir); err == nil {
-		mtime = info.ModTime().UnixNano()
+	h := fnv.New64a()
+	fmt.Fprintf(h, "%d", s.gen.Load())
+
+	// ReadDir returns entries sorted by name, so the digest is stable.
+	if entries, err := os.ReadDir(s.dir); err == nil {
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			fmt.Fprintf(h, "|%s:%d:%d", e.Name(), info.Size(), info.ModTime().UnixNano())
+		}
 	}
-	return fmt.Sprintf("%d:%d", s.gen.Load(), mtime)
+	return fmt.Sprintf("%x", h.Sum64())
 }
 ```
 
-Add `"regexp"` to the imports in `store.go`.
+Add `"hash/fnv"` and `"regexp"` to the imports in `store.go`.
+
+A test must prove this: write a memory, take a revision, rewrite that same file
+with different content (adding no new files), and assert the revision changed.
+That test fails against a directory-mtime implementation.
 
 - [ ] **Step 4: Run test to verify it passes**
 

@@ -2,10 +2,13 @@ package memory
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -181,13 +184,40 @@ func (s *FileStore) Save(ctx context.Context, m Memory) error {
 	return nil
 }
 
-// Revision combines an in-process write counter with the directory's mtime:
-// the counter catches this process's own saves immediately, and the mtime
-// catches a file edited by hand while a session is running.
+// Revision digests the name, size and mtime of every memory file, plus an
+// in-process write counter. It deliberately does not use the directory's own
+// mtime, which moves only when an entry is added or removed: rewriting a file
+// in place leaves it untouched, so a hand-edited memory would never be
+// reloaded. The counter covers this process's own saves without depending on
+// filesystem timestamp granularity, which can be as coarse as a second.
+//
+// This runs before every model call, so it stays to one read of the directory
+// and a fixed-size digest rather than an unbounded string.
 func (s *FileStore) Revision(ctx context.Context) string {
-	var mtime int64
-	if info, err := os.Stat(s.dir); err == nil {
-		mtime = info.ModTime().UnixNano()
+	h := fnv.New64a()
+	buf := binary.LittleEndian.AppendUint64(make([]byte, 0, 64), s.gen.Load())
+	h.Write(buf)
+
+	// A missing or unreadable directory is a stable state, not something to
+	// report here; Load is where that surfaces.
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return strconv.FormatUint(h.Sum64(), 16)
 	}
-	return fmt.Sprintf("%d:%d", s.gen.Load(), mtime)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			// Vanished mid-scan; treat it as absent and let the next call settle.
+			continue
+		}
+		buf = buf[:0]
+		buf = append(buf, e.Name()...)
+		buf = binary.LittleEndian.AppendUint64(buf, uint64(info.Size()))
+		buf = binary.LittleEndian.AppendUint64(buf, uint64(info.ModTime().UnixNano()))
+		h.Write(buf)
+	}
+	return strconv.FormatUint(h.Sum64(), 16)
 }

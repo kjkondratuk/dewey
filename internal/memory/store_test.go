@@ -197,3 +197,31 @@ func TestFileStore_RevisionChangesOnSave(t *testing.T) {
 		t.Errorf("Revision unchanged after Save (%q) — cached memories would go stale", after)
 	}
 }
+
+// Editing a memory in place is the most likely way a user curates one, and a
+// directory's own mtime does not move when an existing file is overwritten —
+// so a directory-level change token would make the edit invisible until
+// restart.
+func TestFileStore_RevisionChangesWhenAFileIsEditedInPlace(t *testing.T) {
+	dir := t.TempDir()
+	writeMemFile(t, dir, "x.md", "---\nid: x\n---\nOriginal.\n")
+	s := NewFileStore(dir)
+	before := s.Revision(context.Background())
+
+	writeMemFile(t, dir, "x.md", "---\nid: x\n---\nRewritten, with a different length.\n")
+
+	if after := s.Revision(context.Background()); after == before {
+		t.Error("Revision unchanged after an in-place edit — the edit would not be picked up until restart")
+	}
+}
+
+func TestFileStore_RevisionIsStableWithoutChanges(t *testing.T) {
+	dir := t.TempDir()
+	writeMemFile(t, dir, "x.md", "---\nid: x\n---\nStable.\n")
+	s := NewFileStore(dir)
+
+	first := s.Revision(context.Background())
+	if second := s.Revision(context.Background()); second != first {
+		t.Errorf("Revision changed without any edit (%q then %q) — the cache would reload on every call", first, second)
+	}
+}
