@@ -8,8 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/kjkondratuk/dewey/internal/safety"
 )
 
 func writeConfig(t *testing.T, dir, contents string) {
@@ -28,7 +26,7 @@ func TestLoad_DefaultsWhenNoFilesExist(t *testing.T) {
 	project := t.TempDir()
 	t.Setenv("HOME", home)
 
-	cfg, err := Load(project)
+	cfg, _, err := Load(project)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -40,33 +38,12 @@ func TestLoad_DefaultsWhenNoFilesExist(t *testing.T) {
 	if cfg.Simple != wantIntermediate {
 		t.Errorf("Simple = %+v, want fallback to intermediate %+v", cfg.Simple, wantIntermediate)
 	}
-	// remember is pinned by default; see builtinOverrides.
-	if got := cfg.Overrides["remember"]; got != safety.Moderate {
-		t.Errorf("Overrides[remember] = %v, want Moderate", got)
+	// The remember tool writes by definition; the built-in rules say so.
+	if !contains(cfg.ShellRules.AlwaysWriteTools, "remember") {
+		t.Errorf("AlwaysWriteTools = %v, want it to include remember", cfg.ShellRules.AlwaysWriteTools)
 	}
-	if len(cfg.Overrides) != len(builtinOverrides) {
-		t.Errorf("Overrides = %+v, want only the built-ins", cfg.Overrides)
-	}
-}
-
-func TestLoad_ProjectOverridesGlobalPerKey(t *testing.T) {
-	home := t.TempDir()
-	project := t.TempDir()
-	t.Setenv("HOME", home)
-
-	writeConfig(t, home, "overrides:\n  read_file: safe\n  web_request: dangerous\n")
-	writeConfig(t, project, "overrides:\n  web_request: moderate\n")
-
-	cfg, err := Load(project)
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-
-	if cfg.Overrides["read_file"] != safety.Safe {
-		t.Errorf("read_file override = %v, want Safe (from global)", cfg.Overrides["read_file"])
-	}
-	if cfg.Overrides["web_request"] != safety.Moderate {
-		t.Errorf("web_request override = %v, want Moderate (project wins)", cfg.Overrides["web_request"])
+	if len(cfg.ShellRules.AlwaysWrite) == 0 {
+		t.Error("AlwaysWrite is empty; the built-in rules did not load")
 	}
 }
 
@@ -78,7 +55,7 @@ func TestLoad_ProjectModelTierReplacesGlobalTier(t *testing.T) {
 	writeConfig(t, home, "models:\n  simple:\n    base_url: \"http://global:1234/v1\"\n    api_key: \"global-key\"\n    model: \"global-model\"\n")
 	writeConfig(t, project, "models:\n  simple:\n    model: \"project-model\"\n")
 
-	cfg, err := Load(project)
+	cfg, _, err := Load(project)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -96,20 +73,8 @@ func TestLoad_MalformedYAMLIsAnError(t *testing.T) {
 
 	writeConfig(t, project, "models: [this is not valid: yaml structure")
 
-	if _, err := Load(project); err == nil {
+	if _, _, err := Load(project); err == nil {
 		t.Fatal("expected an error for malformed YAML")
-	}
-}
-
-func TestLoad_InvalidOverrideValueIsAnError(t *testing.T) {
-	home := t.TempDir()
-	project := t.TempDir()
-	t.Setenv("HOME", home)
-
-	writeConfig(t, project, "overrides:\n  read_file: extremely-safe\n")
-
-	if _, err := Load(project); err == nil {
-		t.Fatal("expected an error for invalid override value")
 	}
 }
 
@@ -117,7 +82,7 @@ func TestLoad_MemoryDefaults(t *testing.T) {
 	home, project := t.TempDir(), t.TempDir()
 	t.Setenv("HOME", home)
 
-	cfg, err := Load(project)
+	cfg, _, err := Load(project)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -137,7 +102,7 @@ func TestLoad_MemoryCanBeDisabled(t *testing.T) {
 	t.Setenv("HOME", home)
 	writeConfig(t, project, "memory:\n  enabled: false\n")
 
-	cfg, err := Load(project)
+	cfg, _, err := Load(project)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -154,7 +119,7 @@ func TestLoad_MemorySectionWithoutEnabledKeepsItOn(t *testing.T) {
 	t.Setenv("HOME", home)
 	writeConfig(t, project, "memory:\n  dir: /custom/memories\n  max_tokens: 1234\n")
 
-	cfg, err := Load(project)
+	cfg, _, err := Load(project)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -175,7 +140,7 @@ func TestLoad_MemoryProjectOverridesGlobal(t *testing.T) {
 	writeConfig(t, home, "memory:\n  enabled: false\n  dir: /global/memories\n  max_tokens: 100\n")
 	writeConfig(t, project, "memory:\n  enabled: true\n  max_tokens: 200\n")
 
-	cfg, err := Load(project)
+	cfg, _, err := Load(project)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -259,37 +224,6 @@ func TestDiscoverContextWindow_NoMatchingModelFallsThrough(t *testing.T) {
 	}
 }
 
-// The remember tool writes to the system prompt of every future session, so
-// its confirmation gate must not depend on the classifier agreeing it is a
-// write. A classifier answering read/safe would otherwise skip the prompt.
-func TestLoad_RememberIsPinnedSoApprovalCannotBeSkipped(t *testing.T) {
-	home, project := t.TempDir(), t.TempDir()
-	t.Setenv("HOME", home)
-
-	cfg, err := Load(project)
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if cfg.Overrides["remember"] != safety.Moderate {
-		t.Errorf("Overrides[remember] = %v, want Moderate so the gate always fires", cfg.Overrides["remember"])
-	}
-}
-
-// Pinned, not hardcoded: a user who really wants it ungated can say so.
-func TestLoad_UserCanOverrideTheBuiltinPin(t *testing.T) {
-	home, project := t.TempDir(), t.TempDir()
-	t.Setenv("HOME", home)
-	writeConfig(t, project, "overrides:\n  remember: safe\n")
-
-	cfg, err := Load(project)
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if cfg.Overrides["remember"] != safety.Safe {
-		t.Errorf("Overrides[remember] = %v, want the user's value to win", cfg.Overrides["remember"])
-	}
-}
-
 // "~/.dewey/memory" is the value the design doc documents. Taken literally it
 // makes the real profile invisible and creates a directory named "~" in
 // whatever project the user launched from.
@@ -298,7 +232,7 @@ func TestLoad_MemoryDirExpandsLeadingTilde(t *testing.T) {
 	t.Setenv("HOME", home)
 	writeConfig(t, project, "memory:\n  dir: ~/.dewey/memory\n")
 
-	cfg, err := Load(project)
+	cfg, _, err := Load(project)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -315,7 +249,7 @@ func TestLoad_MemoryDirWithoutTildeIsUnchanged(t *testing.T) {
 	t.Setenv("HOME", home)
 	writeConfig(t, project, "memory:\n  dir: /opt/memories\n")
 
-	cfg, err := Load(project)
+	cfg, _, err := Load(project)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -329,7 +263,7 @@ func TestLoad_MemoryDirWithoutTildeIsUnchanged(t *testing.T) {
 // same project disagreed about where they were.
 func TestProjectRoot_WalksUpToTheDeweyDirectory(t *testing.T) {
 	root := t.TempDir()
-	writeConfig(t, root, "overrides:\n  run_shell_command: moderate\n")
+	writeConfig(t, root, "shell_rules:\n  always_write: [mytool]\n")
 	deep := filepath.Join(root, "services", "api", "internal")
 	if err := os.MkdirAll(deep, 0o755); err != nil {
 		t.Fatal(err)
@@ -341,19 +275,19 @@ func TestProjectRoot_WalksUpToTheDeweyDirectory(t *testing.T) {
 
 	// And the config actually loads from down there.
 	t.Setenv("HOME", t.TempDir())
-	cfg, err := Load(deep)
+	cfg, _, err := Load(deep)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.Overrides["run_shell_command"] != safety.Moderate {
-		t.Errorf("override not picked up from a subdirectory: %+v", cfg.Overrides)
+	if !contains(cfg.ShellRules.AlwaysWrite, "mytool") {
+		t.Errorf("project shell rules not picked up from a subdirectory: %+v", cfg.ShellRules.AlwaysWrite)
 	}
 }
 
 // The search must not wander above the repository and adopt a parent's config.
 func TestProjectRoot_StopsAtARepositoryBoundary(t *testing.T) {
 	outer := t.TempDir()
-	writeConfig(t, outer, "overrides:\n  run_shell_command: dangerous\n")
+	writeConfig(t, outer, "shell_rules:\n  always_write: [outertool]\n")
 
 	inner := filepath.Join(outer, "vendored")
 	if err := os.MkdirAll(filepath.Join(inner, ".git"), 0o755); err != nil {
@@ -387,7 +321,7 @@ func TestLoad_ProjectConfigCannotDeclareAnOrg(t *testing.T) {
 	t.Setenv("HOME", home)
 	writeConfig(t, project, "org: acme\nmemory:\n  max_tokens: 1234\n")
 
-	cfg, err := Load(project)
+	cfg, _, err := Load(project)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -416,7 +350,7 @@ func TestLoad_PartialSimpleTierInheritsFromIntermediate(t *testing.T) {
     model: "tiny-model"
 `)
 
-	cfg, err := Load(project)
+	cfg, _, err := Load(project)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -448,11 +382,20 @@ func TestLoad_SimpleTierCanPointAtADifferentServer(t *testing.T) {
     model: "tiny-model"
 `)
 
-	cfg, err := Load(project)
+	cfg, _, err := Load(project)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
 	if cfg.Simple.BaseURL != "http://localhost:1234/v1" {
 		t.Errorf("Simple.BaseURL = %q, want its own explicit value", cfg.Simple.BaseURL)
 	}
+}
+
+func contains(values []string, want string) bool {
+	for _, v := range values {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }

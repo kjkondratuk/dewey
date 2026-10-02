@@ -88,7 +88,7 @@ func TestBuildMemory_EnabledRegistersRememberTool(t *testing.T) {
 func TestBuildMemory_ReportsTheDetectedScope(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	cfg, err := config.Load(t.TempDir())
+	cfg, _, err := config.Load(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestBuildMemory_ReportsTheDetectedScope(t *testing.T) {
 
 func TestBuildMemory_DisabledReportsNoScope(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	cfg, err := config.Load(t.TempDir())
+	cfg, _, err := config.Load(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -72,7 +72,3 @@ type Classification struct {
 func (c Classification) RequiresApproval() bool {
 	return c.Kind == "write" || c.Risk != Safe
 }
-
-// RiskOverrides pins specific tool names to a fixed RiskTier, bypassing the
-// classifier entirely for that tool.
-type RiskOverrides map[string]RiskTier

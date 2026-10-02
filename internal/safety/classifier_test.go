@@ -26,7 +26,7 @@ func (f *fakeGenerateModel) Stream(ctx context.Context, in []*schema.Message, op
 }
 
 func TestLLMClassifier_ValidResponse(t *testing.T) {
-	classifier := NewLLMClassifier(&fakeGenerateModel{content: `{"kind":"read","risk":"safe"}`})
+	classifier := NewLLMClassifier(&fakeGenerateModel{content: `{"kind":"read","risk":"safe"}`}, testRules(t))
 
 	got, err := classifier.Classify(context.Background(), "read_file", "reads a file", `{"path":"/tmp/x"}`)
 	if err != nil {
@@ -41,7 +41,7 @@ func TestLLMClassifier_ValidResponse(t *testing.T) {
 func TestLLMClassifier_ToleratesSurroundingText(t *testing.T) {
 	classifier := NewLLMClassifier(&fakeGenerateModel{
 		content: "Sure, here is my answer:\n```json\n{\"kind\":\"write\",\"risk\":\"dangerous\"}\n```",
-	})
+	}, testRules(t))
 
 	got, err := classifier.Classify(context.Background(), "web_request", "makes HTTP requests", `{"method":"DELETE"}`)
 	if err != nil {
@@ -54,7 +54,7 @@ func TestLLMClassifier_ToleratesSurroundingText(t *testing.T) {
 }
 
 func TestLLMClassifier_ModelErrorFailsSafe(t *testing.T) {
-	classifier := NewLLMClassifier(&fakeGenerateModel{err: errors.New("connection refused")})
+	classifier := NewLLMClassifier(&fakeGenerateModel{err: errors.New("connection refused")}, testRules(t))
 
 	got, err := classifier.Classify(context.Background(), "web_request", "makes HTTP requests", `{}`)
 	if err == nil {
@@ -66,7 +66,7 @@ func TestLLMClassifier_ModelErrorFailsSafe(t *testing.T) {
 }
 
 func TestLLMClassifier_MalformedJSONFailsSafe(t *testing.T) {
-	classifier := NewLLMClassifier(&fakeGenerateModel{content: "not json at all"})
+	classifier := NewLLMClassifier(&fakeGenerateModel{content: "not json at all"}, testRules(t))
 
 	got, err := classifier.Classify(context.Background(), "web_request", "makes HTTP requests", `{}`)
 	if err == nil {
@@ -78,7 +78,7 @@ func TestLLMClassifier_MalformedJSONFailsSafe(t *testing.T) {
 }
 
 func TestLLMClassifier_UnrecognizedFieldsFailSafe(t *testing.T) {
-	classifier := NewLLMClassifier(&fakeGenerateModel{content: `{"kind":"maybe","risk":"safe"}`})
+	classifier := NewLLMClassifier(&fakeGenerateModel{content: `{"kind":"maybe","risk":"safe"}`}, testRules(t))
 
 	got, err := classifier.Classify(context.Background(), "web_request", "makes HTTP requests", `{}`)
 	if err == nil {
@@ -90,7 +90,7 @@ func TestLLMClassifier_UnrecognizedFieldsFailSafe(t *testing.T) {
 }
 
 func TestLLMClassifier_MalformedJSONInsideBracesFailsSafe(t *testing.T) {
-	classifier := NewLLMClassifier(&fakeGenerateModel{content: `{"kind":"read","risk":}`})
+	classifier := NewLLMClassifier(&fakeGenerateModel{content: `{"kind":"read","risk":}`}, testRules(t))
 
 	got, err := classifier.Classify(context.Background(), "web_request", "makes HTTP requests", `{}`)
 	if err == nil {
@@ -102,7 +102,7 @@ func TestLLMClassifier_MalformedJSONInsideBracesFailsSafe(t *testing.T) {
 }
 
 func TestLLMClassifier_UnrecognizedRiskFailsSafe(t *testing.T) {
-	classifier := NewLLMClassifier(&fakeGenerateModel{content: `{"kind":"read","risk":"catastrophic"}`})
+	classifier := NewLLMClassifier(&fakeGenerateModel{content: `{"kind":"read","risk":"catastrophic"}`}, testRules(t))
 
 	got, err := classifier.Classify(context.Background(), "web_request", "makes HTTP requests", `{}`)
 	if err == nil {
@@ -116,7 +116,7 @@ func TestLLMClassifier_UnrecognizedRiskFailsSafe(t *testing.T) {
 func TestLLMClassifier_ParsesAndTrimsSummary(t *testing.T) {
 	classifier := NewLLMClassifier(&fakeGenerateModel{
 		content: `{"kind":"write","risk":"dangerous","summary":"  Deletes the build output directory.  "}`,
-	})
+	}, testRules(t))
 
 	got, err := classifier.Classify(context.Background(), "run_shell_command", "runs a shell command", `{"command":"rm -rf ./dist"}`)
 	if err != nil {
@@ -131,7 +131,7 @@ func TestLLMClassifier_ParsesAndTrimsSummary(t *testing.T) {
 // Summary is cosmetic, so its absence must not drag the classification down
 // the fail-safe path the way a bad kind or risk does.
 func TestLLMClassifier_MissingSummaryIsNotFatal(t *testing.T) {
-	classifier := NewLLMClassifier(&fakeGenerateModel{content: `{"kind":"read","risk":"safe"}`})
+	classifier := NewLLMClassifier(&fakeGenerateModel{content: `{"kind":"read","risk":"safe"}`}, testRules(t))
 
 	got, err := classifier.Classify(context.Background(), "run_shell_command", "runs a shell command", `{"command":"ls"}`)
 	if err != nil {
@@ -144,7 +144,7 @@ func TestLLMClassifier_MissingSummaryIsNotFatal(t *testing.T) {
 }
 
 func TestLLMClassifier_EmptySummaryIsNotFatal(t *testing.T) {
-	classifier := NewLLMClassifier(&fakeGenerateModel{content: `{"kind":"write","risk":"moderate","summary":"   "}`})
+	classifier := NewLLMClassifier(&fakeGenerateModel{content: `{"kind":"write","risk":"moderate","summary":"   "}`}, testRules(t))
 
 	got, err := classifier.Classify(context.Background(), "run_shell_command", "runs a shell command", `{"command":"touch f"}`)
 	if err != nil {
@@ -159,7 +159,7 @@ func TestLLMClassifier_EmptySummaryIsNotFatal(t *testing.T) {
 func TestLLMClassifier_BadKindStillFailsSafeDespiteSummary(t *testing.T) {
 	classifier := NewLLMClassifier(&fakeGenerateModel{
 		content: `{"kind":"maybe","risk":"safe","summary":"Lists files."}`,
-	})
+	}, testRules(t))
 
 	got, err := classifier.Classify(context.Background(), "run_shell_command", "runs a shell command", `{"command":"ls"}`)
 	if err == nil {
@@ -168,4 +168,15 @@ func TestLLMClassifier_BadKindStillFailsSafeDespiteSummary(t *testing.T) {
 	if got != failSafeClassification {
 		t.Errorf("Classify() = %+v, want the fail-safe classification %+v", got, failSafeClassification)
 	}
+}
+
+// testRules gives classifier tests the real built-in floor, so a test that
+// passes here reflects what ships.
+func testRules(t *testing.T) ShellRules {
+	t.Helper()
+	r, err := DefaultShellRules()
+	if err != nil {
+		t.Fatalf("DefaultShellRules() error = %v", err)
+	}
+	return r
 }

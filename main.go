@@ -29,7 +29,7 @@ func main() {
 		log.Fatalf("failed to determine working directory: %v", err)
 	}
 
-	cfg, err := config.Load(cwd)
+	cfg, ruleNotices, err := config.Load(cwd)
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
@@ -43,11 +43,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to create simple model: %v", err)
 	}
-	classifier := safety.NewLLMClassifier(simpleModel)
+	classifier := safety.NewLLMClassifier(simpleModel, cfg.ShellRules)
 	summarizer := compaction.NewLLMSummarizer(simpleModel)
 	contextWindow := config.DiscoverContextWindow(ctx, cfg.Intermediate)
 
 	systemPrompt, toolRecorder, provider, notices := buildMemory(cwd, cfg)
+	notices = append(ruleNotices, notices...)
 
 	// Force one load here so an unreadable memory directory or a dropped
 	// memory is reported at startup, rather than surfacing mid-turn as a
@@ -75,7 +76,7 @@ func main() {
 		log.Fatalf("failed to bind tools: %v", err)
 	}
 
-	agt := agent.New(tm, tools, classifier, cfg.Overrides, contextWindow, summarizer).
+	agt := agent.New(tm, tools, classifier, contextWindow, summarizer).
 		WithSystemPrompt(systemPrompt)
 
 	prog := tea.NewProgram(initModel(agt, notices))
