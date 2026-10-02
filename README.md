@@ -20,6 +20,7 @@ It is a single Go binary with a TUI. No daemon, no database.
 - [Context compaction](#context-compaction)
 - [Long-term memory](#long-term-memory)
 - [Keybindings](#keybindings)
+- [Troubleshooting](#troubleshooting)
 - [Development](#development)
 - [Current limitations](#current-limitations)
 
@@ -44,6 +45,12 @@ With no config file at all, dewey assumes LM Studio on its default port:
 If your loaded model has a different id — it almost certainly does — set it in
 a config file as described below. dewey does not auto-detect which model to
 use; it only auto-detects that model's context window size.
+
+**The model id is not validated at startup.** dewey builds its client without
+contacting the server, so a wrong id or an unreachable server surfaces as a red
+error block on your first message rather than as a startup failure. If dewey
+launches cleanly and then errors the moment you say anything, check the model id
+first.
 
 ## How the model is chosen
 
@@ -466,6 +473,19 @@ new prompt returns you to the bottom.
 Block borders carry meaning: blue for your messages, gray for replies and
 status, **yellow** when something is waiting on you, **red** for errors and
 denials.
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| Launches fine, red error on the first message | Wrong `model` id, or the server isn't running. The id is never validated at startup. Check `curl -s <base_url>/models`. |
+| Talks about running a command but never runs one | The model doesn't support tool calling. Nothing else in dewey works without it. |
+| An approval prompt on *every* tool call, even obviously safe ones | The `simple` tier can't be reached, so classification fails and fails safe to `dangerous`. If you set `simple.base_url` explicitly, confirm something is listening there. |
+| Compaction never happens on a long conversation | Either the provider reports usage and the window is genuinely large enough, or the tokenizer vocabulary couldn't be fetched. See the note under [Context compaction](#context-compaction). |
+| `remember` isn't offered | `memory.enabled` is false, in which case the tool is unregistered and the model is not told it exists. |
+| A memory isn't being applied | Compare its `org`/`tags` against the scope notice printed at startup. An `org:` memory never applies when no organization is detected, and a repo with no git remote has none. |
+| A memory file seems ignored | Look for a startup notice naming it. Malformed frontmatter, an empty body, and symlinks are each reported and skipped. |
+| Startup errors with an override message | An unrecognized value under `overrides:`. Valid values are `safe`, `moderate`, `dangerous`. |
 
 ## Development
 
