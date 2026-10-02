@@ -47,12 +47,6 @@ func (f *fakeClassifier) Classify(ctx context.Context, name, desc, argsJSON stri
 	return f.result, nil
 }
 
-type panicClassifier struct{}
-
-func (panicClassifier) Classify(ctx context.Context, name, desc, argsJSON string) (safety.Classification, error) {
-	panic("classifier should not be called when an override is set")
-}
-
 type fakeSummarizer struct {
 	result  string
 	err     error
@@ -131,7 +125,7 @@ func TestRun_SafeToolRunsWithoutConfirmation(t *testing.T) {
 		finalResponse("done"),
 	}}
 
-	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Kind: "read", Risk: safety.Safe}}, nil, 0, nil)
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Kind: "read", Risk: safety.Safe}}, 0, nil)
 
 	ch, err := agt.Run(context.Background(), "go")
 	if err != nil {
@@ -152,38 +146,6 @@ func TestRun_SafeToolRunsWithoutConfirmation(t *testing.T) {
 	}
 }
 
-func TestRun_OverrideSkipsClassifierAndAllowedDangerousRuns(t *testing.T) {
-	invoked := 0
-	tl := newRecordingTool(t, &invoked)
-	m := &fakeStreamModel{responses: [][]*schema.Message{
-		toolCallResponse("do_thing", `{"x":"1"}`),
-		finalResponse("done"),
-	}}
-
-	agt := New(m, []tool.InvokableTool{tl}, panicClassifier{}, safety.RiskOverrides{"do_thing": safety.Dangerous}, 0, nil)
-
-	ch, err := agt.Run(context.Background(), "go")
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-
-	sawConfirm := false
-	events := drain(t, ch, func(e Event) bool {
-		sawConfirm = true
-		return true // allow
-	})
-
-	if !sawConfirm {
-		t.Fatal("expected a confirm event for a dangerous tool")
-	}
-	if invoked != 1 {
-		t.Errorf("tool invoked %d times, want 1", invoked)
-	}
-	if events[len(events)-1].Kind != "done" {
-		t.Errorf("last event = %+v, want done", events[len(events)-1])
-	}
-}
-
 func TestRun_DenialSkipsToolAndFeedsHistoryBack(t *testing.T) {
 	invoked := 0
 	tl := newRecordingTool(t, &invoked)
@@ -192,7 +154,7 @@ func TestRun_DenialSkipsToolAndFeedsHistoryBack(t *testing.T) {
 		finalResponse("okay, skipping that"),
 	}}
 
-	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Kind: "write", Risk: safety.Dangerous}}, nil, 0, nil)
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Kind: "write", Risk: safety.Dangerous}}, 0, nil)
 
 	ch, err := agt.Run(context.Background(), "go")
 	if err != nil {
@@ -246,7 +208,7 @@ func TestRun_CancelDuringConfirmationDropsTheTurn(t *testing.T) {
 		toolCallResponse("do_thing", `{"x":"1"}`),
 	}}
 
-	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Kind: "write", Risk: safety.Dangerous}}, nil, 0, nil)
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Kind: "write", Risk: safety.Dangerous}}, 0, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -275,7 +237,7 @@ func TestRun_CancelDuringConfirmationDropsTheTurn(t *testing.T) {
 }
 
 func TestShouldCompact(t *testing.T) {
-	agt := New(nil, nil, nil, nil, 1000, nil)
+	agt := New(nil, nil, nil, 1000, nil)
 
 	if agt.shouldCompact(899) {
 		t.Error("shouldCompact(899) with window 1000 = true, want false (< 90%)")
@@ -286,7 +248,7 @@ func TestShouldCompact(t *testing.T) {
 }
 
 func TestShouldCompact_DisabledWhenContextWindowIsZero(t *testing.T) {
-	agt := New(nil, nil, nil, nil, 0, nil)
+	agt := New(nil, nil, nil, 0, nil)
 
 	if agt.shouldCompact(1_000_000) {
 		t.Error("shouldCompact() with contextWindow 0 = true, want false (disabled)")
@@ -294,7 +256,7 @@ func TestShouldCompact_DisabledWhenContextWindowIsZero(t *testing.T) {
 }
 
 func TestEstimateTokens_UsesProviderUsageAsBaseline(t *testing.T) {
-	agt := New(nil, nil, nil, nil, 1000, nil)
+	agt := New(nil, nil, nil, 1000, nil)
 	agt.history = []*schema.Message{{Role: schema.User, Content: "hi"}}
 
 	full := &schema.Message{
@@ -330,7 +292,7 @@ func TestRun_CompactsWhenHistoryExceedsThreshold(t *testing.T) {
 	fakeSumm := &fakeSummarizer{result: "the short summary"}
 
 	// A tiny context window guarantees the pre-seeded history exceeds 90% of it.
-	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 10, fakeSumm)
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 10, fakeSumm)
 	agt.history = []*schema.Message{
 		{Role: schema.User, Content: strings.Repeat("filler content ", 200)},
 		{Role: schema.Assistant, Content: strings.Repeat("more filler content ", 200)},
@@ -365,7 +327,7 @@ func TestRun_CompactsWhenHistoryExceedsThreshold(t *testing.T) {
 }
 
 func TestCompact_ResetsUsageBaseline(t *testing.T) {
-	agt := New(nil, nil, nil, nil, 1000, &fakeSummarizer{result: "summary"})
+	agt := New(nil, nil, nil, 1000, &fakeSummarizer{result: "summary"})
 	agt.history = []*schema.Message{
 		{Role: schema.User, Content: "old message 1"},
 		{Role: schema.Assistant, Content: "old message 2"},
@@ -386,7 +348,7 @@ func TestCompact_ResetsUsageBaseline(t *testing.T) {
 }
 
 func TestCompact_NoOpWhenTruncateLenIsZero(t *testing.T) {
-	agt := New(nil, nil, nil, nil, 1000, &fakeSummarizer{result: "should not be used"})
+	agt := New(nil, nil, nil, 1000, &fakeSummarizer{result: "should not be used"})
 	agt.history = []*schema.Message{{Role: schema.User, Content: "only message"}}
 
 	if err := agt.compact(context.Background(), 0); err != nil {
@@ -404,7 +366,7 @@ func TestRun_CompactionFailureSurfacesAsError(t *testing.T) {
 	m := &fakeStreamModel{responses: [][]*schema.Message{}}
 	fakeSumm := &fakeSummarizer{err: errors.New("model unavailable")}
 
-	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 10, fakeSumm)
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 10, fakeSumm)
 	agt.history = []*schema.Message{
 		{Role: schema.User, Content: strings.Repeat("filler content ", 200)},
 	}
@@ -430,7 +392,7 @@ func TestRun_CancelDuringCompactionRollsBackHistory(t *testing.T) {
 	m := &fakeStreamModel{responses: [][]*schema.Message{}}
 	fakeSumm := &fakeSummarizer{err: context.Canceled}
 
-	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 10, fakeSumm)
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 10, fakeSumm)
 	agt.history = []*schema.Message{
 		{Role: schema.User, Content: strings.Repeat("filler content ", 200)},
 	}
@@ -462,7 +424,7 @@ func TestRun_SkipsCompactionOnFirstTurn(t *testing.T) {
 
 	// contextWindow of 1 guarantees even a tiny first message would trip
 	// shouldCompact if truncateLen==0 weren't special-cased.
-	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 1, fakeSumm)
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 1, fakeSumm)
 
 	ch, err := agt.Run(context.Background(), strings.Repeat("filler content ", 200))
 	if err != nil {
@@ -587,7 +549,7 @@ func TestRun_ApprovedCallEmitsBriefInvocationAndSafeCallEmitsFull(t *testing.T) 
 		toolCallResponse("do_thing", `{"command":"rm -rf ./dist"}`),
 		finalResponse("done"),
 	}}
-	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Kind: "write", Risk: safety.Dangerous}}, nil, 0, nil)
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Kind: "write", Risk: safety.Dangerous}}, 0, nil)
 
 	ch, err := agt.Run(context.Background(), "go")
 	if err != nil {
@@ -615,7 +577,7 @@ func TestRun_ApprovedCallEmitsBriefInvocationAndSafeCallEmitsFull(t *testing.T) 
 		toolCallResponse("do_thing", `{"command":"ls -la"}`),
 		finalResponse("done"),
 	}}
-	agt2 := New(m2, []tool.InvokableTool{tl2}, &fakeClassifier{result: safety.Classification{Kind: "read", Risk: safety.Safe}}, nil, 0, nil)
+	agt2 := New(m2, []tool.InvokableTool{tl2}, &fakeClassifier{result: safety.Classification{Kind: "read", Risk: safety.Safe}}, 0, nil)
 
 	ch2, err := agt2.Run(context.Background(), "go")
 	if err != nil {
@@ -641,7 +603,7 @@ func TestRun_SuccessfulToolResultCarriesToolName(t *testing.T) {
 		toolCallResponse("do_thing", `{"x":"1"}`),
 		finalResponse("done"),
 	}}
-	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Kind: "read", Risk: safety.Safe}}, nil, 0, nil)
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Kind: "read", Risk: safety.Safe}}, 0, nil)
 
 	ch, err := agt.Run(context.Background(), "go")
 	if err != nil {
@@ -705,7 +667,7 @@ func TestFormatConfirmMessage_SummaryCannotInjectAHeading(t *testing.T) {
 func TestRun_PrependsSystemMessageWithoutStoringIt(t *testing.T) {
 	sp := &fakeSystemProvider{text: "SYSTEM RULES"}
 	m := &fakeStreamModel{responses: [][]*schema.Message{finalResponse("ok")}}
-	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 0, nil)
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 0, nil)
 	agt.systemProvider = sp
 
 	ch, err := agt.Run(context.Background(), "hello")
@@ -736,7 +698,7 @@ func TestRun_SystemProviderIsConsultedEveryStream(t *testing.T) {
 		toolCallResponse("do_thing", `{"x":"1"}`),
 		finalResponse("done"),
 	}}
-	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 0, nil)
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 0, nil)
 	agt.systemProvider = sp
 
 	ch, _ := agt.Run(context.Background(), "go")
@@ -749,7 +711,7 @@ func TestRun_SystemProviderIsConsultedEveryStream(t *testing.T) {
 
 func TestRun_NilSystemProviderSendsHistoryUnchanged(t *testing.T) {
 	m := &fakeStreamModel{responses: [][]*schema.Message{finalResponse("ok")}}
-	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 0, nil)
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 0, nil)
 
 	ch, _ := agt.Run(context.Background(), "hello")
 	drain(t, ch, func(Event) bool { return true })
@@ -768,7 +730,7 @@ func TestRun_SystemMessageSurvivesARealCompaction(t *testing.T) {
 	m := &fakeStreamModel{responses: [][]*schema.Message{finalResponse("ok")}}
 
 	// A tiny context window guarantees the seeded history trips the threshold.
-	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 10,
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 10,
 		&fakeSummarizer{result: "the summary"})
 	agt.systemProvider = sp
 	agt.history = []*schema.Message{
@@ -813,7 +775,7 @@ func TestRun_SystemMessageSurvivesARealCompaction(t *testing.T) {
 
 func TestCompact_DoesNotTouchTheSystemMessage(t *testing.T) {
 	sp := &fakeSystemProvider{text: "RULES"}
-	agt := New(nil, nil, nil, nil, 1000, &fakeSummarizer{result: "summary"})
+	agt := New(nil, nil, nil, 1000, &fakeSummarizer{result: "summary"})
 	agt.systemProvider = sp
 	agt.history = []*schema.Message{
 		{Role: schema.User, Content: "one"},
@@ -857,7 +819,7 @@ func TestRun_MidSessionNoticesAreSurfaced(t *testing.T) {
 		toolCallResponse("do_thing", `{"x":"1"}`),
 		finalResponse("done"),
 	}}
-	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 0, nil)
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 0, nil)
 	agt.systemProvider = sp
 
 	ch, err := agt.Run(context.Background(), "go")
@@ -888,7 +850,7 @@ func TestRun_UnchangedNoticesAreNotRepeated(t *testing.T) {
 		toolCallResponse("do_thing", `{"x":"1"}`),
 		finalResponse("done"),
 	}}
-	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, nil, 0, nil)
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 0, nil)
 	agt.systemProvider = sp
 
 	ch, _ := agt.Run(context.Background(), "go")
@@ -925,7 +887,7 @@ func TestRun_WriteRatedSafeStillAsksFirst(t *testing.T) {
 	// Exactly what gemma returns for `echo hello > smoke-test.txt`.
 	writeRatedSafe := &fakeClassifier{result: safety.Classification{Kind: "write", Risk: safety.Safe}}
 
-	agt := New(m, []tool.InvokableTool{tl}, writeRatedSafe, nil, 0, nil)
+	agt := New(m, []tool.InvokableTool{tl}, writeRatedSafe, 0, nil)
 	ch, err := agt.Run(context.Background(), "go")
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
@@ -954,7 +916,7 @@ func TestRun_ReadRatedSafeStillRunsWithoutAsking(t *testing.T) {
 		toolCallResponse("do_thing", `{"x":"1"}`),
 		finalResponse("done"),
 	}}
-	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Kind: "read", Risk: safety.Safe}}, nil, 0, nil)
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Kind: "read", Risk: safety.Safe}}, 0, nil)
 
 	ch, _ := agt.Run(context.Background(), "go")
 	events := drain(t, ch, func(Event) bool { return true })

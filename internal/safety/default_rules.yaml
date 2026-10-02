@@ -1,0 +1,168 @@
+# Deterministic floor applied to shell commands before the classifier's answer
+# is used. These are defaults: a project or user config can extend them, and
+# dewey does not need rebuilding to cover a new tool.
+#
+# The shape matters. Listing a program under `reads_when` means "unknown
+# invocations of this write" — so a subcommand nobody anticipated prompts
+# rather than running silently. Patterns describe reads for the same reason:
+# a pattern language for writes would let anything unmatched through.
+
+# Programs whose purpose is changing something. No argument makes them reads.
+always_write:
+  # filesystem
+  - rm
+  - rmdir
+  - mv
+  - cp
+  - touch
+  - mkdir
+  - ln
+  - tee
+  - dd
+  - truncate
+  - shred
+  - install
+  - chmod
+  - chown
+  - chgrp
+  - chflags
+  - unlink
+  - mktemp
+  # in-place rewriters and editors
+  - patch
+  - vi
+  - vim
+  - nano
+  - emacs
+  # privilege and system state
+  - sudo
+  - su
+  - doas
+  - reboot
+  - shutdown
+  - mount
+  - umount
+  - crontab
+  # process control
+  - kill
+  - killall
+  - pkill
+  # transfers that land files locally
+  - scp
+  - rsync
+  - wget
+  # archive tools whose default action extracts
+  - unzip
+  - gunzip
+  - bunzip2
+  - unxz
+
+# Non-shell tools that write by definition, whatever a classifier decides.
+always_write_tools:
+  - remember
+
+# Programs that read or write depending on the subcommand. Anything not listed
+# here as read-only counts as a write.
+reads_when:
+  git:
+    subcommands:
+      [status, log, diff, show, blame, shortlog, describe, rev-parse,
+       rev-list, ls-files, ls-remote, ls-tree, cat-file, grep, reflog,
+       whatchanged, merge-base, show-ref, name-rev, diff-tree, diff-index,
+       check-ignore, verify-commit, verify-tag, count-objects, var, help,
+       version, annotate, cherry, difftool, range-diff]
+    patterns:
+      # `git branch` and `git tag` list until given an operand, at which point
+      # they create, delete, or rename.
+      - '^branch(\s+(-a|-r|-v|-vv|-l|--list|--all|--remotes|--verbose|--show-current))*\s*$'
+      - '^tag(\s+(-l|--list|-n\d*))*\s*$'
+      # `git remote` lists; `git remote add` does not.
+      - '^remote(\s+(-v|--verbose))*\s*$'
+      - '^remote\s+(show|get-url)\b'
+      # Sub-subcommands that only read. Bare `git stash` stashes, so it is
+      # deliberately absent.
+      - '^stash\s+(list|show)\b'
+      - '^worktree\s+list\b'
+      - '^submodule\s+(status|summary)\b'
+      - '^notes\s+(list|show)\b'
+      - '^bisect\s+(log|view)\b'
+      # `git config` reads with one operand and writes with two.
+      - '^config\s+(--get|--get-all|--get-regexp|--list|-l)\b[^|&;]*$'
+      - '^config\s+[^-\s][^\s]*\s*$'
+
+  docker: &container
+    subcommands:
+      [ps, images, logs, inspect, version, info, stats, top, port, diff,
+       history, events, search]
+  podman: *container
+
+  kubectl:
+    subcommands:
+      [get, describe, logs, explain, version, api-resources, api-versions,
+       cluster-info, top, config, diff, auth, events]
+
+  helm:
+    subcommands:
+      [list, ls, status, get, history, show, search, version, env, lint,
+       template, dependency]
+
+  systemctl:
+    subcommands:
+      [status, show, list-units, list-unit-files, is-active, is-enabled,
+       is-failed, cat, show-environment, list-timers, list-sockets]
+
+  npm:
+    subcommands:
+      [ls, list, view, info, show, outdated, search, ping, whoami, root,
+       prefix, bin, config, why, explain, doctor, version, audit]
+  yarn:
+    subcommands: [list, info, why, outdated, versions, config, audit]
+  pnpm:
+    subcommands: [list, ls, why, outdated, view, info, config, audit, root, bin]
+
+  go:
+    subcommands: [version, env, list, doc, vet, fmt, fix, help, bug, tool]
+  cargo:
+    subcommands:
+      [check, tree, metadata, search, version, help, locate-project,
+       verify-project, pkgid, report]
+
+  pip: &pip
+    subcommands: [list, show, freeze, check, search, config, debug, inspect]
+  pip3: *pip
+
+  brew:
+    subcommands:
+      [list, ls, info, search, deps, uses, outdated, doctor, config, home,
+       cat, desc]
+  apt:
+    subcommands: [list, search, show, policy, depends, rdepends]
+  apt-get:
+    subcommands: [download, source, check, indextargets]
+  mise:
+    subcommands: [ls, list, current, where, which, env, doctor, version, config]
+
+  terraform:
+    subcommands: [plan, show, output, validate, fmt, version, providers, graph, console]
+  tofu:
+    subcommands: [plan, show, output, validate, fmt, version, providers, graph, console]
+
+  hg:
+    subcommands:
+      [status, log, diff, cat, annotate, identify, manifest, paths, summary, version]
+  svn:
+    subcommands: [status, log, diff, cat, info, list, ls, blame, annotate]
+
+  launchctl:
+    subcommands:
+      [list, print, print-cache, print-disabled, procinfo, examine, blame, version]
+  defaults:
+    subcommands: [read, read-type, domains, find, help]
+
+# Programs that read by default and write only with one of these flags.
+writes_with_flags:
+  sed: ['-i', '--in-place']
+  perl: ['-i']
+  curl: ['-o', '-O', '--output', '--remote-name', '--create-dirs', '--upload-file', '-T']
+  find: ['-delete', '-exec', '-execdir', '-ok', '-okdir']
+  tar: ['-x', '-c', '--extract', '--create', '--delete', '-u', '--update']

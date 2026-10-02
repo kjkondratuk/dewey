@@ -33,16 +33,6 @@ type MemoryConfig struct {
 	MaxTokens int
 }
 
-// builtinOverrides pins tools whose risk tier must not be left to the
-// classifier's judgement.
-var builtinOverrides = safety.RiskOverrides{
-	// remember writes to the system prompt of every future session. A
-	// classifier answering {"kind":"read","risk":"safe"} would let the model
-	// save a memory with no confirmation at all, while the system prompt tells
-	// it approval is required.
-	"remember": safety.Moderate,
-}
-
 // ModelConfig is the connection details for one model tier.
 type ModelConfig struct {
 	BaseURL string `yaml:"base_url"`
@@ -60,7 +50,7 @@ type Config struct {
 	Intermediate ModelConfig
 	Hard         ModelConfig
 	Embedding    ModelConfig
-	Overrides    safety.RiskOverrides
+	ShellRules   safety.ShellRules
 	Memory       MemoryConfig
 }
 
@@ -81,7 +71,7 @@ type fileConfig struct {
 		Hard         ModelConfig `yaml:"hard"`
 		Embedding    ModelConfig `yaml:"embedding"`
 	} `yaml:"models"`
-	Overrides map[string]string `yaml:"overrides"`
+	ShellRules safety.ShellRules `yaml:"shell_rules"`
 	// Memory is a pointer so an absent section is distinguishable from one
 	// that explicitly sets enabled: false.
 	Memory *memoryFileConfig `yaml:"memory"`
@@ -91,7 +81,10 @@ type fileConfig struct {
 // merges project values over global per-key, applies defaults, and returns
 // the resolved Config. A missing file is not an error; malformed YAML or an
 // invalid override value is.
-func Load(projectDir string) (Config, error) {
+// Load returns the resolved configuration plus any notices about rules the
+// user's config weakened — removing a program from the always-write list is a
+// legitimate thing to want and a thing worth being reminded of.
+func Load(projectDir string) (Config, []string, error) {
 	globalPath := ""
 	if home, err := os.UserHomeDir(); err == nil {
 		globalPath = filepath.Join(home, configDirName, configFileName)
@@ -99,13 +92,13 @@ func Load(projectDir string) (Config, error) {
 
 	global, err := readFileConfig(globalPath)
 	if err != nil {
-		return Config{}, err
+		return Config{}, nil, err
 	}
 
 	projectPath := filepath.Join(ProjectRoot(projectDir), configDirName, configFileName)
 	project, err := readFileConfig(projectPath)
 	if err != nil {
-		return Config{}, err
+		return Config{}, nil, err
 	}
 
 	return merge(global, project)
@@ -166,7 +159,7 @@ func readFileConfig(path string) (fileConfig, error) {
 	return fc, nil
 }
 
-func merge(global, project fileConfig) (Config, error) {
+func merge(global, project fileConfig) (Config, []string, error) {
 	intermediate := pickModelConfig(global.Models.Intermediate, project.Models.Intermediate)
 	applyModelDefaults(&intermediate, defaultIntermediateModel)
 
@@ -190,29 +183,15 @@ func merge(global, project fileConfig) (Config, error) {
 	embedding := pickModelConfig(global.Models.Embedding, project.Models.Embedding)
 	applyModelDefaults(&embedding, "")
 
-	overrides := safety.RiskOverrides{}
-	// remember writes to the system prompt of every future session, so its
-	// confirmation gate cannot rest on the classifier agreeing that it is a
-	// write. A classifier answering {"kind":"read","risk":"safe"} would
-	// otherwise let the model save a memory with no prompt at all, while the
-	// system prompt tells it approval is required. Seeded before the file
-	// loops so a user who really wants it ungated can still override.
-	for name, tier := range builtinOverrides {
-		overrides[name] = tier
+	defaults, err := safety.DefaultShellRules()
+	if err != nil {
+		return Config{}, nil, err
 	}
-	for name, raw := range global.Overrides {
-		tier, err := safety.ParseRiskTier(raw)
-		if err != nil {
-			return Config{}, fmt.Errorf("global override for %q: %w", name, err)
-		}
-		overrides[name] = tier
-	}
-	for name, raw := range project.Overrides {
-		tier, err := safety.ParseRiskTier(raw)
-		if err != nil {
-			return Config{}, fmt.Errorf("project override for %q: %w", name, err)
-		}
-		overrides[name] = tier
+	rules, ruleNotices := defaults.Merge(global.ShellRules)
+	rules, projectNotices := rules.Merge(project.ShellRules)
+	ruleNotices = append(ruleNotices, projectNotices...)
+	if err := rules.Compile(); err != nil {
+		return Config{}, nil, err
 	}
 
 	memory := MemoryConfig{Enabled: true, MaxTokens: defaultMemoryMaxTokens}
@@ -239,9 +218,9 @@ func merge(global, project fileConfig) (Config, error) {
 		Intermediate: intermediate,
 		Hard:         hard,
 		Embedding:    embedding,
-		Overrides:    overrides,
+		ShellRules:   rules,
 		Memory:       memory,
-	}, nil
+	}, ruleNotices, nil
 }
 
 // pickModelConfig returns project if it sets anything, else global. A tier

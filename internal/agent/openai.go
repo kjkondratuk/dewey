@@ -60,7 +60,6 @@ type openaiAgent struct {
 	tools      map[string]tool.InvokableTool
 	descs      map[string]string
 	classifier safety.Classifier
-	overrides  safety.RiskOverrides
 	history    []*schema.Message
 
 	// systemProvider is deliberately not part of history: compact() rewrites
@@ -86,15 +85,14 @@ type openaiAgent struct {
 // bound (via cm.WithTools). tools supplies the matching executable
 // implementations, keyed by name, so tool calls the model requests can
 // actually be run. classifier assigns a risk tier to each resolved tool
-// call; overrides pins specific tool names to a fixed tier, bypassing the
-// classifier for that tool. contextWindow is the model's context size in
+// call, applying a deterministic floor the model cannot lower. contextWindow
+// is the model's context size in
 // tokens (0 disables automatic compaction); summarizer condenses history
 // when compaction triggers.
 func New(
 	cm model.ToolCallingChatModel,
 	tools []tool.InvokableTool,
 	classifier safety.Classifier,
-	overrides safety.RiskOverrides,
 	contextWindow int,
 	summarizer compaction.Summarizer,
 ) *openaiAgent {
@@ -113,7 +111,6 @@ func New(
 		tools:         byName,
 		descs:         descs,
 		classifier:    classifier,
-		overrides:     overrides,
 		contextWindow: contextWindow,
 		summarizer:    summarizer,
 	}
@@ -316,13 +313,10 @@ func (a *openaiAgent) newNotices() string {
 	return strings.Join(fresh, "\n")
 }
 
-// classify resolves the risk classification for a tool call: a config
-// override always wins and skips the classifier; otherwise the classifier
-// is consulted, which itself fails safe to Dangerous/write on any error.
+// classify resolves the classification for a tool call. The classifier fails
+// safe to Dangerous/write on any error and applies the deterministic shell
+// floor itself, so the result is usable without special-casing err.
 func (a *openaiAgent) classify(ctx context.Context, name, argsJSON string) safety.Classification {
-	if tier, ok := a.overrides[name]; ok {
-		return safety.Classification{Risk: tier}
-	}
 	classification, _ := a.classifier.Classify(ctx, name, a.descs[name], argsJSON)
 	return classification
 }

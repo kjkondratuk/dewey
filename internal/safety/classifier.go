@@ -36,12 +36,13 @@ var failSafeClassification = Classification{Kind: "write", Risk: Dangerous}
 // exchange isolated from any ongoing conversation history.
 type llmClassifier struct {
 	model model.BaseChatModel
+	rules ShellRules
 }
 
 // NewLLMClassifier builds a Classifier backed by m. m should be a small/fast
 // model — classification runs once per tool call.
-func NewLLMClassifier(m model.BaseChatModel) Classifier {
-	return &llmClassifier{model: m}
+func NewLLMClassifier(m model.BaseChatModel, rules ShellRules) Classifier {
+	return &llmClassifier{model: m, rules: rules}
 }
 
 func (c *llmClassifier) Classify(ctx context.Context, toolName, toolDesc, argsJSON string) (Classification, error) {
@@ -63,7 +64,7 @@ func (c *llmClassifier) Classify(ctx context.Context, toolName, toolDesc, argsJS
 	if err != nil {
 		return failSafeClassification, err
 	}
-	return raiseToFloor(classification, toolName, argsJSON), nil
+	return c.rules.raiseToFloor(classification, toolName, argsJSON), nil
 }
 
 // raiseToFloor applies a deterministic minimum to a model-produced
@@ -71,12 +72,8 @@ func (c *llmClassifier) Classify(ctx context.Context, toolName, toolDesc, argsJS
 // may escalate beyond it, never relax below it, because a language model
 // reasoning about consequences is not a sound basis for the only gate in front
 // of a tool that can run arbitrary commands.
-func raiseToFloor(c Classification, toolName, argsJSON string) Classification {
-	if toolName != shellToolName {
-		return c
-	}
-
-	floor := ShellFloor(argsJSON)
+func (r ShellRules) raiseToFloor(c Classification, toolName, argsJSON string) Classification {
+	floor := r.ToolFloor(toolName, argsJSON)
 	if floor.Kind == "write" {
 		c.Kind = "write"
 	}

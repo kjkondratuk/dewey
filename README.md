@@ -225,10 +225,32 @@ models:
   hard: {}                                       # parsed, unused
   embedding: {}                                  # parsed, unused
 
-# Pin a tool's risk tier, bypassing the classifier for it.
-# Values: safe | moderate | dangerous
-overrides:
-  run_shell_command: moderate
+# Extend the deterministic floor applied to shell commands. These merge over
+# the built-in defaults rather than replacing them.
+shell_rules:
+  # Programs that always require approval, whatever the arguments.
+  always_write: [terraform-destroy-wrapper]
+
+  # Programs that read or write depending on the subcommand. Listing a program
+  # here means unknown invocations of it count as writes.
+  reads_when:
+    bazel:
+      subcommands: [query, info, version]
+    ansible:
+      subcommands: ["--version", "--list-hosts"]
+      # Patterns match the arguments after the program name, and describe
+      # READS only. They never describe writes: anything unmatched has to fall
+      # through as a write, or an unanticipated command runs silently.
+      patterns: ['^--check\b']
+
+  # Programs that read by default and write only with one of these flags.
+  # Replaces the built-in list for that program rather than extending it.
+  writes_with_flags:
+    rsync: ['--delete']
+
+  # Remove a program from always_write. The one knob that weakens the floor,
+  # so dewey reports it at startup.
+  never_write: [mktemp]
 
 # Long-term memory.
 memory:
@@ -243,12 +265,15 @@ value is ignored. It is what gets used on every other provider, and omitting it 
 means a conservative 8192. It is only ever read for the `intermediate` tier —
 setting it on another tier parses and is silently ignored.
 
-`overrides` and `memory` merge **per-key** between the global and project files,
-unlike model tiers. An unrecognized `overrides` value is a fatal startup error,
-not a warning.
+`shell_rules` and `memory` merge **per-key** between the global and project
+files, unlike model tiers — adding one subcommand for `git` keeps the built-in
+list. An invalid regex in `patterns` is a fatal startup error rather than a
+silently-skipped rule, since a rule you believe is in effect is the failure
+this is guarding against.
 
-`remember` is pinned to `moderate` internally, ahead of this file, so its
-approval prompt always fires. You can still override it explicitly if you want
+The `remember` tool declares itself a write in the built-in rules
+(`always_write_tools`), so its approval prompt always fires regardless of what
+the classifier decides. You can still override it explicitly if you want
 it ungated.
 
 ## Tool safety and approval
@@ -300,9 +325,9 @@ The plain-English line comes from the classifier, so you can judge a command
 without reading its flags. Answer `y` to run, `n` to decline, `esc` to cancel
 the whole turn.
 
-A prompt that fired because of a config `override` has no summary line and no
-`(WRITE)` label — overrides skip the classifier, and the summary is something
-the classifier produces. That includes `remember`, whose tier is pinned.
+The summary comes from the classifier, so a prompt that fired only because the
+deterministic floor raised it may show a summary that undersells what the
+command does. The command text above it is authoritative.
 
 Declining is not an error. The model is told you had the capability and chose
 not to use it, and asked to propose something else rather than retry.
@@ -485,7 +510,8 @@ denials.
 | `remember` isn't offered | `memory.enabled` is false, in which case the tool is unregistered and the model is not told it exists. |
 | A memory isn't being applied | Compare its `org`/`tags` against the scope notice printed at startup. An `org:` memory never applies when no organization is detected, and a repo with no git remote has none. |
 | A memory file seems ignored | Look for a startup notice naming it. Malformed frontmatter, an empty body, and symlinks are each reported and skipped. |
-| Startup errors with an override message | An unrecognized value under `overrides:`. Valid values are `safe`, `moderate`, `dangerous`. |
+| Startup errors about a shell rule | An invalid regex under `shell_rules.<program>.patterns`. The message names the program and the pattern. |
+| A command you run constantly keeps prompting | Add its read-only form under `shell_rules.reads_when`, or the program to `never_write` if it should never prompt. Both are reported at startup so a weakened rule stays visible. |
 
 ## Development
 
