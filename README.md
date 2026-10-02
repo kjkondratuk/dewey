@@ -401,7 +401,7 @@ test functions.
 | `id` | Stable slug, also the filename stem. Optional — defaults to the filename. |
 | `created` | Date. Informational, and decides eviction order when the budget is tight. |
 | `org` | **Hard gate.** Absent means "applies anywhere". Present means "only when the detected organization matches exactly". |
-| `tags` | Topical filter. Absent means no restriction; present means at least one must match. |
+| `tags` | Stack filter. Absent means no restriction; present means at least one must match the detected stack. Only `go`, `node`, `rust`, and `python` are meaningful — tags match by intersection with what detection produces, so anything else can never match and is dropped on save. |
 
 `org` and `tags` behave differently on purpose. A memory tagged `[go]` with
 `org: acme` does **not** apply to Go work for a different organization — org
@@ -445,6 +445,13 @@ a remote owner of `Acme` matches `org: acme`.
 The agent proposes a memory when you state a preference, correct the same
 behavior twice, or establish a durable fact about your environment. It arrives
 as a normal approval prompt, and nothing is written unless you say yes.
+
+**Saved memories apply everywhere by default.** Most preferences follow you
+between projects, so the agent only narrows one when it has reason to: it can
+ask for the memory to be limited to the current organization, and it can tag a
+memory with a stack. It can never name a *different* organization — the choice
+is "here" or "everywhere", which is what keeps one client's conventions out of
+another's work while still allowing universal preferences.
 
 You can also just write the files by hand — that is the whole storage format,
 and edits are picked up on the next model call without restarting.

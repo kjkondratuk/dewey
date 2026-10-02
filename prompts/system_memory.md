@@ -10,4 +10,11 @@ Do not record project-specific facts — architecture, where code lives, why a
 decision was made. Those belong in the project itself. Record how this person
 wants to work, not what this codebase is.
 
+Default to saving a memory that applies everywhere. Most preferences follow the
+user between projects, so set `this_org_only` only when the fact genuinely
+belongs to the current client or employer rather than to the user, and add
+`tags` only to limit a memory to particular stacks — the only meaningful values
+are `go`, `node`, `rust`, and `python`. Tags are not topic labels; anything else
+is discarded.
+
 Saving requires the user's approval, so propose rather than announce.

@@ -23,6 +23,35 @@ var stackMarkers = map[string]string{
 	"requirements.txt": "python",
 }
 
+// KnownTags returns every tag DetectContext can produce.
+//
+// Tags only ever narrow a memory by intersection with the detected context, so
+// a tag outside this set can never match anything. Validating against it is
+// what stops a well-meaning tag like "commits" from silently making a memory
+// permanently inert.
+func KnownTags() []string {
+	seen := make(map[string]bool, len(stackMarkers))
+	var tags []string
+	for _, tag := range stackMarkers {
+		if !seen[tag] {
+			seen[tag] = true
+			tags = append(tags, tag)
+		}
+	}
+	sortStrings(tags)
+	return tags
+}
+
+// isKnownTag reports whether tag is one DetectContext can ever produce.
+func isKnownTag(tag string) bool {
+	for _, known := range stackMarkers {
+		if tag == known {
+			return true
+		}
+	}
+	return false
+}
+
 // DetectContext infers what the work in dir is, so memories can be scoped to
 // it.
 //

@@ -86,15 +86,16 @@ func TestDefaultInvokableToolset_ShellCommandSpawnFailureIsAToolError(t *testing
 }
 
 type fakeRecorder struct {
-	calls int
-	text  string
-	tags  []string
-	err   error
+	calls       int
+	text        string
+	tags        []string
+	thisOrgOnly bool
+	err         error
 }
 
-func (f *fakeRecorder) Record(ctx context.Context, text string, tags []string) error {
+func (f *fakeRecorder) RecordScoped(ctx context.Context, text string, tags []string, thisOrgOnly bool) error {
 	f.calls++
-	f.text, f.tags = text, tags
+	f.text, f.tags, f.thisOrgOnly = text, tags, thisOrgOnly
 	return f.err
 }
 
@@ -162,14 +163,16 @@ func TestRememberTool_SchemaExposesNoOrgParameter(t *testing.T) {
 	if err := json.Unmarshal(raw, &shape); err != nil {
 		t.Fatalf("unmarshaling the schema: %v", err)
 	}
-	for _, want := range []string{"text", "tags"} {
+	for _, want := range []string{"text", "tags", "this_org_only"} {
 		if _, ok := shape.Properties[want]; !ok {
 			t.Errorf("schema is missing the %q parameter; properties = %v", want, shape.Properties)
 		}
 	}
-	if len(shape.Properties) != 2 {
-		t.Errorf("schema exposes %d parameters, want exactly text and tags: %s", len(shape.Properties), raw)
+	if len(shape.Properties) != 3 {
+		t.Errorf("schema exposes %d parameters, want exactly text, tags and this_org_only: %s", len(shape.Properties), raw)
 	}
+	// this_org_only can only ask for the org already detected. A field naming
+	// one is what would let the model reach another client's memories.
 	if _, ok := shape.Properties["org"]; ok {
 		t.Error("schema exposes an org parameter, which would let the model choose a memory's organization")
 	}
@@ -189,5 +192,27 @@ func TestRememberTool_SurfacesRecorderFailures(t *testing.T) {
 	}
 	if rec.calls != 1 {
 		t.Errorf("recorder called %d times, want 1", rec.calls)
+	}
+}
+
+// Omitting this_org_only must mean "applies everywhere", since that is what
+// the model will do for the great majority of preferences.
+func TestRememberTool_DefaultsToUniversalScope(t *testing.T) {
+	rec := &fakeRecorder{}
+	if _, err := rememberTool(t, rec).InvokableRun(context.Background(), `{"text":"Prefers conventional commits."}`); err != nil {
+		t.Fatalf("InvokableRun() error = %v", err)
+	}
+	if rec.thisOrgOnly {
+		t.Error("thisOrgOnly = true with the field omitted, want false")
+	}
+}
+
+func TestRememberTool_PassesScopeThrough(t *testing.T) {
+	rec := &fakeRecorder{}
+	if _, err := rememberTool(t, rec).InvokableRun(context.Background(), `{"text":"Bills to cost center 7781.","this_org_only":true}`); err != nil {
+		t.Fatalf("InvokableRun() error = %v", err)
+	}
+	if !rec.thisOrgOnly {
+		t.Error("thisOrgOnly = false, want the requested scoping honored")
 	}
 }

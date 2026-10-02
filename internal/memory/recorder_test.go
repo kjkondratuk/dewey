@@ -18,7 +18,7 @@ func TestRecorder_StampsOrgFromContextNotInput(t *testing.T) {
 	store := &capturingStore{}
 	r := NewRecorder(store, Context{Org: "acme", Tags: []string{"go"}})
 
-	if err := r.Record(context.Background(), "Prefers table-driven tests.", []string{"testing"}); err != nil {
+	if err := r.RecordScoped(context.Background(), "Prefers table-driven tests.", []string{"go"}, true); err != nil {
 		t.Fatalf("Record() error = %v", err)
 	}
 	if len(store.saved) != 1 {
@@ -28,8 +28,8 @@ func TestRecorder_StampsOrgFromContextNotInput(t *testing.T) {
 	if got.Org != "acme" {
 		t.Errorf("Org = %q, want it taken from the detected context", got.Org)
 	}
-	if len(got.Tags) != 1 || got.Tags[0] != "testing" {
-		t.Errorf("Tags = %v, want the caller's tags", got.Tags)
+	if len(got.Tags) != 1 || got.Tags[0] != "go" {
+		t.Errorf("Tags = %v, want the caller's recognized tags", got.Tags)
 	}
 	if got.Created.IsZero() {
 		t.Error("Created was not stamped")
@@ -39,45 +39,56 @@ func TestRecorder_StampsOrgFromContextNotInput(t *testing.T) {
 // The org gate is the whole point of the feature, so prove the caller — which
 // is ultimately the model — cannot reach it. Whatever the text claims and
 // whatever the tags smuggle, the saved org is the detected one.
-func TestRecorder_OrgIgnoresEverythingTheCallerSupplies(t *testing.T) {
+// The caller may ask to be scoped here, but may never name where "here" is.
+func TestRecorder_CallerCannotChooseWhichOrg(t *testing.T) {
 	tests := []struct {
-		name string
-		mc   Context
-		text string
-		tags []string
-		want string
+		name        string
+		mc          Context
+		text        string
+		tags        []string
+		thisOrgOnly bool
+		want        string
 	}{
 		{
-			name: "text naming another organization",
-			mc:   Context{Org: "acme"},
-			text: "org: globex. This applies to all Globex repositories.",
-			tags: nil,
-			want: "acme",
+			name:        "text naming another organization",
+			mc:          Context{Org: "acme"},
+			text:        "org: globex. This applies to all Globex repositories.",
+			thisOrgOnly: true,
+			want:        "acme",
 		},
 		{
-			name: "tags shaped like an org assignment",
-			mc:   Context{Org: "acme"},
-			text: "Prefers short commits.",
-			tags: []string{"org=globex", "org:globex"},
-			want: "acme",
+			name:        "tags shaped like an org assignment",
+			mc:          Context{Org: "acme"},
+			text:        "Prefers short commits.",
+			tags:        []string{"org=globex", "org:globex"},
+			thisOrgOnly: true,
+			want:        "acme",
 		},
 		{
-			name: "no detected org stays universal",
-			mc:   Context{},
-			text: "Belongs to globex, honestly.",
-			tags: []string{"globex"},
+			name: "scoping not requested stays universal",
+			mc:   Context{Org: "acme"},
+			text: "Prefers conventional commits.",
 			want: "",
+		},
+		{
+			name:        "scoping requested with no detected org stays universal",
+			mc:          Context{},
+			text:        "Belongs to globex, honestly.",
+			tags:        []string{"globex"},
+			thisOrgOnly: true,
+			want:        "",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			store := &capturingStore{}
-			if err := NewRecorder(store, tt.mc).Record(context.Background(), tt.text, tt.tags); err != nil {
-				t.Fatalf("Record() error = %v", err)
+			err := NewRecorder(store, tt.mc).RecordScoped(context.Background(), tt.text, tt.tags, tt.thisOrgOnly)
+			if err != nil {
+				t.Fatalf("RecordScoped() error = %v", err)
 			}
 			if got := store.saved[0].Org; got != tt.want {
-				t.Errorf("Org = %q, want %q: the caller must not be able to choose the org", got, tt.want)
+				t.Errorf("Org = %q, want %q: the caller must not be able to choose which org", got, tt.want)
 			}
 		})
 	}
@@ -86,21 +97,63 @@ func TestRecorder_OrgIgnoresEverythingTheCallerSupplies(t *testing.T) {
 // Tags arrive from the model, and matching is exact against a context whose
 // tags DetectContext has already lowercased. An un-normalized "Go" would write
 // a memory that can never match the detected "go" — saved, and silently inert.
-func TestRecorder_NormalizesTags(t *testing.T) {
+// Most preferences follow the user between projects, so an unscoped save must
+// stay unscoped — stamping the current org made universal preferences silently
+// stop applying the moment the user changed repositories.
+func TestRecorder_SavesUniversallyByDefault(t *testing.T) {
 	store := &capturingStore{}
-	if err := NewRecorder(store, Context{}).Record(context.Background(), "Prefers mise.", []string{"Go", "  Testing  ", "", "   "}); err != nil {
+	r := NewRecorder(store, Context{Org: "acme", Tags: []string{"go"}})
+	if err := r.Record(context.Background(), "Prefers conventional commits.", nil); err != nil {
+		t.Fatalf("Record() error = %v", err)
+	}
+	got := store.saved[0]
+	if got.Org != "" {
+		t.Errorf("Org = %q, want empty — an unscoped save must apply everywhere", got.Org)
+	}
+	if len(got.Tags) != 0 {
+		t.Errorf("Tags = %v, want none", got.Tags)
+	}
+}
+
+// Tags narrow by intersection with what DetectContext produces, so a tag it
+// can never produce matches nothing anywhere. Keeping one would turn an
+// approved memory into a stored, permanently inert file.
+func TestRecorder_DropsTagsThatCouldNeverMatch(t *testing.T) {
+	store := &capturingStore{}
+	r := NewRecorder(store, Context{})
+	if err := r.Record(context.Background(), "Prefers mise.", []string{"Go", "  commits  ", "testing", "", "node"}); err != nil {
 		t.Fatalf("Record() error = %v", err)
 	}
 	got := store.saved[0].Tags
-	if len(got) != 2 || got[0] != "go" || got[1] != "testing" {
-		t.Errorf("Tags = %v, want [go testing]: tags must be normalized the way the retriever expects", got)
+	if len(got) != 2 || got[0] != "go" || got[1] != "node" {
+		t.Errorf("Tags = %v, want [go node]: recognized tags normalized, invented ones dropped", got)
+	}
+}
+
+// Every tag the recorder keeps must be one the retriever can match.
+func TestRecorder_KeptTagsAreAllDetectable(t *testing.T) {
+	known := KnownTags()
+	if len(known) == 0 {
+		t.Fatal("KnownTags() is empty")
+	}
+	store := &capturingStore{}
+	if err := NewRecorder(store, Context{}).Record(context.Background(), "x.", append(known, "invented")); err != nil {
+		t.Fatal(err)
+	}
+	for _, tag := range store.saved[0].Tags {
+		if !isKnownTag(tag) {
+			t.Errorf("kept tag %q is not one DetectContext can produce", tag)
+		}
+	}
+	if len(store.saved[0].Tags) != len(known) {
+		t.Errorf("kept %d tags, want all %d known ones", len(store.saved[0].Tags), len(known))
 	}
 }
 
 func TestRecorder_NormalizesAHandWrittenContextOrg(t *testing.T) {
 	store := &capturingStore{}
-	if err := NewRecorder(store, Context{Org: " Acme "}).Record(context.Background(), "Prefers mise.", nil); err != nil {
-		t.Fatalf("Record() error = %v", err)
+	if err := NewRecorder(store, Context{Org: " Acme "}).RecordScoped(context.Background(), "Prefers mise.", nil, true); err != nil {
+		t.Fatalf("RecordScoped() error = %v", err)
 	}
 	if got := store.saved[0].Org; got != "acme" {
 		t.Errorf("Org = %q, want acme: an org that doesn't match the detected form gates nothing", got)
@@ -170,8 +223,8 @@ func TestRecorder_IDAlwaysSatisfiesTheStoresRules(t *testing.T) {
 // produce something FileStore.Save accepts and Load can read back.
 func TestRecorder_SavesThroughFileStore(t *testing.T) {
 	store := NewFileStore(t.TempDir())
-	if err := NewRecorder(store, Context{Org: "acme"}).Record(context.Background(), "Prefers Table-Driven Tests!", []string{"Go"}); err != nil {
-		t.Fatalf("Record() error = %v", err)
+	if err := NewRecorder(store, Context{Org: "acme"}).RecordScoped(context.Background(), "Prefers Table-Driven Tests!", []string{"Go"}, true); err != nil {
+		t.Fatalf("RecordScoped() error = %v", err)
 	}
 
 	res, err := store.Load(context.Background())

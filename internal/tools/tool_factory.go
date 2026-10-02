@@ -18,7 +18,7 @@ type ToolCreator interface {
 // MemoryRecorder saves a memory on the user's behalf. Narrow on purpose: the
 // tool layer has no business reading memories or choosing their scope.
 type MemoryRecorder interface {
-	Record(ctx context.Context, text string, tags []string) error
+	RecordScoped(ctx context.Context, text string, tags []string, thisOrgOnly bool) error
 }
 
 type ToolFactory struct {
@@ -42,8 +42,14 @@ type ShellCommandInput struct {
 // the detected context; a model that could set it could also set it wrongly,
 // and the failure would be silent.
 type RememberInput struct {
-	Text string   `json:"text" jsonschema:"required,description=The fact or preference to remember, as one self-contained sentence of plain prose"`
-	Tags []string `json:"tags" jsonschema:"description=Optional topical tags such as go or testing; omit if the memory applies to all work"`
+	Text string `json:"text" jsonschema:"required,description=The fact or preference to remember, as one self-contained sentence of plain prose"`
+	// The tag vocabulary is fixed because tags narrow a memory by matching
+	// what is detected in a directory. A tag outside it matches nothing
+	// anywhere, so an invented one would be silently discarded.
+	Tags []string `json:"tags" jsonschema:"description=Optional. Limits the memory to certain stacks. Only these values are meaningful: go, node, rust, python. Omit entirely for a preference that applies to all work - this is usually correct"`
+	// A boolean rather than an org name: the model can say "here" but can
+	// never name a different organization.
+	ThisOrgOnly bool `json:"this_org_only" jsonschema:"description=Optional. Set true only when the fact is specific to the current client or employer rather than to the user generally. Defaults to false - most preferences follow the user everywhere"`
 }
 
 func (f *ToolFactory) DefaultInvokableToolset() []tool.InvokableTool {
@@ -75,7 +81,7 @@ func (f *ToolFactory) DefaultInvokableToolset() []tool.InvokableTool {
 			"remember",
 			"Saves a durable fact or preference about the user to their personal profile, which persists across projects and sessions. Use for how the user wants work done, not for facts about the current codebase.",
 			func(ctx context.Context, in RememberInput) (string, error) {
-				if err := f.recorder.Record(ctx, in.Text, in.Tags); err != nil {
+				if err := f.recorder.RecordScoped(ctx, in.Text, in.Tags, in.ThisOrgOnly); err != nil {
 					return "", err
 				}
 				return "Saved.", nil

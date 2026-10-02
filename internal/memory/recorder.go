@@ -7,11 +7,11 @@ import (
 	"time"
 )
 
-// Recorder saves new memories. It exists so the tool layer never chooses the
-// org: the model supplies only the text and topical tags, and the org comes
-// from the detected context. A model able to set org freely could also set it
-// wrongly, and the failure mode is one organization's conventions leaking into
-// another's work.
+// Recorder saves new memories. It exists so the tool layer never names an
+// organization: a caller supplies text, tags, and at most a request to limit
+// the memory to wherever it is being saved — never which organization that is.
+// A caller that could name one could name the wrong one, and the failure mode
+// is one client's conventions reaching another's work.
 type Recorder struct {
 	store Store
 	mc    Context
@@ -22,7 +22,25 @@ func NewRecorder(store Store, mc Context) *Recorder {
 	return &Recorder{store: store, mc: mc, now: time.Now}
 }
 
+// Record saves a memory that applies everywhere.
 func (r *Recorder) Record(ctx context.Context, text string, tags []string) error {
+	return r.RecordScoped(ctx, text, tags, false)
+}
+
+// RecordScoped saves a memory, optionally limiting it to the organization
+// detected for the current directory.
+//
+// thisOrgOnly is a boolean rather than an org name on purpose. A caller that
+// could name an organization could name the wrong one, and the failure mode is
+// one client's conventions reaching another's work. Choosing between "here"
+// and "everywhere" cannot reference an organization other than the detected
+// one, so it carries none of that risk.
+//
+// Universal is the default because most preferences are: how someone wants
+// commits written or tests structured does not usually stop being true when
+// they change repositories. Scoping everything to wherever it happened to be
+// saved made genuinely universal preferences silently stop applying.
+func (r *Recorder) RecordScoped(ctx context.Context, text string, tags []string, thisOrgOnly bool) error {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		// FileStore.Save rejects this too; saying so here names the actual
@@ -34,15 +52,22 @@ func (r *Recorder) Record(ctx context.Context, text string, tags []string) error
 		return err
 	}
 
+	org := ""
+	if thisOrgOnly {
+		org = normalizeTag(r.mc.Org)
+	}
+
 	return r.store.Save(ctx, Memory{
 		ID:   id,
 		Text: text,
-		// Normalized at both ends, like everything compared against a detected
-		// context: tags come straight from the model, so a supplied "Go" would
-		// otherwise be saved as a memory that can never match the detected
-		// "go" — stored successfully and permanently inert.
-		Org:     normalizeTag(r.mc.Org),
-		Tags:    normalizeTags(tags),
+		Org:  org,
+		// Only tags DetectContext can actually produce survive. Tags narrow by
+		// intersection with the detected context, so an unrecognized one —
+		// "commits", "testing", anything topical the model invents — matches
+		// nothing anywhere and turns an approved memory into a stored, inert
+		// file. Dropping it makes the memory broader than asked instead of
+		// useless, which is at least observable.
+		Tags:    knownTagsOnly(tags),
 		Created: r.now(),
 	})
 }
@@ -141,4 +166,15 @@ func truncateSlug(slug string) string {
 		return cut[:i]
 	}
 	return cut
+}
+
+// knownTagsOnly keeps the tags DetectContext can produce and discards the rest.
+func knownTagsOnly(tags []string) []string {
+	var kept []string
+	for _, t := range normalizeTags(tags) {
+		if isKnownTag(t) {
+			kept = append(kept, t)
+		}
+	}
+	return kept
 }
