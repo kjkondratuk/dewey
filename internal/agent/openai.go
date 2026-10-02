@@ -254,7 +254,7 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 				// a command that's already on screen.
 				confirmed := false
 				classification := a.classify(ctx, tc.Function.Name, tc.Function.Arguments)
-				if classification.Risk != safety.Safe {
+				if classification.RequiresApproval() {
 					allowed, cancelled := a.awaitConfirmation(ctx, ch, tc.Function.Name, classification, tc.Function.Arguments)
 					if cancelled {
 						a.history = a.history[:truncateLen]

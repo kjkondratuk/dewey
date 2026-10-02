@@ -45,9 +45,10 @@ func ParseRiskTier(s string) (RiskTier, error) {
 
 // Classification is the result of evaluating a single tool call.
 type Classification struct {
-	// Kind is "read" or "write" — informational only, it does not affect
-	// confirmation gating. Empty when the classification came from a config
-	// override rather than the classifier.
+	// Kind is "read" or "write". A write always requires confirmation
+	// regardless of risk tier — see RequiresApproval. Empty when the
+	// classification came from a config override rather than the classifier,
+	// in which case the tier alone decides.
 	Kind string
 	Risk RiskTier
 
@@ -57,6 +58,19 @@ type Classification struct {
 	// best-effort: empty when the classification came from a config
 	// override, from the fail-safe path, or when the model omitted it.
 	Summary string
+}
+
+// RequiresApproval reports whether this call must be confirmed by the user
+// before it runs.
+//
+// Either signal is sufficient. Gating on the tier alone was the original
+// implementation and it was wrong: a classifier that correctly identified a
+// file-creating command as a write but rated it "safe" — which is exactly what
+// a local model does for `echo hello > f.txt` — let it run with no prompt at
+// all. "Writes are confirmed" is the actual requirement; the tier only decides
+// how alarming the prompt should look.
+func (c Classification) RequiresApproval() bool {
+	return c.Kind == "write" || c.Risk != Safe
 }
 
 // RiskOverrides pins specific tool names to a fixed RiskTier, bypassing the

@@ -22,6 +22,11 @@ type Classifier interface {
 // classifierSystemPrompt lives in prompts/classifier.md.
 var classifierSystemPrompt = prompts.Classifier
 
+// shellToolName is the tool the deterministic floor understands. The floor is
+// shell-specific by nature, so it is applied by name rather than pretending to
+// be generic.
+const shellToolName = "run_shell_command"
+
 // failSafeClassification is returned whenever classification cannot be
 // trusted — a model error, a malformed response, or an unrecognized field
 // value. It must never be downgraded.
@@ -58,7 +63,27 @@ func (c *llmClassifier) Classify(ctx context.Context, toolName, toolDesc, argsJS
 	if err != nil {
 		return failSafeClassification, err
 	}
-	return classification, nil
+	return raiseToFloor(classification, toolName, argsJSON), nil
+}
+
+// raiseToFloor applies a deterministic minimum to a model-produced
+// classification. The floor can only increase what gets confirmed: the model
+// may escalate beyond it, never relax below it, because a language model
+// reasoning about consequences is not a sound basis for the only gate in front
+// of a tool that can run arbitrary commands.
+func raiseToFloor(c Classification, toolName, argsJSON string) Classification {
+	if toolName != shellToolName {
+		return c
+	}
+
+	floor := ShellFloor(argsJSON)
+	if floor.Kind == "write" {
+		c.Kind = "write"
+	}
+	if floor.Risk > c.Risk {
+		c.Risk = floor.Risk
+	}
+	return c
 }
 
 func parseClassification(raw string) (Classification, error) {

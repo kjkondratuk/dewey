@@ -911,3 +911,60 @@ func (p *fakeNoticeProvider) System(ctx context.Context) (*schema.Message, error
 	return &schema.Message{Role: schema.System, Content: "RULES"}, nil
 }
 func (p *fakeNoticeProvider) Notices() []string { return p.notices }
+
+// The reported bug, at the layer it actually bit: the classifier correctly
+// identified a file-creating command as a write but rated it "safe", and the
+// gate -- which only looked at the tier -- ran it with no prompt.
+func TestRun_WriteRatedSafeStillAsksFirst(t *testing.T) {
+	invoked := 0
+	tl := newRecordingTool(t, &invoked)
+	m := &fakeStreamModel{responses: [][]*schema.Message{
+		toolCallResponse("do_thing", `{"x":"1"}`),
+		finalResponse("done"),
+	}}
+	// Exactly what gemma returns for `echo hello > smoke-test.txt`.
+	writeRatedSafe := &fakeClassifier{result: safety.Classification{Kind: "write", Risk: safety.Safe}}
+
+	agt := New(m, []tool.InvokableTool{tl}, writeRatedSafe, nil, 0, nil)
+	ch, err := agt.Run(context.Background(), "go")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	sawConfirm := false
+	drain(t, ch, func(Event) bool {
+		sawConfirm = true
+		return false // deny
+	})
+
+	if !sawConfirm {
+		t.Error("no confirm event for a write rated safe — it would have run silently")
+	}
+	if invoked != 0 {
+		t.Errorf("tool invoked %d times after denial, want 0", invoked)
+	}
+}
+
+// Reads must stay fast: a confirmation on every `ls` would make the gate
+// useless by training the user to approve reflexively.
+func TestRun_ReadRatedSafeStillRunsWithoutAsking(t *testing.T) {
+	invoked := 0
+	tl := newRecordingTool(t, &invoked)
+	m := &fakeStreamModel{responses: [][]*schema.Message{
+		toolCallResponse("do_thing", `{"x":"1"}`),
+		finalResponse("done"),
+	}}
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Kind: "read", Risk: safety.Safe}}, nil, 0, nil)
+
+	ch, _ := agt.Run(context.Background(), "go")
+	events := drain(t, ch, func(Event) bool { return true })
+
+	for _, e := range events {
+		if e.Kind == "confirm" {
+			t.Fatal("confirm event for a read rated safe")
+		}
+	}
+	if invoked != 1 {
+		t.Errorf("tool invoked %d times, want 1", invoked)
+	}
+}

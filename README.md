@@ -283,13 +283,31 @@ via `sh -c` and returns combined stdout/stderr plus the exit code — and one fo
 remembering things. There is no sandbox. The protection is that you approve
 anything risky.
 
-Before each tool call runs, the `simple` model classifies it:
+Before each tool call runs, the `simple` model classifies it along two axes —
+whether it **writes**, and how risky it is:
 
-| Tier | Meaning | Behavior |
-|---|---|---|
-| `safe` | Read-only or inconsequential | Runs immediately |
-| `moderate` | Reversible write, limited blast radius | Asks first |
-| `dangerous` | Irreversible, destructive, or wide blast radius | Asks first |
+| Classification | Behavior |
+|---|---|
+| `read` + `safe` | Runs immediately |
+| anything `write` | **Asks first, at any risk tier** |
+| `moderate` or `dangerous`, even if `read` | Asks first |
+
+Both signals gate independently. A write rated `safe` still prompts — local
+models routinely rate `echo hello > f.txt` as safe, and "writes get confirmed"
+is the actual rule rather than a tier threshold.
+
+Shell commands additionally get a **deterministic floor** before the model's
+answer is used. Output redirection and a list of known-mutating programs (`rm`,
+`mv`, `git`, `npm`, `chmod`, `sudo`, …) are recognized structurally and force a
+`write`/`moderate` minimum. The classifier can raise this but never lower it,
+so the only gate in front of an arbitrary-command tool does not rest solely on
+a language model's judgement.
+
+The floor is a floor, not a parser: it doesn't expand variables, follow
+aliases, or read invoked scripts, and anything it misses still goes to the
+classifier. It over-prompts in places — `git status` is treated as a write
+because telling it apart from `git reset --hard` needs real subcommand parsing
+— which is the right direction to err.
 
 A prompt looks like this:
 
