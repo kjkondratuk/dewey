@@ -1,7 +1,7 @@
 # dewey
 
 A personal terminal agent harness. dewey talks to any OpenAI-compatible model
-server — a local LM Studio or BionicGPT instance, or a hosted API — runs shell
+server — Bionic or LM Studio running locally, or a hosted API — runs shell
 commands on your behalf, asks before anything consequential, compacts the
 conversation when the context window fills, and remembers your preferences
 across projects.
@@ -12,8 +12,7 @@ It is a single Go binary with a TUI. No daemon, no database.
 
 - [Quick start](#quick-start)
 - [How the model is chosen](#how-the-model-is-chosen)
-- [LM Studio](#lm-studio)
-- [BionicGPT](#bionicgpt)
+- [Bionic / LM Studio](#bionic--lm-studio)
 - [Other providers](#other-providers)
 - [Configuration reference](#configuration-reference)
 - [Tool safety and approval](#tool-safety-and-approval)
@@ -34,12 +33,13 @@ cd dewey
 go run .
 ```
 
-With no config file at all, dewey assumes LM Studio on its default port:
+With no config file at all, dewey assumes Bionic (or LM Studio) on its default
+port:
 
 | Setting | Default |
 |---|---|
 | Base URL | `http://localhost:1234/v1` |
-| API key | `lm-studio` (LM Studio ignores the value) |
+| API key | `lm-studio` (the server ignores the value) |
 | Model | `gemma-4-31b-it-turboquant-mlx` |
 
 If your loaded model has a different id — it almost certainly does — set it in
@@ -118,16 +118,20 @@ models:
 ```
 
 `intermediate` takes the default base URL and key, and `simple` inherits both
-from it, so one LM Studio instance serving both models is all you need. Pointing
+from it, so one local server hosting both models is all you need. Pointing
 `intermediate` at a different server needs no change here either — `simple`
 follows it.
 
-## LM Studio
+## Bionic / LM Studio
 
-1. Install [LM Studio](https://lmstudio.ai) and download a model. **It must
-   support tool calling** — dewey is useless without it. LM Studio marks these
-   in the model list, and its API reports `"capabilities": ["tool_use"]`.
-2. Open the **Developer** tab and start the server. Default port is `1234`.
+This is the setup dewey defaults to, and the one it has actually been run
+against. Bionic is LM Studio's desktop app; the local server and its API are
+the same either way, so the steps below apply to both.
+
+1. Install [Bionic](https://lmstudio.ai) and download a model. **It must
+   support tool calling** — dewey is useless without it. The model list marks
+   these, and the API reports `"capabilities": ["tool_use"]`.
+2. Start the local server. Default port is `1234`.
 3. Load your model, and set its context length while you're there — dewey reads
    the loaded value to decide when to compact.
 4. Find the model id. It is the `id` field from:
@@ -148,13 +152,13 @@ follows it.
 
 6. `go run .`
 
-The default `api_key` of `lm-studio` is a placeholder. LM Studio does not check
-it, but the OpenAI client library requires something non-empty.
+The default `api_key` of `lm-studio` is a placeholder. The local server does not
+check it, but the OpenAI client library requires something non-empty.
 
 ### Context window auto-detection
 
-LM Studio also serves a **native** API alongside the OpenAI-compatible one, at
-`/api/v0/models`, which reports context sizes the OpenAI spec has no field for:
+Alongside the OpenAI-compatible API, the server exposes a **native** one at
+`/api/v0/models` reporting context sizes the OpenAI spec has no field for:
 
 ```bash
 curl -s http://localhost:1234/api/v0/models
@@ -175,36 +179,7 @@ dewey queries this at startup (2-second timeout) and prefers
 supports is common. Failure is silent and expected on any other provider — it
 is a convenience, not a requirement.
 
-## BionicGPT
-
-[BionicGPT](https://bionic-gpt.com) exposes an OpenAI-compatible API, so it
-works the same way — only the port, the key, and the model naming differ.
-
-```yaml
-# ~/.dewey/config.yaml
-models:
-  intermediate:
-    base_url: "http://localhost:7800/v1"
-    api_key: "your-bionicgpt-api-key"
-    model: "your-model-name"
-    context_window: 32768
-```
-
-Three differences from LM Studio:
-
-- **The API key is real.** BionicGPT issues keys per API endpoint in its UI and
-  rejects requests without a valid one. There is no placeholder to fall back on.
-- **Port 7800** by default rather than 1234, and the `/v1` suffix belongs on
-  the `base_url`.
-- **Set `context_window` yourself.** BionicGPT does not serve LM Studio's
-  native endpoint, so auto-detection won't fire and dewey falls back to
-  `context_window` — or to a conservative **8192** if you omit it, which will
-  compact far more often than necessary on a large-context model.
-
-Verify the port and model naming against your own instance before assuming the
-values above: BionicGPT is deployed via Docker with a configurable
-`PORT`/ingress, and the public documentation on its exact API surface is older
-than the project's current releases.
+Every other provider needs `context_window` set by hand; see below.
 
 ## Other providers
 
@@ -229,7 +204,7 @@ Two requirements, both non-negotiable:
 - **Streaming.** Replies are streamed; a server that only supports
   non-streaming completions will not work.
 
-Set `context_window` for any provider that isn't LM Studio.
+Set `context_window` for anything other than Bionic / LM Studio.
 
 ## Configuration reference
 
@@ -262,9 +237,9 @@ memory:
   max_tokens: 4000           # budget for the injected memory block
 ```
 
-`context_window` is a **fallback, not an override**: LM Studio discovery is
-always attempted first and wins when it succeeds, so on LM Studio this value is
-ignored. It is what gets used on every other provider, and omitting it there
+`context_window` is a **fallback, not an override**: native discovery is always
+attempted first and wins when it succeeds, so against Bionic / LM Studio this
+value is ignored. It is what gets used on every other provider, and omitting it there
 means a conservative 8192. It is only ever read for the `intermediate` tier —
 setting it on another tier parses and is silently ignored.
 
@@ -549,8 +524,9 @@ Design documents and implementation plans are under `docs/superpowers/`.
   local model's judgement.
 - **`hard` and `embedding` tiers do nothing.** They are parsed and resolved but
   never used.
-- **Context-window auto-detection is LM Studio-only.** Everything else needs
-  `context_window` set, or silently gets 8192.
+- **Context-window auto-detection only works against Bionic / LM Studio**,
+  which is the one server exposing the native endpoint that reports it.
+  Everything else needs `context_window` set, or silently gets 8192.
 - **One tool.** Everything goes through the shell.
 - **Tool output is not truncated.** A command's entire combined output goes
   into the conversation, so one `cat` of a large file can consume the context
