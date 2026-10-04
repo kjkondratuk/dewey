@@ -209,18 +209,18 @@ func TestShellFloor_IgnoresUnparseableArguments(t *testing.T) {
 func TestRaiseToFloor_OnlyRaises(t *testing.T) {
 	write := `{"command":"rm -rf dist"}`
 
-	got := testRules(t).raiseToFloor(Classification{Kind: "read", Risk: Safe}, "run_shell_command", write)
+	got := testRules(t).raiseToFloor(Classification{Kind: "read", Risk: Safe}, "Bash", write)
 	if got.Kind != "write" || got.Risk != Moderate {
 		t.Errorf("floor did not raise a read/safe write: %+v", got)
 	}
 
-	got = testRules(t).raiseToFloor(Classification{Kind: "write", Risk: Dangerous}, "run_shell_command", write)
+	got = testRules(t).raiseToFloor(Classification{Kind: "write", Risk: Dangerous}, "Bash", write)
 	if got.Risk != Dangerous {
 		t.Errorf("floor lowered the model's tier: %+v, want Dangerous preserved", got)
 	}
 
 	// A read the floor doesn't recognize is left exactly as the model rated it.
-	got = testRules(t).raiseToFloor(Classification{Kind: "read", Risk: Safe}, "run_shell_command", `{"command":"git status"}`)
+	got = testRules(t).raiseToFloor(Classification{Kind: "read", Risk: Safe}, "Bash", `{"command":"git status"}`)
 	if got.Kind != "read" || got.Risk != Safe {
 		t.Errorf("floor raised a read subcommand: %+v", got)
 	}

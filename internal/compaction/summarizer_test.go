@@ -80,7 +80,7 @@ func TestLLMSummarizer_TranscribesToolCallsAndResults(t *testing.T) {
 
 	history := []*schema.Message{
 		{Role: schema.Assistant, ToolCalls: []schema.ToolCall{{
-			Function: schema.FunctionCall{Name: "run_shell_command", Arguments: `{"command":"ls"}`},
+			Function: schema.FunctionCall{Name: "Bash", Arguments: `{"command":"ls"}`},
 		}}},
 		schema.ToolMessage("file1.txt\nfile2.txt", "call-1"),
 	}
@@ -90,7 +90,7 @@ func TestLLMSummarizer_TranscribesToolCallsAndResults(t *testing.T) {
 	}
 
 	transcript := fake.lastReq[1].Content
-	if !strings.Contains(transcript, "run_shell_command") {
+	if !strings.Contains(transcript, "Bash") {
 		t.Errorf("transcript missing tool call name: %q", transcript)
 	}
 	if !strings.Contains(transcript, "file1.txt") {
@@ -105,7 +105,7 @@ func TestLLMSummarizer_MixedHistoryOrdering(t *testing.T) {
 	history := []*schema.Message{
 		{Role: schema.User, Content: "please list files"},
 		{Role: schema.Assistant, ToolCalls: []schema.ToolCall{{
-			Function: schema.FunctionCall{Name: "run_shell_command", Arguments: `{"command":"ls"}`},
+			Function: schema.FunctionCall{Name: "Bash", Arguments: `{"command":"ls"}`},
 		}}},
 		schema.ToolMessage("file1.txt\nfile2.txt", "call-1"),
 		{Role: schema.Assistant, Content: "Here are the files."},
@@ -116,7 +116,7 @@ func TestLLMSummarizer_MixedHistoryOrdering(t *testing.T) {
 	}
 
 	transcript := fake.lastReq[1].Content
-	wantOrder := []string{"please list files", "run_shell_command", "file1.txt", "Here are the files."}
+	wantOrder := []string{"please list files", "Bash", "file1.txt", "Here are the files."}
 	lastIdx := -1
 	for _, want := range wantOrder {
 		idx := strings.Index(transcript, want)

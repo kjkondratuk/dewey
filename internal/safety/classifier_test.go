@@ -120,7 +120,7 @@ func TestLLMClassifier_ParsesAndTrimsSummary(t *testing.T) {
 		content: `{"kind":"write","risk":"dangerous","summary":"  Deletes the build output directory.  "}`,
 	}, testRules(t), "")
 
-	got, err := classifier.Classify(context.Background(), "run_shell_command", "runs a shell command", `{"command":"rm -rf ./dist"}`)
+	got, err := classifier.Classify(context.Background(), "Bash", "runs a shell command", `{"command":"rm -rf ./dist"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestLLMClassifier_ParsesAndTrimsSummary(t *testing.T) {
 func TestLLMClassifier_MissingSummaryIsNotFatal(t *testing.T) {
 	classifier := NewLLMClassifier(&fakeGenerateModel{content: `{"kind":"read","risk":"safe"}`}, testRules(t), "")
 
-	got, err := classifier.Classify(context.Background(), "run_shell_command", "runs a shell command", `{"command":"ls"}`)
+	got, err := classifier.Classify(context.Background(), "Bash", "runs a shell command", `{"command":"ls"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestLLMClassifier_MissingSummaryIsNotFatal(t *testing.T) {
 func TestLLMClassifier_EmptySummaryIsNotFatal(t *testing.T) {
 	classifier := NewLLMClassifier(&fakeGenerateModel{content: `{"kind":"write","risk":"moderate","summary":"   "}`}, testRules(t), "")
 
-	got, err := classifier.Classify(context.Background(), "run_shell_command", "runs a shell command", `{"command":"touch f"}`)
+	got, err := classifier.Classify(context.Background(), "Bash", "runs a shell command", `{"command":"touch f"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestLLMClassifier_BadKindStillFailsSafeDespiteSummary(t *testing.T) {
 		content: `{"kind":"maybe","risk":"safe","summary":"Lists files."}`,
 	}, testRules(t), "")
 
-	got, err := classifier.Classify(context.Background(), "run_shell_command", "runs a shell command", `{"command":"ls"}`)
+	got, err := classifier.Classify(context.Background(), "Bash", "runs a shell command", `{"command":"ls"}`)
 	if err == nil {
 		t.Fatal("expected an error for an unrecognized kind")
 	}

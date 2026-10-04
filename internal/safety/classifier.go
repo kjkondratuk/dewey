@@ -25,7 +25,7 @@ var classifierSystemPrompt = prompts.Classifier
 // shellToolName is the tool the deterministic floor understands. The floor is
 // shell-specific by nature, so it is applied by name rather than pretending to
 // be generic.
-const shellToolName = "run_shell_command"
+const shellToolName = "Bash"
 
 // failSafeClassification is returned whenever classification cannot be
 // trusted — a model error, a malformed response, or an unrecognized field

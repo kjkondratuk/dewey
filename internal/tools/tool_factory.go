@@ -2,9 +2,6 @@ package tools
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"os/exec"
 
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/components/tool/utils"
@@ -33,10 +30,6 @@ func NewToolFactory(recorder MemoryRecorder) *ToolFactory {
 	return &ToolFactory{recorder: recorder}
 }
 
-type ShellCommandInput struct {
-	Command string `json:"command" jsonschema:"required,description=The shell command to execute via sh -c"`
-}
-
 // RememberInput is deliberately missing an org field. The org is the gate that
 // keeps one client's conventions out of another's work, and it is stamped from
 // the detected context; a model that could set it could also set it wrongly,
@@ -53,28 +46,7 @@ type RememberInput struct {
 }
 
 func (f *ToolFactory) DefaultInvokableToolset() []tool.InvokableTool {
-	shellCommand, _ := utils.InferTool(
-		"run_shell_command",
-		"Executes a shell command via sh -c and returns its combined stdout+stderr output plus exit code. Use this for reading/writing files, listing directories, making network requests, or any other command-line operation.",
-		func(ctx context.Context, in ShellCommandInput) (string, error) {
-			cmd := exec.CommandContext(ctx, "sh", "-c", in.Command)
-			output, err := cmd.CombinedOutput()
-
-			var exitErr *exec.ExitError
-			if err != nil && !errors.As(err, &exitErr) {
-				return "", err
-			}
-
-			exitCode := 0
-			if exitErr != nil {
-				exitCode = exitErr.ExitCode()
-			}
-
-			return fmt.Sprintf("%s\nexit code: %d", output, exitCode), nil
-		},
-	)
-
-	toolset := []tool.InvokableTool{shellCommand}
+	toolset := []tool.InvokableTool{newBashTool()}
 
 	if f.recorder != nil {
 		remember, _ := utils.InferTool(

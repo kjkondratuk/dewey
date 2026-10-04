@@ -230,7 +230,7 @@ models:
 
 Two requirements, both non-negotiable:
 
-- **Tool calling.** dewey's only tool for doing work is `run_shell_command`. A
+- **Tool calling.** dewey's only tool for doing work is `Bash`. A
   model that cannot emit tool calls will talk about running commands without
   ever running one.
 - **Streaming.** Replies are streamed; a server that only supports
@@ -310,7 +310,7 @@ it ungated.
 
 ## Tool safety and approval
 
-dewey has one tool for doing work — `run_shell_command`, which runs a command
+dewey has one tool for doing work — `Bash`, which runs a command
 via `sh -c` and returns combined stdout/stderr plus the exit code — and one for
 remembering things. There is no sandbox. The protection is that you approve
 anything risky.
@@ -344,7 +344,7 @@ because telling it apart from `git reset --hard` needs real subcommand parsing
 A prompt looks like this:
 
 ```
-run_shell_command wants to run (WRITE) [risk: dangerous]
+Bash wants to run (WRITE) [risk: dangerous]
 
 Permanently deletes the project's build output folder and everything inside it.
 
@@ -597,7 +597,7 @@ Design documents and implementation plans are under `docs/superpowers/`.
 
 ## Current limitations
 
-- **No sandbox.** `run_shell_command` runs with your full user privileges.
+- **No sandbox.** `Bash` runs with your full user privileges.
   Approval prompts are the only guard, and the risk classification comes from a
   local model's judgement.
 - **`hard` and `embedding` tiers do nothing.** They are parsed and resolved but

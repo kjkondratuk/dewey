@@ -84,7 +84,7 @@ func TestGate_WritesAreConfirmedEvenWhenTheClassifierSaysSafe(t *testing.T) {
 		`{"command":"git commit -m x"}`,
 		`{"command":"npm install"}`,
 	} {
-		sawConfirm, invoked := runAndAnswer(t, "run_shell_command", command)
+		sawConfirm, invoked := runAndAnswer(t, "Bash", command)
 		if !sawConfirm {
 			t.Errorf("%s: no confirm event — a lying classifier bypassed the gate", command)
 		}
@@ -105,7 +105,7 @@ func TestGate_ReadsRunWithoutPrompting(t *testing.T) {
 		`{"command":"docker ps"}`,
 		`{"command":"go version"}`,
 	} {
-		sawConfirm, invoked := runAndAnswer(t, "run_shell_command", command)
+		sawConfirm, invoked := runAndAnswer(t, "Bash", command)
 		if sawConfirm {
 			t.Errorf("%s: prompted for a read", command)
 		}

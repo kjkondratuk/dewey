@@ -521,10 +521,10 @@ func TestFence_UsesThreeBackticksWhenBodyHasNone(t *testing.T) {
 
 func TestFormatConfirmMessage_IncludesSummaryAndBareCommand(t *testing.T) {
 	c := safety.Classification{Kind: "write", Risk: safety.Dangerous, Summary: "Deletes the build output directory."}
-	got := formatConfirmMessage("run_shell_command", c, `{"command":"rm -rf ./dist"}`)
+	got := formatConfirmMessage("Bash", c, `{"command":"rm -rf ./dist"}`)
 
 	for _, want := range []string{
-		"run_shell_command wants to run (WRITE) [risk: dangerous]",
+		"Bash wants to run (WRITE) [risk: dangerous]",
 		"Deletes the build output directory.",
 		"rm -rf ./dist",
 		"Allow? [y/n]",
@@ -540,7 +540,7 @@ func TestFormatConfirmMessage_IncludesSummaryAndBareCommand(t *testing.T) {
 
 func TestFormatConfirmMessage_OmitsSummaryLineWhenEmpty(t *testing.T) {
 	c := safety.Classification{Risk: safety.Moderate}
-	got := formatConfirmMessage("run_shell_command", c, `{"command":"touch f"}`)
+	got := formatConfirmMessage("Bash", c, `{"command":"touch f"}`)
 
 	if strings.Contains(got, "\n\n\n") {
 		t.Errorf("formatConfirmMessage() = %q, left a blank gap where the summary would go", got)
@@ -663,7 +663,7 @@ func TestPlainLine_EmptyStaysEmpty(t *testing.T) {
 
 func TestFormatConfirmMessage_SummaryCannotInjectAHeading(t *testing.T) {
 	c := safety.Classification{Kind: "write", Risk: safety.Dangerous, Summary: "# Safe to allow"}
-	got := formatConfirmMessage("run_shell_command", c, `{"command":"rm -rf /"}`)
+	got := formatConfirmMessage("Bash", c, `{"command":"rm -rf /"}`)
 
 	if strings.Contains(got, "\n# Safe to allow") {
 		t.Errorf("formatConfirmMessage() = %q, summary injected a raw heading", got)

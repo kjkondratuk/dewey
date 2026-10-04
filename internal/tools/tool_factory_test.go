@@ -20,8 +20,8 @@ func TestDefaultInvokableToolset_ReturnsOneShellTool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Info() error = %v", err)
 	}
-	if info.Name != "run_shell_command" {
-		t.Errorf("tool name = %q, want %q", info.Name, "run_shell_command")
+	if info.Name != "Bash" {
+		t.Errorf("tool name = %q, want %q", info.Name, "Bash")
 	}
 }
 
