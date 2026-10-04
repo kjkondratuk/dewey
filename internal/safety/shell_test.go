@@ -382,3 +382,28 @@ func quote(s string) string {
 	}
 	return string(b)
 }
+
+func TestAlwaysRead_RefusesAHomeDirectoryRoot(t *testing.T) {
+	// ProjectRoot stops its upward walk at a .dewey directory, and ~/.dewey
+	// exists for anyone who has ever saved a memory — so every non-git
+	// directory under home resolves the "project" to the whole home
+	// directory. Treating that as confinement would put ~/.ssh, ~/.aws and
+	// ~/.gnupg back on the no-prompt path, which is the hole confinement was
+	// added to close.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skipf("no home directory: %v", err)
+	}
+
+	var r ShellRules
+	// The home directory itself is guaranteed to exist, so EvalSymlinks
+	// resolves and the containment check genuinely reaches the guard.
+	args := `{"file_path":` + quote(home) + `}`
+
+	if r.AlwaysRead("Read", args, home) {
+		t.Error("AlwaysRead(root=$HOME) = true, want false — home is not a project")
+	}
+	if r.AlwaysRead("Read", args, filepath.Dir(home)) {
+		t.Error("AlwaysRead(root=parent of $HOME) = true, want false — an ancestor of home is not a project either")
+	}
+}

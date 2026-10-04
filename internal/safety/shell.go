@@ -134,9 +134,41 @@ func withinRoot(path, root string) bool {
 		return false
 	}
 
+	// A root broad enough to contain the home directory is not a project, and
+	// treating it as one would undo this whole function. ProjectRoot stops its
+	// upward walk at a .dewey directory, so a ~/.dewey — which exists for
+	// anyone who has saved a memory — makes every non-git directory under home
+	// resolve to $HOME itself. That would put ~/.ssh, ~/.aws and ~/.gnupg
+	// inside "the project" and back on the no-prompt path.
+	if isTooBroad(resolvedRoot) {
+		return false
+	}
+
 	rel, err := filepath.Rel(resolvedRoot, resolved)
 	if err != nil {
 		return false
+	}
+	return rel == "." || !strings.HasPrefix(rel, "..")
+}
+
+// isTooBroad reports whether root is the home directory or an ancestor of it.
+// Fails closed: a home directory that cannot be determined or resolved is
+// treated as broad, because the alternative is granting the fast path on the
+// strength of a path lookup that just failed.
+func isTooBroad(resolvedRoot string) bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return true
+	}
+	resolvedHome, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		return true
+	}
+
+	// root contains (or equals) home => root is at least as broad as home.
+	rel, err := filepath.Rel(resolvedRoot, resolvedHome)
+	if err != nil {
+		return true
 	}
 	return rel == "." || !strings.HasPrefix(rel, "..")
 }
