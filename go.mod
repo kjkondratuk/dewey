@@ -10,6 +10,7 @@ require (
 	github.com/cloudwego/eino v0.9.20
 	github.com/cloudwego/eino-ext/components/model/openai v0.1.13
 	github.com/pkoukk/tiktoken-go v0.1.8
+	github.com/yargevad/filepathx v1.0.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -59,7 +60,6 @@ require (
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/wk8/go-ordered-map/v2 v2.1.8 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
-	github.com/yargevad/filepathx v1.0.0 // indirect
 	github.com/yuin/goldmark v1.7.8 // indirect
 	github.com/yuin/goldmark-emoji v1.0.5 // indirect
 	golang.org/x/arch v0.11.0 // indirect

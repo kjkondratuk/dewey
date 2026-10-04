@@ -2,6 +2,8 @@ package safety
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -39,6 +41,10 @@ var wrapperPrograms = set("env", "command", "exec", "time", "nohup", "builtin")
 // It is a floor, not a parser and not a security boundary. It does not expand
 // variables, follow aliases, read scripts being invoked, or understand
 // `sh -c "$CMD"`. Anything it misses still goes to the classifier.
+//
+// Not the only entry point any more: AlwaysRead handles dewey's read-only
+// tools, which skip classification entirely rather than receiving a floor.
+// A tool in neither place is classified by the model alone.
 func (r ShellRules) ToolFloor(toolName, argsJSON string) Classification {
 	for _, name := range r.AlwaysWriteTools {
 		if name == toolName {
@@ -49,6 +55,185 @@ func (r ShellRules) ToolFloor(toolName, argsJSON string) Classification {
 		return Classification{}
 	}
 	return r.ShellFloor(argsJSON)
+}
+
+// readOnlyTools maps each of dewey's read-only tools to the argument keys that
+// together determine what it will actually touch. Order matters: the first key
+// is a directory or file, and any later key is joined onto it.
+//
+// Glob needs two. Its pattern is joined onto its path by the tool itself, and
+// filepath.Join cleans "..", so confining the path alone leaves the pattern
+// free to walk straight out of the project — which is precisely how the
+// confinement was first defeated.
+var readOnlyTools = map[string][]string{
+	"Read": {"file_path"},
+	"Grep": {"path"},
+	"Glob": {"path", "pattern"},
+}
+
+// AlwaysRead reports whether toolName is one of dewey's read-only tools
+// operating entirely inside root, in which case the classifier is skipped and
+// the call is treated as read/safe.
+//
+// Confinement is the whole basis for lowering a classification here. "Cannot
+// write" is not the same as "cannot harm": an unconfined reader can lift a
+// private key or an API token into the model's context, which is exactly the
+// safe-kind/high-risk case RequiresApproval exists to catch. Inside the
+// project the user is already working on, a read is genuinely unremarkable.
+// Outside it, this returns false and the call goes to the classifier like any
+// other — the read still happens, it just has to be approved.
+//
+// Fails closed on anything it cannot establish: unknown tool, unreadable
+// path, unresolvable root, malformed arguments.
+//
+// One limit worth stating, because the gate rests on it: this inspects
+// arguments, not the filesystem, so it cannot see a symlink nested inside an
+// otherwise-confined root. Grep walks a tree and would read whatever such a
+// link points at, so the fast path for Grep is sound only because its
+// implementation refuses to follow symlinks — pinned by
+// TestGrepWithGo_DoesNotFollowSymlinksOutOfRoot in internal/tools. Teaching a
+// read-only tool to follow links means fixing this function first.
+func (r ShellRules) AlwaysRead(toolName, argsJSON, root string) bool {
+	if toolName == "" || toolName == shellToolName || root == "" {
+		return false
+	}
+	// An explicit always-write pin outranks the fast path, so a user can
+	// force a prompt on a tool dewey considers read-only.
+	for _, name := range r.AlwaysWriteTools {
+		if name == toolName {
+			return false
+		}
+	}
+
+	keys, ok := readOnlyTools[toolName]
+	if !ok {
+		return false
+	}
+
+	var args map[string]any
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return false
+	}
+
+	// The first key names a real directory or file, so it is resolved through
+	// symlinks and confined. Grep and Glob default it to the working
+	// directory, matching the tools' own behavior.
+	base, _ := args[keys[0]].(string)
+	if base == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return false
+		}
+		base = cwd
+	}
+	if !withinRoot(base, root) {
+		return false
+	}
+
+	// Any remaining key is a pattern joined onto that base. It cannot be
+	// resolved through symlinks because it does not name an existing path, so
+	// it is checked lexically on the cleaned join — which is exactly the
+	// operation the tool will perform.
+	resolvedBase, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		return false
+	}
+	target := resolvedBase
+	for _, k := range keys[1:] {
+		v, _ := args[k].(string)
+		if v == "" {
+			continue
+		}
+		target = filepath.Join(target, v)
+	}
+	if target == resolvedBase {
+		return true
+	}
+	return withinRootLexical(target, root)
+}
+
+// withinRoot reports whether path resolves inside root. Both sides go through
+// EvalSymlinks first: without it a link inside the project pointing at
+// ~/.ssh would inherit the fast path, making the confinement decorative. It
+// also makes macOS's /tmp -> /private/tmp agree with itself.
+func withinRoot(path, root string) bool {
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return false
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return false
+	}
+
+	// A root broad enough to contain the home directory is not a project, and
+	// treating it as one would undo this whole function. ProjectRoot stops its
+	// upward walk at a .dewey directory, so a ~/.dewey — which exists for
+	// anyone who has saved a memory — makes every non-git directory under home
+	// resolve to $HOME itself. That would put ~/.ssh, ~/.aws and ~/.gnupg
+	// inside "the project" and back on the no-prompt path.
+	if isTooBroad(resolvedRoot) {
+		return false
+	}
+
+	rel, err := filepath.Rel(resolvedRoot, resolved)
+	if err != nil {
+		return false
+	}
+	return rel == "." || !strings.HasPrefix(rel, "..")
+}
+
+// withinRootLexical reports whether a cleaned path lies inside root without
+// requiring it to exist. A glob pattern names no real file, so EvalSymlinks
+// cannot be used on it — but filepath.Join has already applied the same
+// cleaning the tool will apply, so comparing the cleaned result is checking
+// the operation that will actually happen.
+//
+// Only safe because the base directory it was joined onto was resolved and
+// confined first; on its own it would be fooled by a symlinked base.
+func withinRootLexical(path, root string) bool {
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return false
+	}
+	if isTooBroad(resolvedRoot) {
+		return false
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(resolvedRoot, filepath.Clean(abs))
+	if err != nil {
+		return false
+	}
+	return rel == "." || !strings.HasPrefix(rel, "..")
+}
+
+// isTooBroad reports whether root is the home directory or an ancestor of it.
+// Fails closed: a home directory that cannot be determined or resolved is
+// treated as broad, because the alternative is granting the fast path on the
+// strength of a path lookup that just failed.
+func isTooBroad(resolvedRoot string) bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return true
+	}
+	resolvedHome, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		return true
+	}
+
+	// root contains (or equals) home => root is at least as broad as home.
+	rel, err := filepath.Rel(resolvedRoot, resolvedHome)
+	if err != nil {
+		return true
+	}
+	return rel == "." || !strings.HasPrefix(rel, "..")
 }
 
 // ShellFloor returns the minimum classification for a shell command.

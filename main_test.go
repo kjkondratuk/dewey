@@ -7,6 +7,7 @@ import (
 
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/kjkondratuk/dewey/internal/config"
+	"github.com/kjkondratuk/dewey/internal/files"
 	tools2 "github.com/kjkondratuk/dewey/internal/tools"
 )
 
@@ -47,7 +48,7 @@ func TestBuildMemory_DisabledOmitsRememberTool(t *testing.T) {
 		t.Errorf("provider = %#v, want nil when memory is disabled", provider)
 	}
 
-	names := toolNames(t, tools2.NewToolFactory(recorder).DefaultInvokableToolset())
+	names := toolNames(t, tools2.NewToolFactory(recorder, files.NewTracker()).DefaultInvokableToolset())
 	if hasTool(names, "remember") {
 		t.Errorf("toolset = %v, want no remember tool with memory disabled", names)
 	}
@@ -76,7 +77,7 @@ func TestBuildMemory_EnabledRegistersRememberTool(t *testing.T) {
 		t.Fatal("systemPrompt = nil, want the memory-backed prompt")
 	}
 
-	names := toolNames(t, tools2.NewToolFactory(recorder).DefaultInvokableToolset())
+	names := toolNames(t, tools2.NewToolFactory(recorder, files.NewTracker()).DefaultInvokableToolset())
 	if !hasTool(names, "remember") {
 		t.Errorf("toolset = %v, want a remember tool with memory enabled", names)
 	}

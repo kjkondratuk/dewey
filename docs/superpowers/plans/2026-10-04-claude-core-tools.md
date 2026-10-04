@@ -8,6 +8,19 @@
 
 **Tech Stack:** Go 1.26, eino (`utils.InferTool` for schema inference), `github.com/yargevad/filepathx` (already an indirect dependency; provides `**` glob support), ripgrep when present on `PATH`.
 
+**Two verified eino schema constraints.** Both were measured against
+eino v0.9.20 with `utils.InferTool`, not assumed:
+
+1. **A field is optional only if its `json` tag carries `,omitempty`.**
+   `jsonschema:"required"` does not control this — without `omitempty` a field
+   lands in the schema's `required` list even if it is a pointer. Every
+   optional parameter below therefore uses `json:"name,omitempty"`.
+2. **A comma inside `jsonschema:"description=..."` truncates the description
+   at that comma.** `description=One of content, files_with_matches, or count`
+   reaches the model as `"One of content"`. Descriptions below are written
+   comma-free. This does not apply to a tool's own description string, which
+   is a plain argument rather than a struct tag.
+
 **Reading the code blocks:** Each block shows a complete new file, or the
 region of an existing file that changes. Where a block is appended to an
 existing file, its import block is the existing one — steps say explicitly
@@ -505,6 +518,67 @@ git commit -m "feat(safety): add an always-read floor for tools that cannot writ
 
 ---
 
+### Task 2b: Correct the always-read floor after review
+
+Task 2 shipped as `bc194dc` and an adversarial review found two defects in its
+**design** — the implementation matched the spec exactly; the spec was wrong.
+Recorded here rather than rewritten into Task 2, because the history of why
+the rule is shaped this way is the useful part.
+
+**Defect 1 — the early return discarded the risk axis.** `RequiresApproval()`
+is `Kind == "write" || Risk != Safe`. Only `Kind: "read"` was needed to stop
+prompting on a directory listing; pinning `Risk: Safe` as well removed the
+only gate on a *high-risk read*. With `Read` validating nothing but
+`filepath.IsAbs`, that makes `Read{file_path: "~/.ssh/id_rsa"}` and
+`Grep{pattern: "AKIA[0-9A-Z]{16}", path: "/Users/u"}` silent. Reading a secret
+into a model's context is harm, so the comment calling these tools
+"structurally incapable of harm" was false.
+
+**Defect 2 — `always_read_tools` was a user-writable yaml key.** It was added
+for symmetry with `always_write_tools`, with a comment claiming a mistaken
+config "cannot turn it into a hole." Nothing enforced that. Adding `Task` to
+the list would give a subagent-spawning tool a total classifier bypass.
+
+The fix makes the structural claim actually structural: the list becomes a
+package constant describing dewey's own code, and the fast path applies only
+to reads **inside the project root**. A read outside it still works — it just
+goes to the classifier and can require approval, which is the behavior `Bash`
+already has for `cat`.
+
+**Files:**
+- Modify: `internal/safety/rules.go` (drop the yaml field), `internal/safety/shell.go` (constant list + confinement), `internal/safety/classifier.go` (carry the root), `internal/safety/default_rules.yaml` (drop the key), `main.go` (pass the root)
+- Test: `internal/safety/shell_test.go`, `internal/safety/classifier_test.go`, `internal/safety/rules_test.go`
+
+**New API shape.** `AlwaysRead` gains the two arguments it needs to answer the
+question honestly:
+
+```go
+func (r ShellRules) AlwaysRead(toolName, argsJSON, root string) bool
+```
+
+and `NewLLMClassifier` carries the root so `Classify` can pass it:
+
+```go
+func NewLLMClassifier(m model.BaseChatModel, rules ShellRules, projectRoot string) Classifier
+```
+
+The exported `Classifier` interface is unchanged, so `internal/agent` is
+untouched.
+
+**Containment uses `filepath.Rel` plus symlink resolution, and fails closed.**
+A symlink inside the repo pointing at `~/.ssh` must not inherit the fast path,
+so both sides are resolved with `EvalSymlinks` before comparison. That also
+makes macOS's `/tmp` → `/private/tmp` work, which matters because `t.TempDir()`
+returns a path under it. A path that cannot be resolved — including one that
+does not exist — returns false and goes to the classifier.
+
+**Risk/behavior note for the implementer:** every read inside the project root
+behaves exactly as Task 2 shipped it (no model call, no prompt). The only
+change in behavior is for paths outside the root, which now get classified
+instead of being waved through.
+
+---
+
 ### Task 3: Rename the shell tool to Bash
 
 **Files:**
@@ -806,8 +880,8 @@ const defaultReadLimit = 2000
 
 type ReadInput struct {
 	FilePath string `json:"file_path" jsonschema:"required,description=Absolute path to the file to read"`
-	Offset   int    `json:"offset" jsonschema:"description=Optional. 1-indexed line number to start from. Omit to start at the beginning"`
-	Limit    int    `json:"limit" jsonschema:"description=Optional. Maximum number of lines to return. Omit for 2000"`
+	Offset   int    `json:"offset,omitempty" jsonschema:"description=Optional. 1-indexed line number to start from. Omit to start at the beginning"`
+	Limit    int    `json:"limit,omitempty" jsonschema:"description=Optional. Maximum number of lines to return. Omit for 2000"`
 }
 
 // readFile is the tool body, separated from registration so it can be tested
@@ -1132,7 +1206,7 @@ type EditInput struct {
 	FilePath   string `json:"file_path" jsonschema:"required,description=Absolute path to the file to edit"`
 	OldString  string `json:"old_string" jsonschema:"required,description=The exact text to replace. Must appear exactly once unless replace_all is true"`
 	NewString  string `json:"new_string" jsonschema:"required,description=The text to replace it with. Must differ from old_string"`
-	ReplaceAll bool   `json:"replace_all" jsonschema:"description=Optional. Replace every occurrence instead of requiring exactly one"`
+	ReplaceAll bool   `json:"replace_all,omitempty" jsonschema:"description=Optional. Replace every occurrence instead of requiring exactly one"`
 }
 
 // persist writes content to path and re-records the read, so a following
@@ -1368,7 +1442,7 @@ const maxSearchResults = 200
 
 type GlobInput struct {
 	Pattern string `json:"pattern" jsonschema:"required,description=Glob pattern such as **/*.go or src/**/*.ts"`
-	Path     string `json:"path" jsonschema:"description=Optional. Absolute directory to search in. Defaults to the working directory"`
+	Path    string `json:"path,omitempty" jsonschema:"description=Optional. Absolute directory to search in. Defaults to the working directory"`
 }
 
 func searchRoot(path string) (string, error) {
@@ -1581,11 +1655,11 @@ Append to `internal/tools/search.go` (and add `"bufio"`, `"os/exec"`, `"regexp"`
 ```go
 type GrepInput struct {
 	Pattern     string `json:"pattern" jsonschema:"required,description=Regular expression to search for"`
-	Path        string `json:"path" jsonschema:"description=Optional. Absolute directory to search in. Defaults to the working directory"`
-	Glob        string `json:"glob" jsonschema:"description=Optional. Restrict the search to files matching this glob, such as *.go"`
-	OutputMode  string `json:"output_mode" jsonschema:"description=One of content, files_with_matches, or count. Defaults to files_with_matches"`
-	IgnoreCase  bool   `json:"-i" jsonschema:"description=Optional. Case-insensitive search"`
-	LineNumbers bool   `json:"-n" jsonschema:"description=Optional. Include line numbers in content output"`
+	Path        string `json:"path,omitempty" jsonschema:"description=Optional. Absolute directory to search in. Defaults to the working directory"`
+	Glob        string `json:"glob,omitempty" jsonschema:"description=Optional. Restrict the search to files matching this glob - for example *.go"`
+	OutputMode  string `json:"output_mode,omitempty" jsonschema:"description=One of content or files_with_matches or count. Defaults to files_with_matches"`
+	IgnoreCase  bool   `json:"-i,omitempty" jsonschema:"description=Optional. Case-insensitive search"`
+	LineNumbers bool   `json:"-n,omitempty" jsonschema:"description=Optional. Include line numbers in content output"`
 }
 
 func (in GrepInput) mode() string {
@@ -1753,43 +1827,53 @@ func newGrepTool() tool.InvokableTool {
 
 Add `"errors"` to the import block for the `exec.ExitError` check.
 
-**Contingency on the `-i` and `-n` field names.** These match Claude's
-parameter names so a model trained on them emits the right JSON, but they are
-unusual Go struct tags. Only the exact tag `-` means "skip this field", so
-`json:"-i"` is legal — however `utils.InferTool` runs the struct through
-schema inference, and a leading hyphen in a property name has not been
-verified against that path.
-
-Assert it directly rather than assuming — add this test, confirm it passes,
-and keep it (it needs `"encoding/json"` in the import block):
+**The `-i` and `-n` field names are verified.** They match Claude's parameter
+names so a model trained on them emits the right JSON, and they are unusual Go
+struct tags — only the exact tag `-` means "skip this field", so `json:"-i"` is
+legal. This was measured against eino v0.9.20 rather than assumed; inference
+emits them as proper property names. Keep this test so a dependency bump cannot
+break it silently:
 
 ```go
-func TestGrep_SchemaCarriesClaudeFlagNames(t *testing.T) {
+func TestGrep_SchemaKeepsClaudeFlagNamesAndOptionalFields(t *testing.T) {
 	info, err := newGrepTool().Info(context.Background())
 	if err != nil {
 		t.Fatalf("Info() error = %v", err)
 	}
-	if info.ParamsOneOf == nil {
-		t.Fatal("ParamsOneOf = nil, want an inferred schema")
-	}
-	// The assertion that matters is that inference did not drop or mangle the
-	// hyphenated names; marshalling the schema is the cheapest way to see it.
-	raw, err := json.Marshal(info.ParamsOneOf)
+
+	// Marshal the ToolInfo, not info.ParamsOneOf — ParamsOneOf's fields are
+	// unexported, so marshalling it directly yields "{}" and any assertion
+	// against it passes vacuously. ToolInfo has the custom marshaller.
+	raw, err := json.Marshal(info)
 	if err != nil {
 		t.Fatalf("Marshal() error = %v", err)
 	}
-	for _, want := range []string{"-i", "-n"} {
-		if !strings.Contains(string(raw), want) {
-			t.Errorf("schema = %s, want it to carry the %q parameter", raw, want)
+	var parsed struct {
+		JSONSchema struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+			Required   []string                   `json:"required"`
+		} `json:"json_schema"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+
+	for _, want := range []string{"pattern", "-i", "-n", "output_mode"} {
+		if _, ok := parsed.JSONSchema.Properties[want]; !ok {
+			t.Errorf("schema properties = %v, want a %q parameter", parsed.JSONSchema.Properties, want)
 		}
+	}
+
+	// Only pattern may be required. A field is optional solely by virtue of
+	// ",omitempty" on its json tag, so dropping that silently forces the
+	// model to supply every flag on every call.
+	if len(parsed.JSONSchema.Required) != 1 || parsed.JSONSchema.Required[0] != "pattern" {
+		t.Errorf("required = %v, want exactly [pattern]", parsed.JSONSchema.Required)
 	}
 }
 ```
 
-If that test cannot be made to pass, rename the two fields to
-`case_insensitive` and `line_numbers`, note the divergence in the tool
-description so the model is told the correct names, and carry it as a known
-fidelity gap rather than fighting the schema library.
+This test needs `"encoding/json"` in the import block.
 
 - [ ] **Step 4: Run tests to verify they pass**
 

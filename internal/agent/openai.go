@@ -567,7 +567,7 @@ func prettyPrintArgs(argsJSON string) string {
 }
 
 // describeArgs renders tool arguments for a human reader. A lone string
-// argument — the shape of run_shell_command's {"command": "..."} — is returned
+// argument — the shape of Bash's {"command": "..."} — is returned
 // bare, so a command reads as a command, with real newlines instead of
 // JSON-escaped ones. Anything else falls back to indented JSON rather than
 // risk silently dropping fields.

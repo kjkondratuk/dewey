@@ -60,6 +60,8 @@ always_write:
 # Non-shell tools that write by definition, whatever a classifier decides.
 always_write_tools:
   - remember
+  - Write
+  - Edit
 
 # Programs that read or write depending on the subcommand. Anything not listed
 # here as read-only counts as a write.
