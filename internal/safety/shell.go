@@ -2,6 +2,8 @@ package safety
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -51,26 +53,92 @@ func (r ShellRules) ToolFloor(toolName, argsJSON string) Classification {
 	return r.ShellFloor(argsJSON)
 }
 
-// AlwaysRead reports whether toolName is declared structurally incapable of
-// writing, in which case the classifier is not consulted. The two guards are
-// deliberately redundant with the validation in Merge: this is the function
-// the gate actually calls, so it enforces the invariant itself rather than
-// trusting an earlier pass.
-func (r ShellRules) AlwaysRead(toolName string) bool {
-	if toolName == shellToolName {
+// readOnlyTools are the tools dewey ships whose implementation has no write
+// path: Read opens a file, Grep searches text, Glob matches names.
+//
+// A constant rather than config, deliberately. The justification for skipping
+// classification is a claim about dewey's own source code, and a user-editable
+// list would make it a claim about nothing — adding a subagent-spawning tool
+// to it would hand that tool a total bypass of the approval gate.
+var readOnlyTools = map[string]string{
+	"Read": "file_path",
+	"Grep": "path",
+	"Glob": "path",
+}
+
+// AlwaysRead reports whether toolName is one of dewey's read-only tools
+// operating entirely inside root, in which case the classifier is skipped and
+// the call is treated as read/safe.
+//
+// Confinement is the whole basis for lowering a classification here. "Cannot
+// write" is not the same as "cannot harm": an unconfined reader can lift a
+// private key or an API token into the model's context, which is exactly the
+// safe-kind/high-risk case RequiresApproval exists to catch. Inside the
+// project the user is already working on, a read is genuinely unremarkable.
+// Outside it, this returns false and the call goes to the classifier like any
+// other — the read still happens, it just has to be approved.
+//
+// Fails closed on anything it cannot establish: unknown tool, unreadable
+// path, unresolvable root, malformed arguments.
+func (r ShellRules) AlwaysRead(toolName, argsJSON, root string) bool {
+	if toolName == "" || toolName == shellToolName || root == "" {
 		return false
 	}
+	// An explicit always-write pin outranks the fast path, so a user can
+	// force a prompt on a tool dewey considers read-only.
 	for _, name := range r.AlwaysWriteTools {
 		if name == toolName {
 			return false
 		}
 	}
-	for _, name := range r.AlwaysReadTools {
-		if name == toolName {
-			return true
-		}
+
+	key, ok := readOnlyTools[toolName]
+	if !ok {
+		return false
 	}
-	return false
+
+	var args map[string]any
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return false
+	}
+	target, _ := args[key].(string)
+	if target == "" {
+		// Grep and Glob default to the working directory when path is
+		// omitted; Read has no default and a missing file_path is an error
+		// the tool will report anyway.
+		cwd, err := os.Getwd()
+		if err != nil {
+			return false
+		}
+		target = cwd
+	}
+
+	return withinRoot(target, root)
+}
+
+// withinRoot reports whether path resolves inside root. Both sides go through
+// EvalSymlinks first: without it a link inside the project pointing at
+// ~/.ssh would inherit the fast path, making the confinement decorative. It
+// also makes macOS's /tmp -> /private/tmp agree with itself.
+func withinRoot(path, root string) bool {
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return false
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return false
+	}
+
+	rel, err := filepath.Rel(resolvedRoot, resolved)
+	if err != nil {
+		return false
+	}
+	return rel == "." || !strings.HasPrefix(rel, "..")
 }
 
 // ShellFloor returns the minimum classification for a shell command.

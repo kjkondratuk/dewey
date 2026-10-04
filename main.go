@@ -43,7 +43,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to create simple model: %v", err)
 	}
-	classifier := safety.NewLLMClassifier(simpleModel, cfg.ShellRules)
+	classifier := safety.NewLLMClassifier(simpleModel, cfg.ShellRules, config.ProjectRoot(cwd))
 	summarizer := compaction.NewLLMSummarizer(simpleModel)
 	contextWindow := config.DiscoverContextWindow(ctx, cfg.Intermediate)
 

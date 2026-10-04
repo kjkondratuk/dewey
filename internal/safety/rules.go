@@ -55,18 +55,6 @@ type ShellRules struct {
 	// remember tool writes to the user's profile whatever a classifier thinks.
 	AlwaysWriteTools []string `yaml:"always_write_tools"`
 
-	// AlwaysReadTools are tools whose implementation cannot modify anything,
-	// so the classifier is skipped for them entirely.
-	//
-	// This is the only rule that lowers a classification rather than raising
-	// it, which is defensible only because it describes dewey's own code: Read
-	// opens a file, Glob matches names, Grep searches text, and none of them
-	// has a write path. It is not a judgement about arguments, so there is
-	// nothing for an argument to smuggle past. AlwaysRead refuses to apply it
-	// to the shell tool or to anything also listed as always-write, so a
-	// mistaken config cannot turn it into a hole in the approval gate.
-	AlwaysReadTools []string `yaml:"always_read_tools"`
-
 	// compiled holds the parsed Patterns, built once by Compile.
 	compiled map[string][]*regexp.Regexp
 }
@@ -118,7 +106,6 @@ func (r ShellRules) Merge(user ShellRules) (ShellRules, []string) {
 	merged := ShellRules{
 		AlwaysWrite:      append(append([]string(nil), r.AlwaysWrite...), user.AlwaysWrite...),
 		AlwaysWriteTools: append(append([]string(nil), r.AlwaysWriteTools...), user.AlwaysWriteTools...),
-		AlwaysReadTools:  append(append([]string(nil), r.AlwaysReadTools...), user.AlwaysReadTools...),
 		ReadsWhen:        make(map[string]ProgramRules, len(r.ReadsWhen)),
 		WritesWithFlags:  make(map[string][]string, len(r.WritesWithFlags)),
 	}
@@ -174,29 +161,6 @@ func (r ShellRules) Merge(user ShellRules) (ShellRules, []string) {
 		}
 		merged.WritesWithFlags[program] = flags
 	}
-
-	// An always-read entry that names the shell tool or a tool already pinned
-	// to write is ignored rather than honored. Silently dropping it would
-	// leave the user believing a rule is in effect, which is the failure this
-	// package exists to avoid.
-	//
-	// set() is an existing helper in this package (see the NeverWrite handling
-	// above); it is not introduced here.
-	writeTools := set(merged.AlwaysWriteTools...)
-	var keptReads []string
-	for _, name := range merged.AlwaysReadTools {
-		switch {
-		case name == shellToolName:
-			notices = append(notices, fmt.Sprintf(
-				"ignoring always_read_tools entry %q: the shell tool is never exempt from classification", name))
-		case writeTools[name]:
-			notices = append(notices, fmt.Sprintf(
-				"ignoring always_read_tools entry %q: it is also listed in always_write_tools", name))
-		default:
-			keptReads = append(keptReads, name)
-		}
-	}
-	merged.AlwaysReadTools = keptReads
 
 	return merged, notices
 }

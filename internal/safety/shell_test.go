@@ -2,6 +2,8 @@ package safety
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -257,4 +259,126 @@ func TestShellFloor_GlobalFlagHandlingCoversSubcommandPrograms(t *testing.T) {
 
 func TestShellFloor_UnknownProgramsAreLeftToTheClassifier(t *testing.T) {
 	assertReads(t, "mycustomtool --do-something", "./scripts/deploy.sh", "jq .x f.json")
+}
+
+func TestAlwaysRead_FastPathOnlyInsideTheRoot(t *testing.T) {
+	root := t.TempDir()
+	inside := filepath.Join(root, "pkg", "file.go")
+	if err := os.MkdirAll(filepath.Dir(inside), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inside, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(outside, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var r ShellRules
+
+	if !r.AlwaysRead("Read", `{"file_path":`+quote(inside)+`}`, root) {
+		t.Error("AlwaysRead(Read, inside root) = false, want true")
+	}
+	if r.AlwaysRead("Read", `{"file_path":`+quote(outside)+`}`, root) {
+		t.Error("AlwaysRead(Read, outside root) = true, want false — it must be classified")
+	}
+}
+
+func TestAlwaysRead_SymlinkCannotEscapeTheRoot(t *testing.T) {
+	// A link inside the project pointing out of it must not inherit the fast
+	// path; otherwise the confinement is decorative.
+	root := t.TempDir()
+	secretDir := t.TempDir()
+	secret := filepath.Join(secretDir, "id_rsa")
+	if err := os.WriteFile(secret, []byte("PRIVATE KEY"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "innocent.txt")
+	if err := os.Symlink(secret, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	var r ShellRules
+	if r.AlwaysRead("Read", `{"file_path":`+quote(link)+`}`, root) {
+		t.Error("AlwaysRead(symlink out of root) = true, want false")
+	}
+}
+
+func TestAlwaysRead_RejectsNonReadOnlyAndUnknownTools(t *testing.T) {
+	root := t.TempDir()
+	args := `{"file_path":` + quote(filepath.Join(root, "f")) + `}`
+	if err := os.WriteFile(filepath.Join(root, "f"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var r ShellRules
+	for _, name := range []string{shellToolName, "Write", "Edit", "remember", "Task", "mcp__x__y", ""} {
+		if r.AlwaysRead(name, args, root) {
+			t.Errorf("AlwaysRead(%q) = true, want false — only dewey's read-only tools qualify", name)
+		}
+	}
+}
+
+func TestAlwaysRead_WriteListStillWins(t *testing.T) {
+	// Even for a read-only tool inside the root, an always-write pin outranks
+	// the fast path.
+	root := t.TempDir()
+	path := filepath.Join(root, "f")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := ShellRules{AlwaysWriteTools: []string{"Read"}}
+
+	if r.AlwaysRead("Read", `{"file_path":`+quote(path)+`}`, root) {
+		t.Error("AlwaysRead = true, want false when the tool is pinned to write")
+	}
+}
+
+func TestAlwaysRead_FailsClosedOnAnUnusablePathOrRoot(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "exists")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args := `{"file_path":` + quote(path) + `}`
+
+	var r ShellRules
+	cases := []struct {
+		name, argsJSON, root string
+	}{
+		{"empty root", args, ""},
+		{"nonexistent path", `{"file_path":` + quote(filepath.Join(root, "absent")) + `}`, root},
+		{"malformed args", `{not json`, root},
+		{"wrong arg key", `{"path":` + quote(path) + `}`, root},
+	}
+	for _, c := range cases {
+		if r.AlwaysRead("Read", c.argsJSON, c.root) {
+			t.Errorf("AlwaysRead(%s) = true, want false — must fail closed", c.name)
+		}
+	}
+}
+
+func TestAlwaysRead_GrepAndGlobUseThePathArgument(t *testing.T) {
+	root := t.TempDir()
+	var r ShellRules
+
+	for _, tool := range []string{"Grep", "Glob"} {
+		if !r.AlwaysRead(tool, `{"pattern":"x","path":`+quote(root)+`}`, root) {
+			t.Errorf("AlwaysRead(%s, path inside root) = false, want true", tool)
+		}
+		if r.AlwaysRead(tool, `{"pattern":"x","path":`+quote(t.TempDir())+`}`, root) {
+			t.Errorf("AlwaysRead(%s, path outside root) = true, want false", tool)
+		}
+	}
+}
+
+// quote renders s as a JSON string literal, so test paths containing
+// separators or spaces survive embedding in an argument blob.
+func quote(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
 }

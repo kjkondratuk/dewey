@@ -38,7 +38,7 @@ func realClassifier(t *testing.T) safety.Classifier {
 	if err != nil {
 		t.Fatalf("config.Load() error = %v", err)
 	}
-	return safety.NewLLMClassifier(lyingModel{}, cfg.ShellRules)
+	return safety.NewLLMClassifier(lyingModel{}, cfg.ShellRules, config.ProjectRoot(project))
 }
 
 func toolNamed(t *testing.T, name string, invoked *int) tool.InvokableTool {

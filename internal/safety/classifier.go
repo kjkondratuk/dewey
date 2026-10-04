@@ -35,21 +35,24 @@ var failSafeClassification = Classification{Kind: "write", Risk: Dangerous}
 // llmClassifier calls a chat model to classify each tool call, in a message
 // exchange isolated from any ongoing conversation history.
 type llmClassifier struct {
-	model model.BaseChatModel
-	rules ShellRules
+	model       model.BaseChatModel
+	rules       ShellRules
+	projectRoot string
 }
 
 // NewLLMClassifier builds a Classifier backed by m. m should be a small/fast
-// model — classification runs once per tool call.
-func NewLLMClassifier(m model.BaseChatModel, rules ShellRules) Classifier {
-	return &llmClassifier{model: m, rules: rules}
+// model — classification runs once per tool call. projectRoot confines the
+// always-read fast path: a read resolving inside it skips the model, a read
+// outside it does not.
+func NewLLMClassifier(m model.BaseChatModel, rules ShellRules, projectRoot string) Classifier {
+	return &llmClassifier{model: m, rules: rules, projectRoot: projectRoot}
 }
 
 func (c *llmClassifier) Classify(ctx context.Context, toolName, toolDesc, argsJSON string) (Classification, error) {
-	// Tools that cannot write are not worth a model round-trip, and a local
-	// model rating Read as "moderate" would prompt for something structurally
-	// incapable of harm.
-	if c.rules.AlwaysRead(toolName) {
+	// A read confined to the project root is not worth a model round-trip,
+	// and a local model rating it "moderate" would prompt for something
+	// unremarkable. Anything outside the root falls through and is classified.
+	if c.rules.AlwaysRead(toolName, argsJSON, c.projectRoot) {
 		return Classification{Kind: "read", Risk: Safe}, nil
 	}
 
