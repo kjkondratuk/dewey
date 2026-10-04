@@ -179,7 +179,31 @@ dewey queries this at startup (2-second timeout) and prefers
 supports is common. Failure is silent and expected on any other provider — it
 is a convenience, not a requirement.
 
-Every other provider needs `context_window` set by hand; see below.
+When the model is **not loaded**, `loaded_context_length` is null and only
+`max_context_length` is available. That number is the architecture's ceiling,
+not what the server will serve once the model is loaded with a practical
+context size — the two differ by more than an order of magnitude here (256K
+advertised; 1M for some models). Taking it at face value means dewey believes
+it has far more room than it does, never compacts, and fails at the provider
+instead. So a window known only from `max_context_length` is treated as a hint
+and clamped to 32768.
+
+That clamp is not permanent. After the provider successfully serves its first
+request — which means the model is now loaded — dewey asks once more, adopts
+the real `loaded_context_length`, and says so:
+
+```
+Context window updated from ~32768 to 262144 tokens now that the model is loaded.
+```
+
+So launching dewey against an idle server costs one conservative turn, not a
+conservative session. The one case it stays put is when the window was already
+lowered by a provider rejection (see context compaction below): a rejection is
+direct evidence about what the server will serve, so it outranks discovery.
+
+A `context_window` you set by hand always wins over both, and is the escape
+hatch when these heuristics are wrong. Every other provider needs it set; see
+below.
 
 ## Other providers
 
@@ -362,6 +386,26 @@ The summarizer is instructed to preserve goals, decisions, discovered facts
 (file paths, commands, error messages), in-progress work, and open questions,
 and to drop conversational filler. Your current message is never summarized —
 only history before it.
+
+### If the provider rejects the request anyway
+
+The 90% trigger only works if the believed window is right. When it is too
+large — see the clamping note under context-window auto-detection — the
+threshold never fires and the provider rejects the request instead. dewey
+treats that rejection as a compaction signal: it summarizes, lowers its
+assumed window to what the rejected request measured, retries once, and says
+so:
+
+```
+The provider rejected the request as too long for its context window.
+Compacted and retrying; assuming ~32768 tokens from here.
+```
+
+One attempt per turn. If the retry is rejected too, the error surfaces
+normally rather than compacting in a loop. Detection is by error-message text,
+since OpenAI-compatible servers share no error code for this, so an unfamiliar
+provider may word it in a way dewey does not recognize — in which case set
+`context_window` by hand.
 
 ## Long-term memory
 

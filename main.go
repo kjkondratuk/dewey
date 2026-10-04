@@ -77,7 +77,13 @@ func main() {
 	}
 
 	agt := agent.New(tm, tools, classifier, contextWindow, summarizer).
-		WithSystemPrompt(systemPrompt)
+		WithSystemPrompt(systemPrompt).
+		// Startup discovery runs before any request, so the model is often
+		// not loaded yet and contextWindow above may be a clamped guess. Once
+		// the provider serves a request the real window is observable.
+		WithContextWindowRefresher(func(ctx context.Context) (int, bool) {
+			return config.RefreshContextWindow(ctx, cfg.Intermediate)
+		})
 
 	prog := tea.NewProgram(initModel(agt, notices))
 	_, err = prog.Run()

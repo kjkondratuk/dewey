@@ -38,9 +38,10 @@ type ModelConfig struct {
 	BaseURL string `yaml:"base_url"`
 	APIKey  string `yaml:"api_key"`
 	Model   string `yaml:"model"`
-	// ContextWindow is an optional explicit context-window size, used as a
-	// fallback when it can't be discovered from the provider (see
-	// DiscoverContextWindow). Zero means "not set."
+	// ContextWindow is an optional explicit context-window size. When set it
+	// takes precedence over anything discovered from the provider (see
+	// DiscoverContextWindow), making it the escape hatch for a server that
+	// misreports. Zero means "not set."
 	ContextWindow int `yaml:"context_window"`
 }
 
@@ -296,6 +297,10 @@ func BuildChatModel(ctx context.Context, m ModelConfig) (model.ToolCallingChatMo
 
 const defaultContextWindow = 8192
 
+// maxAssumedContextWindow caps a window size that was inferred from a model's
+// architectural maximum rather than measured from a loaded instance.
+const maxAssumedContextWindow = 32768
+
 type lmStudioModelsResponse struct {
 	Data []struct {
 		ID                  string `json:"id"`
@@ -305,21 +310,40 @@ type lmStudioModelsResponse struct {
 }
 
 // DiscoverContextWindow resolves the context window size for m, trying (in
-// order): LM Studio's native API, m.ContextWindow if set, then a hardcoded
+// order): m.ContextWindow if set, LM Studio's native API, then a hardcoded
 // default. LM Studio discovery failures are silent and expected for any
 // other OpenAI-compatible provider — this is a best-effort convenience, not
 // a required capability.
+//
+// An explicitly configured window is checked first because it is the escape
+// hatch for a provider that misreports, and discovery is the thing being
+// escaped. A discovered value that was only inferred from the model's
+// architectural maximum is clamped; see discoverLMStudioContextWindow.
 func DiscoverContextWindow(ctx context.Context, m ModelConfig) int {
-	if window, ok := discoverLMStudioContextWindow(ctx, m); ok {
-		return window
-	}
 	if m.ContextWindow > 0 {
 		return m.ContextWindow
+	}
+	if window, exact, ok := discoverLMStudioContextWindow(ctx, m); ok {
+		if exact {
+			return window
+		}
+		return min(window, maxAssumedContextWindow)
 	}
 	return defaultContextWindow
 }
 
-func discoverLMStudioContextWindow(ctx context.Context, m ModelConfig) (int, bool) {
+// discoverLMStudioContextWindow asks LM Studio about m.Model. The second
+// return reports whether the window was *measured* from a loaded model
+// (loaded_context_length) rather than inferred from the architecture's ceiling
+// (max_context_length).
+//
+// The distinction matters by more than an order of magnitude: an unloaded
+// gemma-4-31b advertises max_context_length 262144 and the nemotron models
+// advertise 1048576, while the context a server will actually serve once the
+// model is loaded is typically a small fraction of that. Treating the ceiling
+// as a measurement means compaction never fires and the request fails at the
+// provider instead.
+func discoverLMStudioContextWindow(ctx context.Context, m ModelConfig) (window int, exact, ok bool) {
 	base := strings.TrimSuffix(strings.TrimSuffix(m.BaseURL, "/"), "/v1")
 
 	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -327,22 +351,22 @@ func discoverLMStudioContextWindow(ctx context.Context, m ModelConfig) (int, boo
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, base+"/api/v0/models", nil)
 	if err != nil {
-		return 0, false
+		return 0, false, false
 	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return 0, false
+		return 0, false, false
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, false
+		return 0, false, false
 	}
 
 	var parsed lmStudioModelsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-		return 0, false
+		return 0, false, false
 	}
 
 	for _, entry := range parsed.Data {
@@ -350,12 +374,34 @@ func discoverLMStudioContextWindow(ctx context.Context, m ModelConfig) (int, boo
 			continue
 		}
 		if entry.LoadedContextLength > 0 {
-			return entry.LoadedContextLength, true
+			return entry.LoadedContextLength, true, true
 		}
 		if entry.MaxContextLength > 0 {
-			return entry.MaxContextLength, true
+			return entry.MaxContextLength, false, true
 		}
+		return 0, false, false
+	}
+	return 0, false, false
+}
+
+// RefreshContextWindow re-resolves the window for m after the provider has
+// served a request, which implies the model is now resident and
+// loaded_context_length reports what it will actually serve. The bool is
+// false when there is nothing better on offer than whatever is already in
+// use: the window is explicitly configured, discovery failed, or the model is
+// still unloaded and only its architectural ceiling is visible.
+//
+// This exists because DiscoverContextWindow runs at startup, when the model
+// is often not loaded yet and the best it can do is clamp a guess. Launching
+// dewey against an idle server would otherwise mean running at the clamp for
+// the whole session even after the server loads the model at its full size.
+func RefreshContextWindow(ctx context.Context, m ModelConfig) (int, bool) {
+	if m.ContextWindow > 0 {
 		return 0, false
 	}
-	return 0, false
+	window, exact, ok := discoverLMStudioContextWindow(ctx, m)
+	if !ok || !exact {
+		return 0, false
+	}
+	return window, true
 }

@@ -399,3 +399,96 @@ func contains(values []string, want string) bool {
 	}
 	return false
 }
+
+func TestDiscoverContextWindow_ClampsArchitecturalMaxWhenModelUnloaded(t *testing.T) {
+	// loaded_context_length absent means the model is not resident, so
+	// max_context_length is the architecture's ceiling rather than what the
+	// server will serve. Trusting it verbatim is how dewey comes to believe it
+	// has 262144 tokens and stops compacting.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"test-model","max_context_length":262144}]}`))
+	}))
+	defer srv.Close()
+
+	got := DiscoverContextWindow(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "test-model"})
+	if got != maxAssumedContextWindow {
+		t.Errorf("DiscoverContextWindow() = %d, want clamp to %d", got, maxAssumedContextWindow)
+	}
+}
+
+func TestDiscoverContextWindow_LoadedValueIsNeverClamped(t *testing.T) {
+	// A loaded model reports what it will actually serve, so a large value is
+	// a measurement and must be honored.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"test-model","max_context_length":262144,"loaded_context_length":131072}]}`))
+	}))
+	defer srv.Close()
+
+	got := DiscoverContextWindow(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "test-model"})
+	if got != 131072 {
+		t.Errorf("DiscoverContextWindow() = %d, want 131072 unclamped", got)
+	}
+}
+
+func TestDiscoverContextWindow_ExplicitConfigOverridesDiscovery(t *testing.T) {
+	// An explicitly configured window is the escape hatch when discovery is
+	// wrong, so it has to win rather than act as a fallback.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"test-model","loaded_context_length":131072}]}`))
+	}))
+	defer srv.Close()
+
+	got := DiscoverContextWindow(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "test-model", ContextWindow: 16384})
+	if got != 16384 {
+		t.Errorf("DiscoverContextWindow() = %d, want 16384 (explicit config wins)", got)
+	}
+}
+
+func TestRefreshContextWindow_AdoptsLoadedValue(t *testing.T) {
+	// Once the provider has served a request the model is resident, so
+	// loaded_context_length is populated and is a real measurement.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"test-model","max_context_length":262144,"loaded_context_length":262144}]}`))
+	}))
+	defer srv.Close()
+
+	got, ok := RefreshContextWindow(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "test-model"})
+	if !ok || got != 262144 {
+		t.Errorf("RefreshContextWindow() = (%d, %v), want (262144, true)", got, ok)
+	}
+}
+
+func TestRefreshContextWindow_DeclinesWhenStillOnlyInferred(t *testing.T) {
+	// Only max_context_length available means the model still is not loaded,
+	// so there is nothing better than the clamped value already in use.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"test-model","max_context_length":262144}]}`))
+	}))
+	defer srv.Close()
+
+	got, ok := RefreshContextWindow(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "test-model"})
+	if ok {
+		t.Errorf("RefreshContextWindow() = (%d, true), want ok=false while still inferred", got)
+	}
+}
+
+func TestRefreshContextWindow_DeclinesWhenExplicitlyConfigured(t *testing.T) {
+	// An explicit window is the user overriding discovery; refreshing would
+	// undo exactly what they asked for.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"test-model","loaded_context_length":262144}]}`))
+	}))
+	defer srv.Close()
+
+	got, ok := RefreshContextWindow(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "test-model", ContextWindow: 16384})
+	if ok {
+		t.Errorf("RefreshContextWindow() = (%d, true), want ok=false when context_window is set", got)
+	}
+}
+
+func TestRefreshContextWindow_DeclinesWhenProviderUnreachable(t *testing.T) {
+	got, ok := RefreshContextWindow(context.Background(), ModelConfig{BaseURL: "http://127.0.0.1:1", Model: "test-model"})
+	if ok {
+		t.Errorf("RefreshContextWindow() = (%d, true), want ok=false when discovery fails", got)
+	}
+}
