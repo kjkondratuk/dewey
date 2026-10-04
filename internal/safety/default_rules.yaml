@@ -60,6 +60,16 @@ always_write:
 # Non-shell tools that write by definition, whatever a classifier decides.
 always_write_tools:
   - remember
+  - Write
+  - Edit
+
+# Tools whose implementation has no write path at all. Unlike every other rule
+# here this one lowers a classification, so it is limited to tools dewey ships
+# and is refused for the shell tool. See ShellRules.AlwaysRead.
+always_read_tools:
+  - Read
+  - Grep
+  - Glob
 
 # Programs that read or write depending on the subcommand. Anything not listed
 # here as read-only counts as a write.

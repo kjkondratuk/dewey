@@ -51,6 +51,28 @@ func (r ShellRules) ToolFloor(toolName, argsJSON string) Classification {
 	return r.ShellFloor(argsJSON)
 }
 
+// AlwaysRead reports whether toolName is declared structurally incapable of
+// writing, in which case the classifier is not consulted. The two guards are
+// deliberately redundant with the validation in Merge: this is the function
+// the gate actually calls, so it enforces the invariant itself rather than
+// trusting an earlier pass.
+func (r ShellRules) AlwaysRead(toolName string) bool {
+	if toolName == shellToolName {
+		return false
+	}
+	for _, name := range r.AlwaysWriteTools {
+		if name == toolName {
+			return false
+		}
+	}
+	for _, name := range r.AlwaysReadTools {
+		if name == toolName {
+			return true
+		}
+	}
+	return false
+}
+
 // ShellFloor returns the minimum classification for a shell command.
 func (r ShellRules) ShellFloor(argsJSON string) Classification {
 	command, ok := shellCommandFrom(argsJSON)

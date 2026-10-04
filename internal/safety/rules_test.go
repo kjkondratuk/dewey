@@ -112,3 +112,50 @@ func TestReadPatterns_OnlyWidenWhatIsAllowed(t *testing.T) {
 		t.Error("git branch -d slipped through a read pattern")
 	}
 }
+
+func TestAlwaysRead_HonorsTheConfiguredList(t *testing.T) {
+	r := ShellRules{AlwaysReadTools: []string{"Read", "Glob"}}
+
+	if !r.AlwaysRead("Read") {
+		t.Error("AlwaysRead(Read) = false, want true")
+	}
+	if r.AlwaysRead("Edit") {
+		t.Error("AlwaysRead(Edit) = true, want false for an unlisted tool")
+	}
+}
+
+func TestAlwaysRead_RefusesTheShellTool(t *testing.T) {
+	// A config that could mark the shell tool read-only could disable the
+	// approval gate entirely.
+	r := ShellRules{AlwaysReadTools: []string{shellToolName}}
+
+	if r.AlwaysRead(shellToolName) {
+		t.Errorf("AlwaysRead(%q) = true, want false — the shell tool can never be always-read", shellToolName)
+	}
+}
+
+func TestAlwaysRead_WriteListWins(t *testing.T) {
+	r := ShellRules{
+		AlwaysReadTools:  []string{"Edit"},
+		AlwaysWriteTools: []string{"Edit"},
+	}
+
+	if r.AlwaysRead("Edit") {
+		t.Error("AlwaysRead(Edit) = true, want false when it is also always-write")
+	}
+}
+
+func TestMerge_NoticesAnAlwaysReadEntryThatCannotApply(t *testing.T) {
+	base := ShellRules{AlwaysWriteTools: []string{"remember"}}
+	user := ShellRules{AlwaysReadTools: []string{"remember", shellToolName, "Read"}}
+
+	merged, notices := base.Merge(user)
+
+	if !merged.AlwaysRead("Read") {
+		t.Error("AlwaysRead(Read) = false, want the valid entry kept")
+	}
+	joined := strings.Join(notices, "\n")
+	if !strings.Contains(joined, "remember") || !strings.Contains(joined, shellToolName) {
+		t.Errorf("notices = %q, want both rejected entries reported", notices)
+	}
+}

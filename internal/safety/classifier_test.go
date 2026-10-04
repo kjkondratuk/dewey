@@ -180,3 +180,38 @@ func testRules(t *testing.T) ShellRules {
 	}
 	return r
 }
+
+type countingModel struct {
+	calls int
+}
+
+func (c *countingModel) Generate(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.Message, error) {
+	c.calls++
+	return &schema.Message{Role: schema.Assistant, Content: `{"kind":"write","risk":"dangerous","summary":"x"}`}, nil
+}
+
+func (c *countingModel) Stream(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	panic("not used")
+}
+
+func TestClassify_AlwaysReadToolSkipsTheModel(t *testing.T) {
+	// Besides avoiding a spurious prompt, this saves a model round-trip on
+	// every file read.
+	rules := ShellRules{AlwaysReadTools: []string{"Read"}}
+	m := &countingModel{}
+	c := NewLLMClassifier(m, rules)
+
+	got, err := c.Classify(context.Background(), "Read", "Reads a file", `{"file_path":"/tmp/x"}`)
+	if err != nil {
+		t.Fatalf("Classify() error = %v", err)
+	}
+	if got.Kind != "read" || got.Risk != Safe {
+		t.Errorf("Classify() = %+v, want read/safe", got)
+	}
+	if got.RequiresApproval() {
+		t.Error("RequiresApproval() = true, want false for a tool that cannot write")
+	}
+	if m.calls != 0 {
+		t.Errorf("model calls = %d, want 0", m.calls)
+	}
+}

@@ -46,6 +46,13 @@ func NewLLMClassifier(m model.BaseChatModel, rules ShellRules) Classifier {
 }
 
 func (c *llmClassifier) Classify(ctx context.Context, toolName, toolDesc, argsJSON string) (Classification, error) {
+	// Tools that cannot write are not worth a model round-trip, and a local
+	// model rating Read as "moderate" would prompt for something structurally
+	// incapable of harm.
+	if c.rules.AlwaysRead(toolName) {
+		return Classification{Kind: "read", Risk: Safe}, nil
+	}
+
 	messages := []*schema.Message{
 		{Role: schema.System, Content: classifierSystemPrompt},
 		{
