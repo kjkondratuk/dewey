@@ -181,12 +181,20 @@ is a convenience, not a requirement.
 
 When the model is **not loaded**, `loaded_context_length` is null and only
 `max_context_length` is available. That number is the architecture's ceiling,
-not what the server will serve once the model is loaded with a practical
-context size — the two differ by more than an order of magnitude here (256K
-advertised; 1M for some models). Taking it at face value means dewey believes
-it has far more room than it does, never compacts, and fails at the provider
-instead. So a window known only from `max_context_length` is treated as a hint
-and clamped to 32768.
+which is not *necessarily* what the server will serve — load the same model
+with a smaller context and the two differ by more than an order of magnitude
+(256K advertised here; 1M for some models). Taking it at face value when it is
+wrong means dewey believes it has far more room than it does, never compacts,
+and fails at the provider instead. So a window known only from
+`max_context_length` is treated as a hint and clamped to 32768.
+
+**This only applies to a cold start, and it costs nothing.** If the model is
+already loaded when dewey launches, `loaded_context_length` is populated and
+used directly — the clamp never runs. If it is cold, the clamp is provisional:
+compaction is skipped on the first turn regardless, and the refresh below lands
+at the end of that same turn, so the real window is in place before any
+compaction check can happen. The clamp only has an effect if the refresh also
+fails, where erring low is the safe direction.
 
 That clamp is not permanent. After the provider successfully serves its first
 request — which means the model is now loaded — dewey asks once more, adopts
