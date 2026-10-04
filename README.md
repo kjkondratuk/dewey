@@ -11,6 +11,7 @@ It is a single Go binary with a TUI. No daemon, no database.
 ## Contents
 
 - [Quick start](#quick-start)
+- [Tools](#tools)
 - [How the model is chosen](#how-the-model-is-chosen)
 - [Bionic / LM Studio](#bionic--lm-studio)
 - [Other providers](#other-providers)
@@ -51,6 +52,64 @@ contacting the server, so a wrong id or an unreachable server surfaces as a red
 error block on your first message rather than as a startup failure. If dewey
 launches cleanly and then errors the moment you say anything, check the model id
 first.
+
+## Tools
+
+The names match Claude Code's deliberately, so skills and subagents written for
+it can run here unchanged once that work lands.
+
+| Tool | What it does | Approval |
+| --- | --- | --- |
+| `Bash` | Runs a shell command via `sh -c` | Per the shell rules below |
+| `Read` | Reads a file with line numbers, 2000 lines by default | Usually silent — see below |
+| `Write` | Replaces a file's contents entirely | Always prompts |
+| `Edit` | Exact string replacement in a file | Always prompts |
+| `Grep` | Regex search over file contents, ripgrep when available | Usually silent — see below |
+| `Glob` | Finds files by glob pattern, `**` supported | Usually silent — see below |
+| `remember` | Saves a preference to your profile | Always prompts |
+
+`Write` and `Edit` are pinned to `always_write_tools`, so they prompt no matter
+what the classifier thinks.
+
+### Why reads are usually silent, and when they are not
+
+`Read`, `Grep`, and `Glob` have no write path at all, so classifying them wastes
+a model round-trip and a local model rating one of them "moderate" would prompt
+you to approve a directory listing. They skip classification entirely — but
+**only for targets inside the project root**.
+
+"Cannot write" is not the same as "cannot harm". An unconfined reader can lift a
+private key or an API token into the model's context, which is exactly the
+safe-but-risky case the approval gate exists to catch. So a read outside the
+project root is classified like anything else and may ask for approval. The read
+still happens; it just has to be approved, the same as `cat` would be.
+
+Symlinks are resolved on both sides before the comparison, so a link inside the
+repo pointing at `~/.ssh` does not inherit the fast path. Anything that cannot
+be established — an unreadable path, an unresolvable root — fails closed and
+gets classified.
+
+One case worth knowing: a root broad enough to contain your home directory is
+rejected outright. `ProjectRoot` stops its upward walk at a `.dewey` directory,
+so in a directory with no `.git` or `.dewey` of its own the "project" resolves
+to `$HOME` — which would put `~/.ssh` inside it. Reads there always consult the
+classifier. A `.dewey/` in the directory you are working in anchors the root and
+restores the fast path.
+
+### Read before modify
+
+`Write` and `Edit` refuse to touch an **existing** file that has not been read
+this session, and refuse again if it changed on disk since that read. Creating a
+new file needs no prior read.
+
+This exists because `Edit` requires `old_string` to match exactly once. Without
+the precondition a stale `old_string` either fails to match or matches something
+the model did not intend — and in the second case the tool reports success, the
+file still compiles, and nothing downstream can tell the wrong line changed. The
+error tells the model to read the file again, which is the fix.
+
+`Edit` also refuses an `old_string` appearing more than once unless `replace_all`
+is set, rather than editing the first occurrence.
 
 ## How the model is chosen
 
@@ -230,7 +289,7 @@ models:
 
 Two requirements, both non-negotiable:
 
-- **Tool calling.** dewey's only tool for doing work is `Bash`. A
+- **Tool calling.** Every tool dewey has is a tool call — see Tools below. A
   model that cannot emit tool calls will talk about running commands without
   ever running one.
 - **Streaming.** Replies are streamed; a server that only supports
@@ -310,10 +369,8 @@ it ungated.
 
 ## Tool safety and approval
 
-dewey has one tool for doing work — `Bash`, which runs a command
-via `sh -c` and returns combined stdout/stderr plus the exit code — and one for
-remembering things. There is no sandbox. The protection is that you approve
-anything risky.
+dewey's tools can run commands and change files (see Tools above). There is no
+sandbox. The protection is that you approve anything risky.
 
 Before each tool call runs, the `simple` model classifies it along two axes —
 whether it **writes**, and how risky it is:
