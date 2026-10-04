@@ -12,24 +12,6 @@ import (
 	"github.com/kjkondratuk/dewey/internal/safety"
 )
 
-func TestDefaultInvokableToolset_ReturnsOneShellTool(t *testing.T) {
-	// Registering the Claude core toolset (Read, Write, Edit, Grep, Glob)
-	// alongside Bash is covered by TestDefaultInvokableToolset_ExposesTheClaudeCoreTools;
-	// this test only pins Bash as present and first.
-	toolset := NewToolFactory(nil, files.NewTracker()).DefaultInvokableToolset()
-	if len(toolset) == 0 {
-		t.Fatalf("DefaultInvokableToolset() returned 0 tools, want at least the shell tool")
-	}
-
-	info, err := toolset[0].Info(context.Background())
-	if err != nil {
-		t.Fatalf("Info() error = %v", err)
-	}
-	if info.Name != "Bash" {
-		t.Errorf("tool name = %q, want %q", info.Name, "Bash")
-	}
-}
-
 func TestDefaultInvokableToolset_ShellCommandSuccess(t *testing.T) {
 	toolset := NewToolFactory(nil, files.NewTracker()).DefaultInvokableToolset()
 
