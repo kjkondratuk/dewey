@@ -57,17 +57,18 @@ func (r ShellRules) ToolFloor(toolName, argsJSON string) Classification {
 	return r.ShellFloor(argsJSON)
 }
 
-// readOnlyTools are the tools dewey ships whose implementation has no write
-// path: Read opens a file, Grep searches text, Glob matches names.
+// readOnlyTools maps each of dewey's read-only tools to the argument keys that
+// together determine what it will actually touch. Order matters: the first key
+// is a directory or file, and any later key is joined onto it.
 //
-// A constant rather than config, deliberately. The justification for skipping
-// classification is a claim about dewey's own source code, and a user-editable
-// list would make it a claim about nothing — adding a subagent-spawning tool
-// to it would hand that tool a total bypass of the approval gate.
-var readOnlyTools = map[string]string{
-	"Read": "file_path",
-	"Grep": "path",
-	"Glob": "path",
+// Glob needs two. Its pattern is joined onto its path by the tool itself, and
+// filepath.Join cleans "..", so confining the path alone leaves the pattern
+// free to walk straight out of the project — which is precisely how the
+// confinement was first defeated.
+var readOnlyTools = map[string][]string{
+	"Read": {"file_path"},
+	"Grep": {"path"},
+	"Glob": {"path", "pattern"},
 }
 
 // AlwaysRead reports whether toolName is one of dewey's read-only tools
@@ -96,7 +97,7 @@ func (r ShellRules) AlwaysRead(toolName, argsJSON, root string) bool {
 		}
 	}
 
-	key, ok := readOnlyTools[toolName]
+	keys, ok := readOnlyTools[toolName]
 	if !ok {
 		return false
 	}
@@ -105,19 +106,42 @@ func (r ShellRules) AlwaysRead(toolName, argsJSON, root string) bool {
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return false
 	}
-	target, _ := args[key].(string)
-	if target == "" {
-		// Grep and Glob default to the working directory when path is
-		// omitted; Read has no default and a missing file_path is an error
-		// the tool will report anyway.
+
+	// The first key names a real directory or file, so it is resolved through
+	// symlinks and confined. Grep and Glob default it to the working
+	// directory, matching the tools' own behavior.
+	base, _ := args[keys[0]].(string)
+	if base == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
 			return false
 		}
-		target = cwd
+		base = cwd
+	}
+	if !withinRoot(base, root) {
+		return false
 	}
 
-	return withinRoot(target, root)
+	// Any remaining key is a pattern joined onto that base. It cannot be
+	// resolved through symlinks because it does not name an existing path, so
+	// it is checked lexically on the cleaned join — which is exactly the
+	// operation the tool will perform.
+	resolvedBase, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		return false
+	}
+	target := resolvedBase
+	for _, k := range keys[1:] {
+		v, _ := args[k].(string)
+		if v == "" {
+			continue
+		}
+		target = filepath.Join(target, v)
+	}
+	if target == resolvedBase {
+		return true
+	}
+	return withinRootLexical(target, root)
 }
 
 // withinRoot reports whether path resolves inside root. Both sides go through
@@ -149,6 +173,33 @@ func withinRoot(path, root string) bool {
 	}
 
 	rel, err := filepath.Rel(resolvedRoot, resolved)
+	if err != nil {
+		return false
+	}
+	return rel == "." || !strings.HasPrefix(rel, "..")
+}
+
+// withinRootLexical reports whether a cleaned path lies inside root without
+// requiring it to exist. A glob pattern names no real file, so EvalSymlinks
+// cannot be used on it — but filepath.Join has already applied the same
+// cleaning the tool will apply, so comparing the cleaned result is checking
+// the operation that will actually happen.
+//
+// Only safe because the base directory it was joined onto was resolved and
+// confined first; on its own it would be fooled by a symlinked base.
+func withinRootLexical(path, root string) bool {
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return false
+	}
+	if isTooBroad(resolvedRoot) {
+		return false
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(resolvedRoot, filepath.Clean(abs))
 	if err != nil {
 		return false
 	}

@@ -314,10 +314,8 @@ func TestRememberTool_TagVocabularyReachesTheModel(t *testing.T) {
 	}
 
 	desc := parsed.JSONSchema.Properties["tags"].Description
-	for _, want := range []string{"go", "node", "rust", "python"} {
-		if !strings.Contains(desc, want) {
-			t.Errorf("tags description = %q, want it to name the %q tag", desc, want)
-		}
+	if !strings.Contains(desc, "go / node / rust / python") {
+		t.Errorf("tags description = %q, want the full tag vocabulary", desc)
 	}
 
 	// Same truncation, same tool: the text description lost the guidance that

@@ -25,6 +25,25 @@ type EditInput struct {
 	ReplaceAll bool   `json:"replace_all,omitempty" jsonschema:"description=Optional. Replace every occurrence instead of requiring exactly one"`
 }
 
+// countOverlapping counts occurrences of sub in s, including overlapping ones.
+//
+// strings.Count counts only non-overlapping occurrences, which is the wrong
+// question for Edit's uniqueness guard: "aba" in "ababa" is 1 by that measure,
+// while there are genuinely two places the replacement could land. Taking the
+// non-overlapping count let Replace edit the first of them and report success.
+func countOverlapping(s, sub string) int {
+	if sub == "" {
+		return 0
+	}
+	n := 0
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			n++
+		}
+	}
+	return n
+}
+
 // persist writes content to path and re-records the read, so a following
 // modification is not rejected for the mtime this write just changed.
 func persist(tracker *files.Tracker, path, content string, perm os.FileMode) error {
@@ -81,24 +100,26 @@ func editFile(tracker *files.Tracker, in EditInput) (string, error) {
 	}
 	text := string(original)
 
-	count := strings.Count(text, in.OldString)
+	// Ambiguity is judged on overlapping occurrences, because any of them is a
+	// place the edit could land.
+	ambiguity := countOverlapping(text, in.OldString)
 	switch {
-	case count == 0:
+	case ambiguity == 0:
 		return "", fmt.Errorf("old_string not found in %s; read the file again to see its current contents", in.FilePath)
-	case count > 1 && !in.ReplaceAll:
-		// Refusing is the whole point: replacing the first of several matches
-		// edits a line the model did not choose, and nothing downstream can
-		// detect that it happened.
-		return "", fmt.Errorf("old_string appears %d times in %s; make it unique or set replace_all", count, in.FilePath)
+	case ambiguity > 1 && !in.ReplaceAll:
+		return "", fmt.Errorf("old_string appears %d times in %s; make it unique or set replace_all", ambiguity, in.FilePath)
 	}
 
 	updated := text
-	replaced := count
+	replaced := 1
 	if in.ReplaceAll {
+		// ReplaceAll and Count agree on left-to-right non-overlapping
+		// semantics, so this is the number of replacements actually made —
+		// which is what the message should report.
+		replaced = strings.Count(text, in.OldString)
 		updated = strings.ReplaceAll(text, in.OldString, in.NewString)
 	} else {
 		updated = strings.Replace(text, in.OldString, in.NewString, 1)
-		replaced = 1
 	}
 
 	if err := persist(tracker, in.FilePath, updated, info.Mode().Perm()); err != nil {

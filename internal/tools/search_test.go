@@ -134,8 +134,8 @@ func TestGrep_FindsMatchingLinesWithLineNumbers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("grepFiles() error = %v", err)
 	}
-	if !strings.Contains(got, "target") || !strings.Contains(got, "2") {
-		t.Errorf("output = %q, want the matching line and its number", got)
+	if !strings.Contains(got, ":2:func target") {
+		t.Errorf("output = %q, want the match reported as path:2:func target", got)
 	}
 }
 
@@ -206,8 +206,8 @@ func TestGrep_CountModeReportsPerFileTotals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("grepFiles() error = %v", err)
 	}
-	if !strings.Contains(got, "2") {
-		t.Errorf("output = %q, want a count of 2", got)
+	if !strings.Contains(got, "a.txt:2") {
+		t.Errorf("output = %q, want the count reported as path:2", got)
 	}
 }
 

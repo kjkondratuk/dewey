@@ -97,7 +97,7 @@ func newGlobTool() tool.InvokableTool {
 type GrepInput struct {
 	Pattern     string `json:"pattern" jsonschema:"required,description=Regular expression to search for"`
 	Path        string `json:"path,omitempty" jsonschema:"description=Optional. Absolute directory to search in. Defaults to the working directory"`
-	Glob        string `json:"glob,omitempty" jsonschema:"description=Optional. Restrict the search to files matching this glob - for example *.go"`
+	Glob        string `json:"glob,omitempty" jsonschema:"description=Optional. Restrict the search to files matching this glob - supports ** for recursive matching - for example **/*.go"`
 	OutputMode  string `json:"output_mode,omitempty" jsonschema:"description=One of content or files_with_matches or count. Defaults to files_with_matches"`
 	IgnoreCase  bool   `json:"-i,omitempty" jsonschema:"description=Optional. Case-insensitive search"`
 	LineNumbers bool   `json:"-n,omitempty" jsonschema:"description=Optional. Include line numbers in content output"`
@@ -182,10 +182,55 @@ func grepWithGo(in GrepInput) (string, error) {
 		return "", fmt.Errorf("invalid pattern: %w", err)
 	}
 
+	candidates, err := grepCandidates(root, in.Glob)
+	if err != nil {
+		return "", err
+	}
+
 	var b strings.Builder
-	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	for _, path := range candidates {
+		if err := grepOneFile(&b, re, path, in); err != nil {
+			return "", err
+		}
+	}
+	return truncateMatches(b.String(), in)
+}
+
+// grepCandidates resolves which files to search.
+//
+// When a glob is given it goes through filepathx, the same ** -capable globber
+// the Glob tool uses, because ripgrep's --glob matches whole paths and
+// supports **. filepath.Match would match basenames only, so the idiomatic
+// "**/*.go" a Claude Code skill writes would return nothing on a machine
+// without ripgrep — the two backends have to agree on the file set, not just
+// the output format.
+func grepCandidates(root, glob string) ([]string, error) {
+	if glob != "" {
+		matches, err := filepathx.Glob(filepath.Join(root, glob))
+		if err != nil {
+			return nil, err
+		}
+		kept := make([]string, 0, len(matches))
+		for _, m := range matches {
+			info, err := os.Lstat(m)
+			if err != nil || info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			kept = append(kept, m)
+		}
+		return kept, nil
+	}
+
+	var paths []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil // unreadable entries are skipped, not fatal
+		}
+		// ripgrep does not follow symlinks by default, and following one here
+		// would read a file outside the root that confinement approved — the
+		// check only ever saw the root, not what links inside it point at.
+		if d.Type()&os.ModeSymlink != 0 {
+			return nil
 		}
 		if d.IsDir() {
 			// .git holds packed binary objects that match almost any pattern.
@@ -194,49 +239,56 @@ func grepWithGo(in GrepInput) (string, error) {
 			}
 			return nil
 		}
-		if in.Glob != "" {
-			ok, err := filepath.Match(in.Glob, d.Name())
-			if err != nil || !ok {
-				return nil
-			}
-		}
-
-		f, err := os.Open(path)
-		if err != nil {
-			return nil
-		}
-		defer f.Close()
-
-		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
-		lineNo, hits := 0, 0
-		for scanner.Scan() {
-			lineNo++
-			if !re.MatchString(scanner.Text()) {
-				continue
-			}
-			hits++
-			if in.mode() == "content" {
-				if in.LineNumbers {
-					fmt.Fprintf(&b, "%s:%d:%s\n", path, lineNo, scanner.Text())
-				} else {
-					fmt.Fprintf(&b, "%s:%s\n", path, scanner.Text())
-				}
-			}
-		}
-		switch {
-		case hits == 0:
-		case in.mode() == "files_with_matches":
-			fmt.Fprintf(&b, "%s\n", path)
-		case in.mode() == "count":
-			fmt.Fprintf(&b, "%s:%s\n", path, strconv.Itoa(hits))
-		}
+		paths = append(paths, path)
 		return nil
 	})
+	return paths, err
+}
+
+// grepOneFile scans a single file and appends whatever the output mode calls
+// for. A file that cannot be opened is skipped rather than failing the search.
+func grepOneFile(b *strings.Builder, re *regexp.Regexp, path string, in GrepInput) error {
+	f, err := os.Open(path)
 	if err != nil {
-		return "", err
+		return nil
 	}
-	return truncateMatches(b.String(), in)
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+	lineNo, hits := 0, 0
+	for scanner.Scan() {
+		lineNo++
+		if !re.MatchString(scanner.Text()) {
+			continue
+		}
+		hits++
+		if in.mode() == "content" {
+			if in.LineNumbers {
+				fmt.Fprintf(b, "%s:%d:%s\n", path, lineNo, scanner.Text())
+			} else {
+				fmt.Fprintf(b, "%s:%s\n", path, scanner.Text())
+			}
+		}
+		if b.Len() >= maxToolOutputBytes {
+			return nil
+		}
+	}
+	// A line over the scanner's budget would otherwise yield silently partial
+	// results, which read as "no more matches".
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(b, "%s: [skipped: %v]\n", path, err)
+		return nil
+	}
+
+	switch {
+	case hits == 0:
+	case in.mode() == "files_with_matches":
+		fmt.Fprintf(b, "%s\n", path)
+	case in.mode() == "count":
+		fmt.Fprintf(b, "%s:%s\n", path, strconv.Itoa(hits))
+	}
+	return nil
 }
 
 // truncateMatches caps output and turns an empty result into a statement, so
@@ -245,6 +297,14 @@ func truncateMatches(out string, in GrepInput) (string, error) {
 	out = strings.TrimRight(out, "\n")
 	if out == "" {
 		return fmt.Sprintf("No matches for %q.", in.Pattern), nil
+	}
+	if len(out) > maxToolOutputBytes {
+		out = out[:maxToolOutputBytes]
+		// Drop the partial final line so the output stays parseable.
+		if i := strings.LastIndexByte(out, '\n'); i > 0 {
+			out = out[:i]
+		}
+		return out + fmt.Sprintf("\n[truncated at %d bytes; narrow the pattern]", maxToolOutputBytes), nil
 	}
 	lines := strings.Split(out, "\n")
 	if len(lines) > maxSearchResults {

@@ -18,6 +18,12 @@ import (
 // skills that assume "Read gives me the first 2000 lines" hold.
 const defaultReadLimit = 2000
 
+// maxToolOutputBytes bounds what a single tool call can put into the
+// conversation. The line caps alone are not a bound: one minified bundle line
+// or one base64 blob can exceed a whole context window, and compaction only
+// runs after the result is already in history.
+const maxToolOutputBytes = 256 * 1024
+
 type ReadInput struct {
 	FilePath string `json:"file_path" jsonschema:"required,description=Absolute path to the file to read"`
 	Offset   int    `json:"offset,omitempty" jsonschema:"description=Optional. 1-indexed line number to start from. Omit to start at the beginning"`
@@ -64,11 +70,23 @@ func readFile(tracker *files.Tracker, in ReadInput) (string, error) {
 		if lineNo < offset {
 			continue
 		}
+		if b.Len() >= maxToolOutputBytes {
+			fmt.Fprintf(&b, "\n[truncated at %d bytes; re-read with offset=%d for more]\n", maxToolOutputBytes, lineNo)
+			break
+		}
 		if emitted >= limit {
 			fmt.Fprintf(&b, "\n[truncated at %d lines; re-read with offset=%d for more]\n", limit, lineNo)
 			break
 		}
-		fmt.Fprintf(&b, "%6d\t%s\n", lineNo, scanner.Text())
+		// A single line can itself exceed the whole budget (a minified bundle
+		// is one line), and the check above only catches that on the next
+		// iteration. Truncating the line's own text here is what makes the
+		// budget an actual bound rather than a bound on every line but one.
+		line := scanner.Text()
+		if remaining := maxToolOutputBytes - b.Len(); len(line) > remaining {
+			line = line[:remaining]
+		}
+		fmt.Fprintf(&b, "%6d\t%s\n", lineNo, line)
 		emitted++
 	}
 	if err := scanner.Err(); err != nil {
