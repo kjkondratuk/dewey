@@ -55,6 +55,14 @@ type noticeReporter interface {
 	Notices() []string
 }
 
+// Recorder persists the conversation as it happens. Narrow on purpose: the
+// agent reports what it appended and what happened, and knows nothing about
+// where it goes.
+type Recorder interface {
+	Append(msg *schema.Message)
+	Event(event, detail string)
+}
+
 type openaiAgent struct {
 	cm         model.ToolCallingChatModel
 	tools      map[string]tool.InvokableTool
@@ -89,6 +97,10 @@ type openaiAgent struct {
 	// provider rejecting a request as too long, which outranks anything
 	// discovery can infer afterwards.
 	windowFromRejection bool
+
+	// recorder persists the conversation as it happens, for debugging and
+	// resume. Nil means recording is disabled for this run.
+	recorder Recorder
 }
 
 // New builds an agent backed by cm, which must already have the tool schemas
@@ -149,6 +161,39 @@ func (a *openaiAgent) WithSystemPrompt(p SystemPromptProvider) *openaiAgent {
 	return a
 }
 
+// WithRecorder attaches a Recorder that persists the conversation as it
+// happens. A nil recorder (the zero value, and also what passing nil
+// explicitly leaves in place) disables recording entirely; every call site
+// guards through record/recordEvent so that is always safe.
+func (a *openaiAgent) WithRecorder(r Recorder) *openaiAgent {
+	a.recorder = r
+	return a
+}
+
+// WithHistory seeds the agent's conversation history, for resuming a session
+// recorded by a Recorder. The seeded messages are sent on the very first
+// request, ahead of anything Run appends.
+func (a *openaiAgent) WithHistory(msgs []*schema.Message) *openaiAgent {
+	a.history = msgs
+	return a
+}
+
+// record appends msg to the recorder, if one is attached. A small helper so
+// every append site reads the same way rather than repeating a nil check.
+func (a *openaiAgent) record(msg *schema.Message) {
+	if a.recorder != nil {
+		a.recorder.Append(msg)
+	}
+}
+
+// recordEvent reports an out-of-band occurrence to the recorder, if one is
+// attached.
+func (a *openaiAgent) recordEvent(event, detail string) {
+	if a.recorder != nil {
+		a.recorder.Event(event, detail)
+	}
+}
+
 // messages returns what to send: the system message, if any, followed by the
 // conversation. The system message is rebuilt per call.
 func (a *openaiAgent) messages(ctx context.Context) ([]*schema.Message, error) {
@@ -167,10 +212,12 @@ func (a *openaiAgent) messages(ctx context.Context) ([]*schema.Message, error) {
 
 func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, error) {
 	truncateLen := len(a.history)
-	a.history = append(a.history, &schema.Message{
+	userMsg := &schema.Message{
 		Role:    schema.User,
 		Content: input,
-	})
+	}
+	a.history = append(a.history, userMsg)
+	a.record(userMsg)
 
 	ch := make(chan Event)
 	go func() {
@@ -179,7 +226,9 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 		// return an error if the loop panics
 		defer func() {
 			if r := recover(); r != nil {
-				ch <- Event{Kind: "error", Payload: fmt.Sprintf("panic: %v", r)}
+				payload := fmt.Sprintf("panic: %v", r)
+				a.recordEvent("error", payload)
+				ch <- Event{Kind: "error", Payload: payload}
 			}
 		}()
 
@@ -187,15 +236,20 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 			if err := a.compact(ctx, truncateLen); err != nil {
 				if errors.Is(err, context.Canceled) {
 					a.history = a.history[:truncateLen]
+					a.recordEvent("cancelled", "")
 					ch <- Event{Kind: "cancelled"}
 					return
 				}
-				ch <- Event{Kind: "error", Payload: "compaction failed: " + err.Error()}
+				payload := "compaction failed: " + err.Error()
+				a.recordEvent("error", payload)
+				ch <- Event{Kind: "error", Payload: payload}
 				return
 			}
-			ch <- Event{Kind: "compacted", Payload: fmt.Sprintf(
+			compactedPayload := fmt.Sprintf(
 				"Compacted conversation history (was ~%d/%d tokens, %.0f%%).",
-				estimated, a.contextWindow, 100*float64(estimated)/float64(a.contextWindow))}
+				estimated, a.contextWindow, 100*float64(estimated)/float64(a.contextWindow))
+			a.recordEvent("compacted", compactedPayload)
+			ch <- Event{Kind: "compacted", Payload: compactedPayload}
 		}
 
 		// forcedCompaction limits the provider-overflow backstop below to one
@@ -209,7 +263,9 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 		for {
 			outbound, err := a.messages(ctx)
 			if err != nil {
-				ch <- Event{Kind: "error", Payload: "system prompt unavailable: " + err.Error()}
+				payload := "system prompt unavailable: " + err.Error()
+				a.recordEvent("error", payload)
+				ch <- Event{Kind: "error", Payload: payload}
 				return
 			}
 			// Report profile problems that appeared since the last call. The
@@ -217,9 +273,12 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 			// can evict another for budget -- precisely when the user has just
 			// been told "Saved."
 			if notice := a.newNotices(); notice != "" {
+				a.recordEvent("notice", notice)
 				ch <- Event{Kind: "notice", Payload: notice}
 			}
 
+			a.recordEvent("request", fmt.Sprintf(
+				"messages=%d estimated_tokens=%d window=%d", len(outbound), a.estimateTokens(), a.contextWindow))
 			sr, err := a.cm.Stream(ctx, outbound)
 			if err != nil {
 				// Backstop for a believed context window larger than the one
@@ -240,17 +299,22 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 					if cerr != nil {
 						if errors.Is(cerr, context.Canceled) {
 							a.history = a.history[:truncateLen]
+							a.recordEvent("cancelled", "")
 							ch <- Event{Kind: "cancelled"}
 							return
 						}
-						ch <- Event{Kind: "error", Payload: "compaction after a context overflow failed: " + cerr.Error()}
+						payload := "compaction after a context overflow failed: " + cerr.Error()
+						a.recordEvent("error", payload)
+						ch <- Event{Kind: "error", Payload: payload}
 						return
 					}
 
+					a.recordEvent("forced_compaction", evt.Payload)
 					ch <- evt
 					continue
 				}
 
+				a.recordEvent("error", err.Error())
 				ch <- Event{Kind: "error", Payload: err.Error()}
 				return
 			}
@@ -269,11 +333,13 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 					// would strip one tool result and leave an assistant
 					// message with orphaned ToolCalls, which the API rejects.
 					a.history = a.history[:truncateLen]
+					a.recordEvent("cancelled", "")
 					ch <- Event{Kind: "cancelled"}
 					return
 				}
 				if err != nil {
 					sr.Close()
+					a.recordEvent("error", err.Error())
 					ch <- Event{Kind: "error", Payload: err.Error()}
 					return
 				}
@@ -286,15 +352,18 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 
 			full, err := schema.ConcatMessages(chunks)
 			if err != nil {
+				a.recordEvent("error", err.Error())
 				ch <- Event{Kind: "error", Payload: err.Error()}
 				return
 			}
 			a.history = append(a.history, full)
+			a.record(full)
 			a.recordUsage(full)
 
 			// The provider just served a request, so the model is loaded and
 			// its real window is discoverable for the first time.
 			if notice := a.refreshContextWindow(ctx); notice != "" {
+				a.recordEvent("notice", notice)
 				ch <- Event{Kind: "notice", Payload: notice}
 			}
 
@@ -307,8 +376,10 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 			for _, tc := range full.ToolCalls {
 				t, ok := a.tools[tc.Function.Name]
 				if !ok {
-					a.history = append(a.history, toolResult(
-						"error: unknown tool "+tc.Function.Name, tc.ID, tc.Function.Name))
+					unknownResult := toolResult(
+						"error: unknown tool "+tc.Function.Name, tc.ID, tc.Function.Name)
+					a.history = append(a.history, unknownResult)
+					a.record(unknownResult)
 					continue
 				}
 
@@ -321,11 +392,14 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 					allowed, cancelled := a.awaitConfirmation(ctx, ch, tc.Function.Name, classification, tc.Function.Arguments)
 					if cancelled {
 						a.history = a.history[:truncateLen]
+						a.recordEvent("cancelled", "")
 						ch <- Event{Kind: "cancelled"}
 						return
 					}
 					if !allowed {
-						a.history = append(a.history, toolResult(deniedToolResult, tc.ID, tc.Function.Name))
+						deniedResult := toolResult(deniedToolResult, tc.ID, tc.Function.Name)
+						a.history = append(a.history, deniedResult)
+						a.record(deniedResult)
 						continue
 					}
 					confirmed = true
@@ -341,7 +415,9 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 				if err != nil {
 					result = "error: " + err.Error()
 				}
-				a.history = append(a.history, toolResult(result, tc.ID, tc.Function.Name))
+				resultMsg := toolResult(result, tc.ID, tc.Function.Name)
+				a.history = append(a.history, resultMsg)
+				a.record(resultMsg)
 			}
 			// loop back around and stream again with tool results in history
 		}
@@ -494,6 +570,10 @@ func (a *openaiAgent) compact(ctx context.Context, truncateLen int) error {
 	a.history = append([]*schema.Message{summaryMsg}, a.history[truncateLen:]...)
 	a.lastKnownTokens = 0
 	a.lastKnownAt = 0
+	// The rewritten history is not re-appended to the recorder -- it already
+	// has every message that went into the summary, plus everything kept.
+	// Re-appending would duplicate the whole kept tail in the transcript.
+	a.recordEvent("compacted_history", fmt.Sprintf("replaced=%d kept=%d", truncateLen, len(a.history)-1))
 	return nil
 }
 
