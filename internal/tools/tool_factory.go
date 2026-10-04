@@ -5,6 +5,7 @@ import (
 
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/components/tool/utils"
+	"github.com/kjkondratuk/dewey/internal/files"
 )
 
 type ToolCreator interface {
@@ -20,14 +21,16 @@ type MemoryRecorder interface {
 
 type ToolFactory struct {
 	recorder MemoryRecorder
+	tracker  *files.Tracker
 }
 
 var _ ToolCreator = (*ToolFactory)(nil)
 
 // NewToolFactory builds the toolset. A nil recorder omits the remember tool,
-// which is how memory stays disabled.
-func NewToolFactory(recorder MemoryRecorder) *ToolFactory {
-	return &ToolFactory{recorder: recorder}
+// which is how memory stays disabled. tracker is required: Write and Edit
+// refuse to modify a file that was not read through it first.
+func NewToolFactory(recorder MemoryRecorder, tracker *files.Tracker) *ToolFactory {
+	return &ToolFactory{recorder: recorder, tracker: tracker}
 }
 
 // RememberInput is deliberately missing an org field. The org is the gate that
@@ -46,7 +49,14 @@ type RememberInput struct {
 }
 
 func (f *ToolFactory) DefaultInvokableToolset() []tool.InvokableTool {
-	toolset := []tool.InvokableTool{newBashTool()}
+	toolset := []tool.InvokableTool{
+		newBashTool(),
+		newReadTool(f.tracker),
+		newWriteTool(f.tracker),
+		newEditTool(f.tracker),
+		newGrepTool(),
+		newGlobTool(),
+	}
 
 	if f.recorder != nil {
 		remember, _ := utils.InferTool(

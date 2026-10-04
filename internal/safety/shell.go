@@ -41,6 +41,10 @@ var wrapperPrograms = set("env", "command", "exec", "time", "nohup", "builtin")
 // It is a floor, not a parser and not a security boundary. It does not expand
 // variables, follow aliases, read scripts being invoked, or understand
 // `sh -c "$CMD"`. Anything it misses still goes to the classifier.
+//
+// Not the only entry point any more: AlwaysRead handles dewey's read-only
+// tools, which skip classification entirely rather than receiving a floor.
+// A tool in neither place is classified by the model alone.
 func (r ShellRules) ToolFloor(toolName, argsJSON string) Classification {
 	for _, name := range r.AlwaysWriteTools {
 		if name == toolName {

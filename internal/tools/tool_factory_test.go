@@ -8,12 +8,17 @@ import (
 	"testing"
 
 	"github.com/cloudwego/eino/components/tool"
+	"github.com/kjkondratuk/dewey/internal/files"
+	"github.com/kjkondratuk/dewey/internal/safety"
 )
 
 func TestDefaultInvokableToolset_ReturnsOneShellTool(t *testing.T) {
-	toolset := NewToolFactory(nil).DefaultInvokableToolset()
-	if len(toolset) != 1 {
-		t.Fatalf("DefaultInvokableToolset() returned %d tools, want 1", len(toolset))
+	// Registering the Claude core toolset (Read, Write, Edit, Grep, Glob)
+	// alongside Bash is covered by TestDefaultInvokableToolset_ExposesTheClaudeCoreTools;
+	// this test only pins Bash as present and first.
+	toolset := NewToolFactory(nil, files.NewTracker()).DefaultInvokableToolset()
+	if len(toolset) == 0 {
+		t.Fatalf("DefaultInvokableToolset() returned 0 tools, want at least the shell tool")
 	}
 
 	info, err := toolset[0].Info(context.Background())
@@ -26,7 +31,7 @@ func TestDefaultInvokableToolset_ReturnsOneShellTool(t *testing.T) {
 }
 
 func TestDefaultInvokableToolset_ShellCommandSuccess(t *testing.T) {
-	toolset := NewToolFactory(nil).DefaultInvokableToolset()
+	toolset := NewToolFactory(nil, files.NewTracker()).DefaultInvokableToolset()
 
 	result, err := toolset[0].InvokableRun(context.Background(), `{"command":"echo hello"}`)
 	if err != nil {
@@ -41,7 +46,7 @@ func TestDefaultInvokableToolset_ShellCommandSuccess(t *testing.T) {
 }
 
 func TestDefaultInvokableToolset_ShellCommandNonZeroExitIsNotAToolError(t *testing.T) {
-	toolset := NewToolFactory(nil).DefaultInvokableToolset()
+	toolset := NewToolFactory(nil, files.NewTracker()).DefaultInvokableToolset()
 
 	result, err := toolset[0].InvokableRun(context.Background(), `{"command":"exit 3"}`)
 	if err != nil {
@@ -53,7 +58,7 @@ func TestDefaultInvokableToolset_ShellCommandNonZeroExitIsNotAToolError(t *testi
 }
 
 func TestDefaultInvokableToolset_ShellCommandCapturesStderr(t *testing.T) {
-	toolset := NewToolFactory(nil).DefaultInvokableToolset()
+	toolset := NewToolFactory(nil, files.NewTracker()).DefaultInvokableToolset()
 
 	result, err := toolset[0].InvokableRun(context.Background(), `{"command":"echo err-output 1>&2"}`)
 	if err != nil {
@@ -65,7 +70,7 @@ func TestDefaultInvokableToolset_ShellCommandCapturesStderr(t *testing.T) {
 }
 
 func TestDefaultInvokableToolset_ShellCommandSupportsPipelines(t *testing.T) {
-	toolset := NewToolFactory(nil).DefaultInvokableToolset()
+	toolset := NewToolFactory(nil, files.NewTracker()).DefaultInvokableToolset()
 
 	result, err := toolset[0].InvokableRun(context.Background(), `{"command":"printf 'a\\nb\\nc\\n' | grep b"}`)
 	if err != nil {
@@ -77,7 +82,7 @@ func TestDefaultInvokableToolset_ShellCommandSupportsPipelines(t *testing.T) {
 }
 
 func TestDefaultInvokableToolset_ShellCommandSpawnFailureIsAToolError(t *testing.T) {
-	toolset := NewToolFactory(nil).DefaultInvokableToolset()
+	toolset := NewToolFactory(nil, files.NewTracker()).DefaultInvokableToolset()
 
 	_, err := toolset[0].InvokableRun(context.Background(), `{"command":123}`)
 	if err == nil {
@@ -101,7 +106,7 @@ func (f *fakeRecorder) RecordScoped(ctx context.Context, text string, tags []str
 
 func rememberTool(t *testing.T, rec MemoryRecorder) tool.InvokableTool {
 	t.Helper()
-	for _, tl := range NewToolFactory(rec).DefaultInvokableToolset() {
+	for _, tl := range NewToolFactory(rec, files.NewTracker()).DefaultInvokableToolset() {
 		info, err := tl.Info(context.Background())
 		if err != nil {
 			t.Fatalf("Info() error = %v", err)
@@ -115,7 +120,7 @@ func rememberTool(t *testing.T, rec MemoryRecorder) tool.InvokableTool {
 }
 
 func TestDefaultInvokableToolset_OmitsRememberWithoutARecorder(t *testing.T) {
-	for _, tl := range NewToolFactory(nil).DefaultInvokableToolset() {
+	for _, tl := range NewToolFactory(nil, files.NewTracker()).DefaultInvokableToolset() {
 		info, err := tl.Info(context.Background())
 		if err != nil {
 			t.Fatal(err)
@@ -214,5 +219,87 @@ func TestRememberTool_PassesScopeThrough(t *testing.T) {
 	}
 	if !rec.thisOrgOnly {
 		t.Error("thisOrgOnly = false, want the requested scoping honored")
+	}
+}
+
+func TestDefaultInvokableToolset_ExposesTheClaudeCoreTools(t *testing.T) {
+	f := NewToolFactory(nil, files.NewTracker())
+
+	have := map[string]bool{}
+	for _, tl := range f.DefaultInvokableToolset() {
+		info, err := tl.Info(context.Background())
+		if err != nil {
+			t.Fatalf("Info() error = %v", err)
+		}
+		have[info.Name] = true
+	}
+
+	for _, want := range []string{"Bash", "Read", "Write", "Edit", "Grep", "Glob"} {
+		if !have[want] {
+			t.Errorf("tool %q missing from the toolset", want)
+		}
+	}
+	if have["remember"] {
+		t.Error("remember present with a nil recorder, want it omitted")
+	}
+}
+
+func TestDefaultInvokableToolset_EveryToolHasASafetyClassification(t *testing.T) {
+	// A tool in neither list falls through to the classifier alone, which is
+	// how a write ends up unprompted. This catches a tool added later without
+	// a matching rule — the failure would otherwise be silent and only
+	// visible as a missing approval prompt at runtime.
+	rules, err := safety.DefaultShellRules()
+	if err != nil {
+		t.Fatalf("DefaultShellRules() error = %v", err)
+	}
+
+	// AlwaysRead needs a path argument that resolves inside root, and the key
+	// differs per tool. A temp dir is used rather than $HOME because a root
+	// that broad is rejected outright.
+	root := t.TempDir()
+	pathArgKey := map[string]string{
+		"Read": "file_path",
+		"Grep": "path",
+		"Glob": "path",
+	}
+
+	f := NewToolFactory(nil, files.NewTracker())
+	for _, tl := range f.DefaultInvokableToolset() {
+		info, err := tl.Info(context.Background())
+		if err != nil {
+			t.Fatalf("Info() error = %v", err)
+		}
+		if info.Name == "Bash" {
+			continue // classified by inspecting the command, not by name
+		}
+
+		if key, ok := pathArgKey[info.Name]; ok {
+			args := `{"` + key + `":"` + root + `"}`
+			if !rules.AlwaysRead(info.Name, args, root) {
+				t.Errorf("tool %q is read-only but AlwaysRead(in-root) = false; it is missing from safety's readOnlyTools", info.Name)
+			}
+			continue
+		}
+
+		if floor := rules.ToolFloor(info.Name, "{}"); floor.Kind != "write" {
+			t.Errorf("tool %q has no safety classification: not in always_write_tools and not a known read-only tool", info.Name)
+		}
+	}
+}
+
+func TestDefaultInvokableToolset_IncludesRememberWithARecorder(t *testing.T) {
+	f := NewToolFactory(&fakeRecorder{}, files.NewTracker())
+
+	have := map[string]bool{}
+	for _, tl := range f.DefaultInvokableToolset() {
+		info, err := tl.Info(context.Background())
+		if err != nil {
+			t.Fatalf("Info() error = %v", err)
+		}
+		have[info.Name] = true
+	}
+	if !have["remember"] {
+		t.Error("remember missing with a recorder present")
 	}
 }
