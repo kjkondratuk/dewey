@@ -518,6 +518,67 @@ git commit -m "feat(safety): add an always-read floor for tools that cannot writ
 
 ---
 
+### Task 2b: Correct the always-read floor after review
+
+Task 2 shipped as `bc194dc` and an adversarial review found two defects in its
+**design** — the implementation matched the spec exactly; the spec was wrong.
+Recorded here rather than rewritten into Task 2, because the history of why
+the rule is shaped this way is the useful part.
+
+**Defect 1 — the early return discarded the risk axis.** `RequiresApproval()`
+is `Kind == "write" || Risk != Safe`. Only `Kind: "read"` was needed to stop
+prompting on a directory listing; pinning `Risk: Safe` as well removed the
+only gate on a *high-risk read*. With `Read` validating nothing but
+`filepath.IsAbs`, that makes `Read{file_path: "~/.ssh/id_rsa"}` and
+`Grep{pattern: "AKIA[0-9A-Z]{16}", path: "/Users/u"}` silent. Reading a secret
+into a model's context is harm, so the comment calling these tools
+"structurally incapable of harm" was false.
+
+**Defect 2 — `always_read_tools` was a user-writable yaml key.** It was added
+for symmetry with `always_write_tools`, with a comment claiming a mistaken
+config "cannot turn it into a hole." Nothing enforced that. Adding `Task` to
+the list would give a subagent-spawning tool a total classifier bypass.
+
+The fix makes the structural claim actually structural: the list becomes a
+package constant describing dewey's own code, and the fast path applies only
+to reads **inside the project root**. A read outside it still works — it just
+goes to the classifier and can require approval, which is the behavior `Bash`
+already has for `cat`.
+
+**Files:**
+- Modify: `internal/safety/rules.go` (drop the yaml field), `internal/safety/shell.go` (constant list + confinement), `internal/safety/classifier.go` (carry the root), `internal/safety/default_rules.yaml` (drop the key), `main.go` (pass the root)
+- Test: `internal/safety/shell_test.go`, `internal/safety/classifier_test.go`, `internal/safety/rules_test.go`
+
+**New API shape.** `AlwaysRead` gains the two arguments it needs to answer the
+question honestly:
+
+```go
+func (r ShellRules) AlwaysRead(toolName, argsJSON, root string) bool
+```
+
+and `NewLLMClassifier` carries the root so `Classify` can pass it:
+
+```go
+func NewLLMClassifier(m model.BaseChatModel, rules ShellRules, projectRoot string) Classifier
+```
+
+The exported `Classifier` interface is unchanged, so `internal/agent` is
+untouched.
+
+**Containment uses `filepath.Rel` plus symlink resolution, and fails closed.**
+A symlink inside the repo pointing at `~/.ssh` must not inherit the fast path,
+so both sides are resolved with `EvalSymlinks` before comparison. That also
+makes macOS's `/tmp` → `/private/tmp` work, which matters because `t.TempDir()`
+returns a path under it. A path that cannot be resolved — including one that
+does not exist — returns false and goes to the classifier.
+
+**Risk/behavior note for the implementer:** every read inside the project root
+behaves exactly as Task 2 shipped it (no model call, no prompt). The only
+change in behavior is for paths outside the root, which now get classified
+instead of being waved through.
+
+---
+
 ### Task 3: Rename the shell tool to Bash
 
 **Files:**
