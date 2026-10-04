@@ -85,6 +85,14 @@ var readOnlyTools = map[string][]string{
 //
 // Fails closed on anything it cannot establish: unknown tool, unreadable
 // path, unresolvable root, malformed arguments.
+//
+// One limit worth stating, because the gate rests on it: this inspects
+// arguments, not the filesystem, so it cannot see a symlink nested inside an
+// otherwise-confined root. Grep walks a tree and would read whatever such a
+// link points at, so the fast path for Grep is sound only because its
+// implementation refuses to follow symlinks — pinned by
+// TestGrepWithGo_DoesNotFollowSymlinksOutOfRoot in internal/tools. Teaching a
+// read-only tool to follow links means fixing this function first.
 func (r ShellRules) AlwaysRead(toolName, argsJSON, root string) bool {
 	if toolName == "" || toolName == shellToolName || root == "" {
 		return false

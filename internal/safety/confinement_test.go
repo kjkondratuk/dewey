@@ -12,7 +12,7 @@ import (
 // never examined, and globFiles joins it onto the root afterwards.
 // filepath.Join cleans "..", so the effective search root leaves the project
 // with no classification at all.
-func TestAdversarial_AlwaysRead_GlobPatternEscapesTheRoot(t *testing.T) {
+func TestAlwaysRead_GlobPatternCannotEscapeTheRoot(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "project")
 	if err := os.MkdirAll(root, 0o755); err != nil {

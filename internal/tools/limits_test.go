@@ -24,7 +24,17 @@ func lookRg() (string, error) { return exec.LookPath("rg") }
 // content, so asserting on the raw secret string is a false positive on a
 // correct "no matches" result. Checking for the leaking file's name has no
 // such collision.
-func TestAdversarial_GrepWithGo_FollowsSymlinkOutOfRoot(t *testing.T) {
+// TestGrepWithGo_DoesNotFollowSymlinksOutOfRoot pins a contract that
+// internal/safety depends on. AlwaysRead confines Grep on its path argument
+// alone and has no way to see a symlink nested inside an already-confined
+// root, so it grants the no-prompt fast path on the strength of this
+// behavior. ripgrep does not follow symlinks by default either, so the two
+// backends agree.
+//
+// If this test is ever deleted or relaxed — including by adding a
+// follow-symlinks option — Grep can read outside the project root with no
+// approval prompt. Change AlwaysRead first.
+func TestGrepWithGo_DoesNotFollowSymlinksOutOfRoot(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "project")
 	if err := os.MkdirAll(root, 0o755); err != nil {
@@ -48,7 +58,7 @@ func TestAdversarial_GrepWithGo_FollowsSymlinkOutOfRoot(t *testing.T) {
 }
 
 // Edit's uniqueness guard misses overlapping occurrences.
-func TestAdversarial_Edit_OverlappingOldStringBypassesUniquenessGuard(t *testing.T) {
+func TestEdit_OverlappingOldStringIsAmbiguous(t *testing.T) {
 	tracker := files.NewTracker()
 	path := filepath.Join(t.TempDir(), "f.txt")
 	if err := os.WriteFile(path, []byte("ababa\n"), 0o644); err != nil {
@@ -69,7 +79,7 @@ func TestAdversarial_Edit_OverlappingOldStringBypassesUniquenessGuard(t *testing
 }
 
 // Read caps line COUNT, never line LENGTH. A minified bundle is one line.
-func TestAdversarial_Read_SingleHugeLineIsReturnedWhole(t *testing.T) {
+func TestRead_BoundsASingleHugeLine(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bundle.min.js")
 	line := strings.Repeat("x", 4<<20) // 4 MiB on one line
 	if err := os.WriteFile(path, []byte(line+"\n"), 0o644); err != nil {
@@ -87,7 +97,7 @@ func TestAdversarial_Read_SingleHugeLineIsReturnedWhole(t *testing.T) {
 }
 
 // Same for Grep content mode: 200 lines is the only cap.
-func TestAdversarial_Grep_ContentModeHasNoByteCap(t *testing.T) {
+func TestGrep_ContentModeIsByteBounded(t *testing.T) {
 	dir := t.TempDir()
 	line := strings.Repeat("needle", 400_000) // ~2.4 MiB, one matching line
 	if err := os.WriteFile(filepath.Join(dir, "a.min.js"), []byte(line+"\n"), 0o644); err != nil {
@@ -106,7 +116,7 @@ func TestAdversarial_Grep_ContentModeHasNoByteCap(t *testing.T) {
 
 // rg --glob matches paths and supports **; filepath.Match matches the
 // basename only and has no ** support.
-func TestAdversarial_Grep_GlobSemanticsDivergeBetweenBackends(t *testing.T) {
+func TestGrep_GlobSemanticsAgreeAcrossBackends(t *testing.T) {
 	dir := t.TempDir()
 	seed(t, dir, "src/deep/a.go")
 	if err := os.WriteFile(filepath.Join(dir, "src/deep/a.go"), []byte("needle\n"), 0o644); err != nil {
@@ -138,7 +148,7 @@ func TestAdversarial_Grep_GlobSemanticsDivergeBetweenBackends(t *testing.T) {
 
 // --- things that held ---
 
-func TestAdversarial_Edit_ReplaceAllOverlappingCountIsHonest(t *testing.T) {
+func TestEdit_ReplaceAllOverlappingCountIsHonest(t *testing.T) {
 	tracker := files.NewTracker()
 	path := filepath.Join(t.TempDir(), "f.txt")
 	if err := os.WriteFile(path, []byte("aaaa\n"), 0o644); err != nil {
@@ -157,7 +167,7 @@ func TestAdversarial_Edit_ReplaceAllOverlappingCountIsHonest(t *testing.T) {
 	}
 }
 
-func TestAdversarial_Glob_SymlinkDirectoryCycle(t *testing.T) {
+func TestGlob_SurvivesASymlinkDirectoryCycle(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "a"), 0o755); err != nil {
 		t.Fatal(err)
@@ -186,7 +196,7 @@ func TestAdversarial_Glob_SymlinkDirectoryCycle(t *testing.T) {
 	}
 }
 
-func TestAdversarial_Read_DevZero(t *testing.T) {
+func TestRead_DevZeroTerminates(t *testing.T) {
 	if _, err := os.Stat("/dev/zero"); err != nil {
 		t.Skip("/dev/zero unavailable")
 	}
@@ -207,7 +217,7 @@ func TestAdversarial_Read_DevZero(t *testing.T) {
 	}
 }
 
-func TestAdversarial_Tracker_ConcurrentUse(t *testing.T) {
+func TestTracker_ConcurrentUseIsRaceFree(t *testing.T) {
 	tracker := files.NewTracker()
 	dir := t.TempDir()
 	var wg sync.WaitGroup
@@ -224,7 +234,7 @@ func TestAdversarial_Tracker_ConcurrentUse(t *testing.T) {
 	wg.Wait()
 }
 
-func TestAdversarial_Grep_HyphenFlagsBindAtRuntime(t *testing.T) {
+func TestGrep_HyphenFlagsBindAtRuntime(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("one\nNEEDLE\n"), 0o644); err != nil {
 		t.Fatal(err)
