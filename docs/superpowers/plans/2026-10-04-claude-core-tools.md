@@ -8,6 +8,12 @@
 
 **Tech Stack:** Go 1.26, eino (`utils.InferTool` for schema inference), `github.com/yargevad/filepathx` (already an indirect dependency; provides `**` glob support), ripgrep when present on `PATH`.
 
+**Reading the code blocks:** Each block shows a complete new file, or the
+region of an existing file that changes. Where a block is appended to an
+existing file, its import block is the existing one — steps say explicitly
+which imports to add, and those additions are part of the step, not optional
+commentary.
+
 **Scope note:** This is plan 1 of roughly four against `docs/superpowers/specs/2026-10-04-claude-config-interop-design.md`. It deliberately covers spec phase 1 plus the minimum of phase 2, and **not** phase 0. Rationale in "Deviations from the spec" below.
 
 ---
@@ -70,6 +76,7 @@ package files
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -169,8 +176,6 @@ func TestTracker_NormalizesPathSpelling(t *testing.T) {
 	}
 }
 ```
-
-Add `"strings"` to the import block.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -413,6 +418,8 @@ Then, immediately before `Merge` returns at `internal/safety/rules.go:165`, drop
 	// to write is ignored rather than honored. Silently dropping it would
 	// leave the user believing a rule is in effect, which is the failure this
 	// package exists to avoid.
+	// set() is an existing helper in this package (see the NeverWrite handling
+	// at rules.go:114); it is not introduced by this plan.
 	writeTools := set(merged.AlwaysWriteTools...)
 	var keptReads []string
 	for _, name := range merged.AlwaysReadTools {
