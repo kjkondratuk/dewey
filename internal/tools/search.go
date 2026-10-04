@@ -1,11 +1,16 @@
 package tools
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/cloudwego/eino/components/tool"
@@ -84,6 +89,177 @@ func newGlobTool() tool.InvokableTool {
 		"Finds files by glob pattern, supporting ** for recursive matching. Returns paths sorted by modification time, newest first. Use this to locate files by name; use Grep to search their contents.",
 		func(ctx context.Context, in GlobInput) (string, error) {
 			return globFiles(in)
+		},
+	)
+	return t
+}
+
+type GrepInput struct {
+	Pattern     string `json:"pattern" jsonschema:"required,description=Regular expression to search for"`
+	Path        string `json:"path,omitempty" jsonschema:"description=Optional. Absolute directory to search in. Defaults to the working directory"`
+	Glob        string `json:"glob,omitempty" jsonschema:"description=Optional. Restrict the search to files matching this glob - for example *.go"`
+	OutputMode  string `json:"output_mode,omitempty" jsonschema:"description=One of content or files_with_matches or count. Defaults to files_with_matches"`
+	IgnoreCase  bool   `json:"-i,omitempty" jsonschema:"description=Optional. Case-insensitive search"`
+	LineNumbers bool   `json:"-n,omitempty" jsonschema:"description=Optional. Include line numbers in content output"`
+}
+
+func (in GrepInput) mode() string {
+	switch in.OutputMode {
+	case "content", "count", "files_with_matches":
+		return in.OutputMode
+	default:
+		return "files_with_matches"
+	}
+}
+
+// grepFiles searches with ripgrep when it is available and falls back to a Go
+// walk otherwise. Both paths produce path:line:text for content mode so the
+// model sees one format regardless of what is installed on the machine.
+func grepFiles(in GrepInput) (string, error) {
+	// Compile first either way: rg reports a bad pattern as a bare exit code,
+	// which is indistinguishable from "no matches" and would surface as a
+	// confidently wrong empty result.
+	if _, err := regexp.Compile(in.Pattern); err != nil {
+		return "", fmt.Errorf("invalid pattern: %w", err)
+	}
+	if _, err := searchRoot(in.Path); err != nil {
+		return "", err
+	}
+
+	if path, err := exec.LookPath("rg"); err == nil {
+		return grepWithRipgrep(path, in)
+	}
+	return grepWithGo(in)
+}
+
+func grepWithRipgrep(rg string, in GrepInput) (string, error) {
+	root, err := searchRoot(in.Path)
+	if err != nil {
+		return "", err
+	}
+
+	args := []string{"--color=never"}
+	switch in.mode() {
+	case "files_with_matches":
+		args = append(args, "--files-with-matches")
+	case "count":
+		args = append(args, "--count")
+	default:
+		args = append(args, "--no-heading", "--with-filename")
+		if in.LineNumbers {
+			args = append(args, "--line-number")
+		}
+	}
+	if in.IgnoreCase {
+		args = append(args, "--ignore-case")
+	}
+	if in.Glob != "" {
+		args = append(args, "--glob", in.Glob)
+	}
+	args = append(args, "--regexp", in.Pattern, root)
+
+	out, err := exec.Command(rg, args...).Output()
+	// rg exits 1 for "no matches", which is not a failure.
+	var exitErr *exec.ExitError
+	if err != nil && (!errors.As(err, &exitErr) || exitErr.ExitCode() != 1) {
+		return "", err
+	}
+	return truncateMatches(string(out), in)
+}
+
+func grepWithGo(in GrepInput) (string, error) {
+	root, err := searchRoot(in.Path)
+	if err != nil {
+		return "", err
+	}
+
+	expr := in.Pattern
+	if in.IgnoreCase {
+		expr = "(?i)" + expr
+	}
+	re, err := regexp.Compile(expr)
+	if err != nil {
+		return "", fmt.Errorf("invalid pattern: %w", err)
+	}
+
+	var b strings.Builder
+	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil // unreadable entries are skipped, not fatal
+		}
+		if d.IsDir() {
+			// .git holds packed binary objects that match almost any pattern.
+			if d.Name() == ".git" || d.Name() == "node_modules" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if in.Glob != "" {
+			ok, err := filepath.Match(in.Glob, d.Name())
+			if err != nil || !ok {
+				return nil
+			}
+		}
+
+		f, err := os.Open(path)
+		if err != nil {
+			return nil
+		}
+		defer f.Close()
+
+		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+		lineNo, hits := 0, 0
+		for scanner.Scan() {
+			lineNo++
+			if !re.MatchString(scanner.Text()) {
+				continue
+			}
+			hits++
+			if in.mode() == "content" {
+				if in.LineNumbers {
+					fmt.Fprintf(&b, "%s:%d:%s\n", path, lineNo, scanner.Text())
+				} else {
+					fmt.Fprintf(&b, "%s:%s\n", path, scanner.Text())
+				}
+			}
+		}
+		switch {
+		case hits == 0:
+		case in.mode() == "files_with_matches":
+			fmt.Fprintf(&b, "%s\n", path)
+		case in.mode() == "count":
+			fmt.Fprintf(&b, "%s:%s\n", path, strconv.Itoa(hits))
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return truncateMatches(b.String(), in)
+}
+
+// truncateMatches caps output and turns an empty result into a statement, so
+// "found nothing" is distinguishable from "the call failed".
+func truncateMatches(out string, in GrepInput) (string, error) {
+	out = strings.TrimRight(out, "\n")
+	if out == "" {
+		return fmt.Sprintf("No matches for %q.", in.Pattern), nil
+	}
+	lines := strings.Split(out, "\n")
+	if len(lines) > maxSearchResults {
+		return strings.Join(lines[:maxSearchResults], "\n") +
+			fmt.Sprintf("\n[%d more lines not shown; narrow the pattern or use output_mode=files_with_matches]", len(lines)-maxSearchResults), nil
+	}
+	return out + "\n", nil
+}
+
+func newGrepTool() tool.InvokableTool {
+	t, _ := utils.InferTool(
+		"Grep",
+		"Searches file contents with a regular expression. output_mode selects content (matching lines), files_with_matches (paths only, the default), or count. Supports -i for case-insensitive and -n for line numbers. Context lines are not supported; use Read with an offset instead.",
+		func(ctx context.Context, in GrepInput) (string, error) {
+			return grepFiles(in)
 		},
 	)
 	return t
