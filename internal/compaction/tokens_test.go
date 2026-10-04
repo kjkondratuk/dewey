@@ -31,7 +31,7 @@ func TestEstimateTokens_EmptyHistory(t *testing.T) {
 func TestEstimateTokens_CountsToolCallsAndResults(t *testing.T) {
 	withToolCall := []*schema.Message{
 		{Role: schema.Assistant, ToolCalls: []schema.ToolCall{{
-			Function: schema.FunctionCall{Name: "run_shell_command", Arguments: `{"command":"ls -la /some/long/path/here"}`},
+			Function: schema.FunctionCall{Name: "Bash", Arguments: `{"command":"ls -la /some/long/path/here"}`},
 		}}},
 	}
 	withoutToolCall := []*schema.Message{{Role: schema.Assistant}}

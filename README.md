@@ -11,6 +11,7 @@ It is a single Go binary with a TUI. No daemon, no database.
 ## Contents
 
 - [Quick start](#quick-start)
+- [Tools](#tools)
 - [How the model is chosen](#how-the-model-is-chosen)
 - [Bionic / LM Studio](#bionic--lm-studio)
 - [Other providers](#other-providers)
@@ -51,6 +52,64 @@ contacting the server, so a wrong id or an unreachable server surfaces as a red
 error block on your first message rather than as a startup failure. If dewey
 launches cleanly and then errors the moment you say anything, check the model id
 first.
+
+## Tools
+
+The names match Claude Code's deliberately, so skills and subagents written for
+it can run here unchanged once that work lands.
+
+| Tool | What it does | Approval |
+| --- | --- | --- |
+| `Bash` | Runs a shell command via `sh -c` | Per the shell rules below |
+| `Read` | Reads a file with line numbers, 2000 lines by default | Usually silent — see below |
+| `Write` | Replaces a file's contents entirely | Always prompts |
+| `Edit` | Exact string replacement in a file | Always prompts |
+| `Grep` | Regex search over file contents, ripgrep when available | Usually silent — see below |
+| `Glob` | Finds files by glob pattern, `**` supported | Usually silent — see below |
+| `remember` | Saves a preference to your profile | Always prompts |
+
+`Write` and `Edit` are pinned to `always_write_tools`, so they prompt no matter
+what the classifier thinks.
+
+### Why reads are usually silent, and when they are not
+
+`Read`, `Grep`, and `Glob` have no write path at all, so classifying them wastes
+a model round-trip and a local model rating one of them "moderate" would prompt
+you to approve a directory listing. They skip classification entirely — but
+**only for targets inside the project root**.
+
+"Cannot write" is not the same as "cannot harm". An unconfined reader can lift a
+private key or an API token into the model's context, which is exactly the
+safe-but-risky case the approval gate exists to catch. So a read outside the
+project root is classified like anything else and may ask for approval. The read
+still happens; it just has to be approved, the same as `cat` would be.
+
+Symlinks are resolved on both sides before the comparison, so a link inside the
+repo pointing at `~/.ssh` does not inherit the fast path. Anything that cannot
+be established — an unreadable path, an unresolvable root — fails closed and
+gets classified.
+
+One case worth knowing: a root broad enough to contain your home directory is
+rejected outright. `ProjectRoot` stops its upward walk at a `.dewey` directory,
+so in a directory with no `.git` or `.dewey` of its own the "project" resolves
+to `$HOME` — which would put `~/.ssh` inside it. Reads there always consult the
+classifier. A `.dewey/` in the directory you are working in anchors the root and
+restores the fast path.
+
+### Read before modify
+
+`Write` and `Edit` refuse to touch an **existing** file that has not been read
+this session, and refuse again if it changed on disk since that read. Creating a
+new file needs no prior read.
+
+This exists because `Edit` requires `old_string` to match exactly once. Without
+the precondition a stale `old_string` either fails to match or matches something
+the model did not intend — and in the second case the tool reports success, the
+file still compiles, and nothing downstream can tell the wrong line changed. The
+error tells the model to read the file again, which is the fix.
+
+`Edit` also refuses an `old_string` appearing more than once unless `replace_all`
+is set, rather than editing the first occurrence.
 
 ## How the model is chosen
 
@@ -179,7 +238,39 @@ dewey queries this at startup (2-second timeout) and prefers
 supports is common. Failure is silent and expected on any other provider — it
 is a convenience, not a requirement.
 
-Every other provider needs `context_window` set by hand; see below.
+When the model is **not loaded**, `loaded_context_length` is null and only
+`max_context_length` is available. That number is the architecture's ceiling,
+which is not *necessarily* what the server will serve — load the same model
+with a smaller context and the two differ by more than an order of magnitude
+(256K advertised here; 1M for some models). Taking it at face value when it is
+wrong means dewey believes it has far more room than it does, never compacts,
+and fails at the provider instead. So a window known only from
+`max_context_length` is treated as a hint and clamped to 32768.
+
+**This only applies to a cold start, and it costs nothing.** If the model is
+already loaded when dewey launches, `loaded_context_length` is populated and
+used directly — the clamp never runs. If it is cold, the clamp is provisional:
+compaction is skipped on the first turn regardless, and the refresh below lands
+at the end of that same turn, so the real window is in place before any
+compaction check can happen. The clamp only has an effect if the refresh also
+fails, where erring low is the safe direction.
+
+That clamp is not permanent. After the provider successfully serves its first
+request — which means the model is now loaded — dewey asks once more, adopts
+the real `loaded_context_length`, and says so:
+
+```
+Context window updated from ~32768 to 262144 tokens now that the model is loaded.
+```
+
+So launching dewey against an idle server costs one conservative turn, not a
+conservative session. The one case it stays put is when the window was already
+lowered by a provider rejection (see context compaction below): a rejection is
+direct evidence about what the server will serve, so it outranks discovery.
+
+A `context_window` you set by hand always wins over both, and is the escape
+hatch when these heuristics are wrong. Every other provider needs it set; see
+below.
 
 ## Other providers
 
@@ -198,7 +289,7 @@ models:
 
 Two requirements, both non-negotiable:
 
-- **Tool calling.** dewey's only tool for doing work is `run_shell_command`. A
+- **Tool calling.** Every tool dewey has is a tool call — see Tools below. A
   model that cannot emit tool calls will talk about running commands without
   ever running one.
 - **Streaming.** Replies are streamed; a server that only supports
@@ -278,10 +369,8 @@ it ungated.
 
 ## Tool safety and approval
 
-dewey has one tool for doing work — `run_shell_command`, which runs a command
-via `sh -c` and returns combined stdout/stderr plus the exit code — and one for
-remembering things. There is no sandbox. The protection is that you approve
-anything risky.
+dewey's tools can run commands and change files (see Tools above). There is no
+sandbox. The protection is that you approve anything risky.
 
 Before each tool call runs, the `simple` model classifies it along two axes —
 whether it **writes**, and how risky it is:
@@ -312,7 +401,7 @@ because telling it apart from `git reset --hard` needs real subcommand parsing
 A prompt looks like this:
 
 ```
-run_shell_command wants to run (WRITE) [risk: dangerous]
+Bash wants to run (WRITE) [risk: dangerous]
 
 Permanently deletes the project's build output folder and everything inside it.
 
@@ -362,6 +451,26 @@ The summarizer is instructed to preserve goals, decisions, discovered facts
 (file paths, commands, error messages), in-progress work, and open questions,
 and to drop conversational filler. Your current message is never summarized —
 only history before it.
+
+### If the provider rejects the request anyway
+
+The 90% trigger only works if the believed window is right. When it is too
+large — see the clamping note under context-window auto-detection — the
+threshold never fires and the provider rejects the request instead. dewey
+treats that rejection as a compaction signal: it summarizes, lowers its
+assumed window to what the rejected request measured, retries once, and says
+so:
+
+```
+The provider rejected the request as too long for its context window.
+Compacted and retrying; assuming ~32768 tokens from here.
+```
+
+One attempt per turn. If the retry is rejected too, the error surfaces
+normally rather than compacting in a loop. Detection is by error-message text,
+since OpenAI-compatible servers share no error code for this, so an unfamiliar
+provider may word it in a way dewey does not recognize — in which case set
+`context_window` by hand.
 
 ## Long-term memory
 
@@ -545,7 +654,7 @@ Design documents and implementation plans are under `docs/superpowers/`.
 
 ## Current limitations
 
-- **No sandbox.** `run_shell_command` runs with your full user privileges.
+- **No sandbox.** `Bash` runs with your full user privileges.
   Approval prompts are the only guard, and the risk classification comes from a
   local model's judgement.
 - **`hard` and `embedding` tiers do nothing.** They are parsed and resolved but

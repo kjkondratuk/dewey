@@ -28,8 +28,14 @@ go.work.sum
 .env
 
 # Editor/IDE
-# .idea/
+.idea/
 # .vscode/
+
+# Local agent/tooling state. These hold per-machine settings and caches, not
+# project configuration. If a shared .claude/settings.json is ever wanted,
+# narrow this to .claude/settings.local.json.
+.claude/
+.serena/
 
 # Compiled binary (module name has no extension, so the patterns above miss it)
 /dewey

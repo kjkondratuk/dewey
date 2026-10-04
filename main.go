@@ -15,6 +15,7 @@ import (
 	"github.com/kjkondratuk/dewey/internal/app"
 	"github.com/kjkondratuk/dewey/internal/compaction"
 	"github.com/kjkondratuk/dewey/internal/config"
+	"github.com/kjkondratuk/dewey/internal/files"
 	"github.com/kjkondratuk/dewey/internal/memory"
 	"github.com/kjkondratuk/dewey/internal/safety"
 	tools2 "github.com/kjkondratuk/dewey/internal/tools"
@@ -43,7 +44,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to create simple model: %v", err)
 	}
-	classifier := safety.NewLLMClassifier(simpleModel, cfg.ShellRules)
+	classifier := safety.NewLLMClassifier(simpleModel, cfg.ShellRules, config.ProjectRoot(cwd))
 	summarizer := compaction.NewLLMSummarizer(simpleModel)
 	contextWindow := config.DiscoverContextWindow(ctx, cfg.Intermediate)
 
@@ -62,7 +63,10 @@ func main() {
 	}
 
 	// register tools
-	tools := tools2.NewToolFactory(toolRecorder).DefaultInvokableToolset()
+	// One tracker per session: Write and Edit consult it to refuse modifying a
+	// file that was not read first.
+	tracker := files.NewTracker()
+	tools := tools2.NewToolFactory(toolRecorder, tracker).DefaultInvokableToolset()
 	infos := make([]*schema.ToolInfo, len(tools))
 	for i, t := range tools {
 		var err error
@@ -77,7 +81,13 @@ func main() {
 	}
 
 	agt := agent.New(tm, tools, classifier, contextWindow, summarizer).
-		WithSystemPrompt(systemPrompt)
+		WithSystemPrompt(systemPrompt).
+		// Startup discovery runs before any request, so the model is often
+		// not loaded yet and contextWindow above may be a clamped guess. Once
+		// the provider serves a request the real window is observable.
+		WithContextWindowRefresher(func(ctx context.Context) (int, bool) {
+			return config.RefreshContextWindow(ctx, cfg.Intermediate)
+		})
 
 	prog := tea.NewProgram(initModel(agt, notices))
 	_, err = prog.Run()

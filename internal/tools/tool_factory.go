@@ -2,12 +2,10 @@ package tools
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"os/exec"
 
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/components/tool/utils"
+	"github.com/kjkondratuk/dewey/internal/files"
 )
 
 type ToolCreator interface {
@@ -23,18 +21,16 @@ type MemoryRecorder interface {
 
 type ToolFactory struct {
 	recorder MemoryRecorder
+	tracker  *files.Tracker
 }
 
 var _ ToolCreator = (*ToolFactory)(nil)
 
 // NewToolFactory builds the toolset. A nil recorder omits the remember tool,
-// which is how memory stays disabled.
-func NewToolFactory(recorder MemoryRecorder) *ToolFactory {
-	return &ToolFactory{recorder: recorder}
-}
-
-type ShellCommandInput struct {
-	Command string `json:"command" jsonschema:"required,description=The shell command to execute via sh -c"`
+// which is how memory stays disabled. tracker is required: Write and Edit
+// refuse to modify a file that was not read through it first.
+func NewToolFactory(recorder MemoryRecorder, tracker *files.Tracker) *ToolFactory {
+	return &ToolFactory{recorder: recorder, tracker: tracker}
 }
 
 // RememberInput is deliberately missing an org field. The org is the gate that
@@ -42,55 +38,51 @@ type ShellCommandInput struct {
 // the detected context; a model that could set it could also set it wrongly,
 // and the failure would be silent.
 type RememberInput struct {
-	Text string `json:"text" jsonschema:"required,description=The fact or preference to remember, as one self-contained sentence of plain prose"`
+	// Descriptions here must contain no commas: a comma inside a
+	// jsonschema:"description=..." tag truncates it at that point, which is
+	// how this field once reached the model as "The fact or preference to
+	// remember" with its guidance silently removed.
+	Text string `json:"text" jsonschema:"required,description=The fact or preference to remember - one self-contained sentence of plain prose"`
 	// The tag vocabulary is fixed because tags narrow a memory by matching
 	// what is detected in a directory. A tag outside it matches nothing
 	// anywhere, so an invented one would be silently discarded.
-	Tags []string `json:"tags" jsonschema:"description=Optional. Limits the memory to certain stacks. Only these values are meaningful: go, node, rust, python. Omit entirely for a preference that applies to all work - this is usually correct"`
+	Tags []string `json:"tags,omitempty" jsonschema:"description=Optional. Limits the memory to certain stacks. The only meaningful values are go / node / rust / python. Omit entirely for a preference that applies to all work - this is usually correct"`
 	// A boolean rather than an org name: the model can say "here" but can
 	// never name a different organization.
-	ThisOrgOnly bool `json:"this_org_only" jsonschema:"description=Optional. Set true only when the fact is specific to the current client or employer rather than to the user generally. Defaults to false - most preferences follow the user everywhere"`
+	ThisOrgOnly bool `json:"this_org_only,omitempty" jsonschema:"description=Optional. Set true only when the fact is specific to the current client or employer rather than to the user generally. Defaults to false - most preferences follow the user everywhere"`
 }
 
 func (f *ToolFactory) DefaultInvokableToolset() []tool.InvokableTool {
-	shellCommand, _ := utils.InferTool(
-		"run_shell_command",
-		"Executes a shell command via sh -c and returns its combined stdout+stderr output plus exit code. Use this for reading/writing files, listing directories, making network requests, or any other command-line operation.",
-		func(ctx context.Context, in ShellCommandInput) (string, error) {
-			cmd := exec.CommandContext(ctx, "sh", "-c", in.Command)
-			output, err := cmd.CombinedOutput()
-
-			var exitErr *exec.ExitError
-			if err != nil && !errors.As(err, &exitErr) {
-				return "", err
-			}
-
-			exitCode := 0
-			if exitErr != nil {
-				exitCode = exitErr.ExitCode()
-			}
-
-			return fmt.Sprintf("%s\nexit code: %d", output, exitCode), nil
-		},
-	)
-
-	toolset := []tool.InvokableTool{shellCommand}
+	toolset := []tool.InvokableTool{
+		newBashTool(),
+		newReadTool(f.tracker),
+		newWriteTool(f.tracker),
+		newEditTool(f.tracker),
+		newGrepTool(),
+		newGlobTool(),
+	}
 
 	if f.recorder != nil {
-		remember, _ := utils.InferTool(
-			"remember",
-			"Saves a durable fact or preference about the user to their personal profile, which persists across projects and sessions. Use for how the user wants work done, not for facts about the current codebase.",
-			func(ctx context.Context, in RememberInput) (string, error) {
-				if err := f.recorder.RecordScoped(ctx, in.Text, in.Tags, in.ThisOrgOnly); err != nil {
-					return "", err
-				}
-				return "Saved.", nil
-			},
-		)
-		toolset = append(toolset, remember)
+		toolset = append(toolset, newRememberTool(f.recorder))
 	}
 
 	return toolset
+}
+
+// newRememberTool builds the memory tool. Separated from the factory like the
+// other five constructors so its schema can be asserted directly.
+func newRememberTool(recorder MemoryRecorder) tool.InvokableTool {
+	t, _ := utils.InferTool(
+		"remember",
+		"Saves a durable fact or preference about the user to their personal profile, which persists across projects and sessions. Use for how the user wants work done, not for facts about the current codebase.",
+		func(ctx context.Context, in RememberInput) (string, error) {
+			if err := recorder.RecordScoped(ctx, in.Text, in.Tags, in.ThisOrgOnly); err != nil {
+				return "", err
+			}
+			return "Saved.", nil
+		},
+	)
+	return t
 }
 
 func (f *ToolFactory) DefaultStreamToolset() []tool.StreamableTool {

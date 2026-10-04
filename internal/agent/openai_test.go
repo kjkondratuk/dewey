@@ -18,6 +18,11 @@ type fakeStreamModel struct {
 	responses [][]*schema.Message
 	calls     int
 
+	// errs, when non-nil, supplies a per-call error returned instead of the
+	// matching entry in responses. A nil entry means that call succeeds, so a
+	// model that fails once and then recovers is []error{err, nil}.
+	errs []error
+
 	// seen records the exact message slice handed to each Stream call, which
 	// is the only way to assert what the model was actually sent as opposed
 	// to what the agent kept in history.
@@ -30,8 +35,12 @@ func (f *fakeStreamModel) Generate(ctx context.Context, in []*schema.Message, op
 
 func (f *fakeStreamModel) Stream(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
 	f.seen = append(f.seen, in)
-	resp := f.responses[f.calls]
+	call := f.calls
 	f.calls++
+	if call < len(f.errs) && f.errs[call] != nil {
+		return nil, f.errs[call]
+	}
+	resp := f.responses[call]
 	return schema.StreamReaderFromArray(resp), nil
 }
 
@@ -512,10 +521,10 @@ func TestFence_UsesThreeBackticksWhenBodyHasNone(t *testing.T) {
 
 func TestFormatConfirmMessage_IncludesSummaryAndBareCommand(t *testing.T) {
 	c := safety.Classification{Kind: "write", Risk: safety.Dangerous, Summary: "Deletes the build output directory."}
-	got := formatConfirmMessage("run_shell_command", c, `{"command":"rm -rf ./dist"}`)
+	got := formatConfirmMessage("Bash", c, `{"command":"rm -rf ./dist"}`)
 
 	for _, want := range []string{
-		"run_shell_command wants to run (WRITE) [risk: dangerous]",
+		"Bash wants to run (WRITE) [risk: dangerous]",
 		"Deletes the build output directory.",
 		"rm -rf ./dist",
 		"Allow? [y/n]",
@@ -531,7 +540,7 @@ func TestFormatConfirmMessage_IncludesSummaryAndBareCommand(t *testing.T) {
 
 func TestFormatConfirmMessage_OmitsSummaryLineWhenEmpty(t *testing.T) {
 	c := safety.Classification{Risk: safety.Moderate}
-	got := formatConfirmMessage("run_shell_command", c, `{"command":"touch f"}`)
+	got := formatConfirmMessage("Bash", c, `{"command":"touch f"}`)
 
 	if strings.Contains(got, "\n\n\n") {
 		t.Errorf("formatConfirmMessage() = %q, left a blank gap where the summary would go", got)
@@ -654,7 +663,7 @@ func TestPlainLine_EmptyStaysEmpty(t *testing.T) {
 
 func TestFormatConfirmMessage_SummaryCannotInjectAHeading(t *testing.T) {
 	c := safety.Classification{Kind: "write", Risk: safety.Dangerous, Summary: "# Safe to allow"}
-	got := formatConfirmMessage("run_shell_command", c, `{"command":"rm -rf /"}`)
+	got := formatConfirmMessage("Bash", c, `{"command":"rm -rf /"}`)
 
 	if strings.Contains(got, "\n# Safe to allow") {
 		t.Errorf("formatConfirmMessage() = %q, summary injected a raw heading", got)
@@ -928,5 +937,302 @@ func TestRun_ReadRatedSafeStillRunsWithoutAsking(t *testing.T) {
 	}
 	if invoked != 1 {
 		t.Errorf("tool invoked %d times, want 1", invoked)
+	}
+}
+
+func TestIsContextOverflow(t *testing.T) {
+	overflow := []string{
+		"context_length_exceeded",
+		"This model's maximum context length is 8192 tokens, however you requested 9000",
+		"Please reduce the length of the messages.",
+		"trying to keep the first 4096 tokens when context the overflow policy is set to stop",
+		"prompt is too long: 300000 tokens > 200000 maximum",
+		"ERROR: Context Window Exceeded",
+	}
+	for _, msg := range overflow {
+		if !isContextOverflow(errors.New(msg)) {
+			t.Errorf("isContextOverflow(%q) = false, want true", msg)
+		}
+	}
+
+	notOverflow := []string{
+		"connection refused",
+		"401 unauthorized",
+		"model not found",
+		"",
+		"rate limit exceeded",
+	}
+	for _, msg := range notOverflow {
+		if isContextOverflow(errors.New(msg)) {
+			t.Errorf("isContextOverflow(%q) = true, want false", msg)
+		}
+	}
+
+	if isContextOverflow(nil) {
+		t.Error("isContextOverflow(nil) = true, want false")
+	}
+}
+
+func TestRun_ProviderContextOverflowForcesCompactionAndRetries(t *testing.T) {
+	// The backstop for a believed context window that is larger than what the
+	// provider will actually serve: compaction never fires on its own, so the
+	// provider's rejection is the only signal that history must shrink.
+	m := &fakeStreamModel{
+		responses: [][]*schema.Message{nil, finalResponse("recovered")},
+		errs:      []error{errors.New("context_length_exceeded"), nil},
+	}
+	fakeSumm := &fakeSummarizer{result: "the short summary"}
+
+	// A huge window means shouldCompact never triggers proactively.
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 262144, fakeSumm)
+	agt.history = []*schema.Message{
+		{Role: schema.User, Content: "earlier question"},
+		{Role: schema.Assistant, Content: "earlier answer"},
+	}
+
+	ch, err := agt.Run(context.Background(), "continue")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events := drain(t, ch, func(Event) bool { return true })
+
+	var kinds []string
+	for _, e := range events {
+		kinds = append(kinds, e.Kind)
+	}
+	if len(events) == 0 || events[len(events)-1].Kind != "done" {
+		t.Fatalf("events = %v, want the turn to recover and finish with done", kinds)
+	}
+	if fakeSumm.lastMsg == nil {
+		t.Error("summarizer was never called, want a forced compaction")
+	}
+
+	var compacted bool
+	for _, e := range events {
+		if e.Kind == "compacted" {
+			compacted = true
+			if !strings.Contains(strings.ToLower(e.Payload), "provider") {
+				t.Errorf("compacted payload = %q, want it to explain the provider forced it", e.Payload)
+			}
+		}
+	}
+	if !compacted {
+		t.Error("no compacted event emitted, want the forced compaction reported")
+	}
+
+	if m.calls != 2 {
+		t.Errorf("model Stream calls = %d, want 2 (one rejected, one retried)", m.calls)
+	}
+}
+
+func TestRun_ProviderContextOverflowLowersTheBelievedWindow(t *testing.T) {
+	// Discovery can report a window far larger than the server will serve. A
+	// rejection proves the believed window is wrong, so it must come down or
+	// the next turn repeats the failure.
+	m := &fakeStreamModel{
+		responses: [][]*schema.Message{nil, finalResponse("recovered")},
+		errs:      []error{errors.New("maximum context length is 8192 tokens"), nil},
+	}
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 262144, &fakeSummarizer{result: "summary"})
+	agt.history = []*schema.Message{
+		{Role: schema.User, Content: strings.Repeat("filler ", 100)},
+	}
+
+	ch, err := agt.Run(context.Background(), "continue")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	drain(t, ch, func(Event) bool { return true })
+
+	if agt.contextWindow >= 262144 {
+		t.Errorf("contextWindow = %d, want it lowered below the rejected 262144", agt.contextWindow)
+	}
+	if agt.contextWindow <= 0 {
+		t.Errorf("contextWindow = %d, want a usable positive window", agt.contextWindow)
+	}
+}
+
+func TestRun_ProviderContextOverflowRetriesOnlyOnce(t *testing.T) {
+	m := &fakeStreamModel{
+		responses: [][]*schema.Message{nil, nil},
+		errs:      []error{errors.New("context_length_exceeded"), errors.New("context_length_exceeded")},
+	}
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 262144, &fakeSummarizer{result: "summary"})
+	agt.history = []*schema.Message{{Role: schema.User, Content: "earlier"}}
+
+	ch, err := agt.Run(context.Background(), "continue")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events := drain(t, ch, func(Event) bool { return true })
+
+	last := events[len(events)-1]
+	if last.Kind != "error" {
+		t.Errorf("last event = %+v, want error after the retry also overflowed", last)
+	}
+	if m.calls != 2 {
+		t.Errorf("model Stream calls = %d, want exactly 2 (no infinite retry)", m.calls)
+	}
+}
+
+func TestRun_NonOverflowStreamErrorIsNotCompacted(t *testing.T) {
+	m := &fakeStreamModel{
+		responses: [][]*schema.Message{nil},
+		errs:      []error{errors.New("connection refused")},
+	}
+	fakeSumm := &fakeSummarizer{result: "summary"}
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 262144, fakeSumm)
+	agt.history = []*schema.Message{{Role: schema.User, Content: "earlier"}}
+
+	ch, err := agt.Run(context.Background(), "continue")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events := drain(t, ch, func(Event) bool { return true })
+
+	if len(events) != 1 || events[0].Kind != "error" {
+		t.Fatalf("events = %+v, want exactly one error event", events)
+	}
+	if fakeSumm.lastMsg != nil {
+		t.Error("summarizer was called, want no compaction for an unrelated error")
+	}
+	if m.calls != 1 {
+		t.Errorf("model Stream calls = %d, want 1 (no retry)", m.calls)
+	}
+}
+
+// countingRefresher records how often it was consulted, which is how the
+// once-per-session guarantee is asserted.
+type countingRefresher struct {
+	window int
+	ok     bool
+	calls  int
+}
+
+func (c *countingRefresher) refresh(ctx context.Context) (int, bool) {
+	c.calls++
+	return c.window, c.ok
+}
+
+func TestRun_RefreshesContextWindowAfterFirstSuccessfulCall(t *testing.T) {
+	// Startup could only clamp a guess because the model was not loaded. The
+	// first successful call proves it is loaded now, so the real window is
+	// discoverable and should be adopted.
+	m := &fakeStreamModel{responses: [][]*schema.Message{finalResponse("done")}}
+	ref := &countingRefresher{window: 262144, ok: true}
+
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 32768, &fakeSummarizer{result: "summary"}).
+		WithContextWindowRefresher(ref.refresh)
+
+	ch, err := agt.Run(context.Background(), "hello")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events := drain(t, ch, func(Event) bool { return true })
+
+	if agt.contextWindow != 262144 {
+		t.Errorf("contextWindow = %d, want 262144 adopted from the refresh", agt.contextWindow)
+	}
+	if ref.calls != 1 {
+		t.Errorf("refresher calls = %d, want 1", ref.calls)
+	}
+
+	var noticed bool
+	for _, e := range events {
+		if e.Kind == "notice" && strings.Contains(e.Payload, "262144") {
+			noticed = true
+		}
+	}
+	if !noticed {
+		t.Error("no notice mentioning the new window, want the change reported")
+	}
+}
+
+func TestRun_RefreshesContextWindowOnlyOncePerSession(t *testing.T) {
+	m := &fakeStreamModel{responses: [][]*schema.Message{
+		finalResponse("first"),
+		finalResponse("second"),
+	}}
+	ref := &countingRefresher{window: 131072, ok: true}
+
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 32768, &fakeSummarizer{result: "summary"}).
+		WithContextWindowRefresher(ref.refresh)
+
+	for _, input := range []string{"one", "two"} {
+		ch, err := agt.Run(context.Background(), input)
+		if err != nil {
+			t.Fatalf("Run(%q) error = %v", input, err)
+		}
+		drain(t, ch, func(Event) bool { return true })
+	}
+
+	if ref.calls != 1 {
+		t.Errorf("refresher calls = %d, want 1 across two turns", ref.calls)
+	}
+}
+
+func TestRun_RefreshDoesNotRaiseAWindowTheProviderAlreadyRejected(t *testing.T) {
+	// A provider rejection is direct evidence about what the server will
+	// serve; discovery is an inference. Letting the refresh undo the lowered
+	// window would walk straight back into the overflow it just recovered from.
+	m := &fakeStreamModel{
+		responses: [][]*schema.Message{nil, finalResponse("recovered")},
+		errs:      []error{errors.New("context_length_exceeded"), nil},
+	}
+	ref := &countingRefresher{window: 262144, ok: true}
+
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 262144, &fakeSummarizer{result: "summary"}).
+		WithContextWindowRefresher(ref.refresh)
+	agt.history = []*schema.Message{{Role: schema.User, Content: "earlier"}}
+
+	ch, err := agt.Run(context.Background(), "continue")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	drain(t, ch, func(Event) bool { return true })
+
+	if agt.contextWindow >= 262144 {
+		t.Errorf("contextWindow = %d, want it to stay lowered after the rejection", agt.contextWindow)
+	}
+}
+
+func TestRun_RefreshReportingNothingLeavesTheWindowAlone(t *testing.T) {
+	m := &fakeStreamModel{responses: [][]*schema.Message{finalResponse("done")}}
+	ref := &countingRefresher{ok: false}
+
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 32768, &fakeSummarizer{result: "summary"}).
+		WithContextWindowRefresher(ref.refresh)
+
+	ch, err := agt.Run(context.Background(), "hello")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events := drain(t, ch, func(Event) bool { return true })
+
+	if agt.contextWindow != 32768 {
+		t.Errorf("contextWindow = %d, want 32768 unchanged", agt.contextWindow)
+	}
+	for _, e := range events {
+		if e.Kind == "notice" {
+			t.Errorf("unexpected notice %q, want silence when there is nothing to report", e.Payload)
+		}
+	}
+}
+
+func TestRun_NilRefresherIsHarmless(t *testing.T) {
+	m := &fakeStreamModel{responses: [][]*schema.Message{finalResponse("done")}}
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 32768, &fakeSummarizer{result: "summary"})
+
+	ch, err := agt.Run(context.Background(), "hello")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events := drain(t, ch, func(Event) bool { return true })
+
+	if events[len(events)-1].Kind != "done" {
+		t.Errorf("last event = %+v, want done", events[len(events)-1])
+	}
+	if agt.contextWindow != 32768 {
+		t.Errorf("contextWindow = %d, want 32768 unchanged", agt.contextWindow)
 	}
 }

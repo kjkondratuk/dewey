@@ -79,6 +79,16 @@ type openaiAgent struct {
 	// lastNotices is the set already shown, so a steady-state problem is
 	// reported once rather than before every model call.
 	lastNotices []string
+
+	// refreshWindow re-resolves the context window once the provider has
+	// served a request; windowRefreshed makes that once per session.
+	refreshWindow   ContextWindowRefresher
+	windowRefreshed bool
+
+	// windowFromRejection records that contextWindow was learned from a
+	// provider rejecting a request as too long, which outranks anything
+	// discovery can infer afterwards.
+	windowFromRejection bool
 }
 
 // New builds an agent backed by cm, which must already have the tool schemas
@@ -114,6 +124,22 @@ func New(
 		contextWindow: contextWindow,
 		summarizer:    summarizer,
 	}
+}
+
+// ContextWindowRefresher re-resolves the model's context window. The bool
+// reports whether the value is a trustworthy measurement; false means
+// "nothing better than what you already have". It is a function rather than
+// an interface so the agent stays independent of how the window is
+// discovered — see config.RefreshContextWindow for the LM Studio
+// implementation.
+type ContextWindowRefresher func(ctx context.Context) (int, bool)
+
+// WithContextWindowRefresher attaches a refresher consulted once per session,
+// after the first successfully served request. Separate from New so existing
+// call sites and their tests stay unchanged.
+func (a *openaiAgent) WithContextWindowRefresher(f ContextWindowRefresher) *openaiAgent {
+	a.refreshWindow = f
+	return a
 }
 
 // WithSystemPrompt attaches a system prompt provider. Separate from New so the
@@ -172,6 +198,11 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 				estimated, a.contextWindow, 100*float64(estimated)/float64(a.contextWindow))}
 		}
 
+		// forcedCompaction limits the provider-overflow backstop below to one
+		// attempt per turn, so a server that rejects every request fails
+		// rather than compacting in a loop.
+		forcedCompaction := false
+
 		// Each iteration is one full model turn: stream a response, then run
 		// any tool calls it asked for. Loops back around with the tool
 		// results appended to history until the model stops calling tools.
@@ -191,6 +222,35 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 
 			sr, err := a.cm.Stream(ctx, outbound)
 			if err != nil {
+				// Backstop for a believed context window larger than the one
+				// the provider actually serves — see DiscoverContextWindow,
+				// which can only infer the window from a model's advertised
+				// architectural maximum when that model is not yet loaded. In
+				// that state shouldCompact never fires, so the rejection is
+				// the only signal that history has to shrink.
+				//
+				// Only the request-time error is handled: an oversized prompt
+				// is rejected before generation starts. An overflow surfacing
+				// mid-stream, after content has been emitted, is about output
+				// length and compaction would not help.
+				if !forcedCompaction && truncateLen > 0 && isContextOverflow(err) {
+					forcedCompaction = true
+
+					evt, cerr := a.forceCompact(ctx, truncateLen)
+					if cerr != nil {
+						if errors.Is(cerr, context.Canceled) {
+							a.history = a.history[:truncateLen]
+							ch <- Event{Kind: "cancelled"}
+							return
+						}
+						ch <- Event{Kind: "error", Payload: "compaction after a context overflow failed: " + cerr.Error()}
+						return
+					}
+
+					ch <- evt
+					continue
+				}
+
 				ch <- Event{Kind: "error", Payload: err.Error()}
 				return
 			}
@@ -231,6 +291,12 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 			}
 			a.history = append(a.history, full)
 			a.recordUsage(full)
+
+			// The provider just served a request, so the model is loaded and
+			// its real window is discoverable for the first time.
+			if notice := a.refreshContextWindow(ctx); notice != "" {
+				ch <- Event{Kind: "notice", Payload: notice}
+			}
 
 			if len(full.ToolCalls) == 0 {
 				ch <- Event{Kind: "done"}
@@ -366,6 +432,41 @@ func (a *openaiAgent) estimateTokens() int {
 	return total + compaction.EstimateTokens(a.history)
 }
 
+// refreshContextWindow re-resolves the context window once per session, after
+// the provider has successfully served a request. At startup the model is
+// often not resident, so DiscoverContextWindow can do no better than clamp
+// the architectural ceiling; a served request proves the model is loaded and
+// the real window is finally observable. Without this, launching dewey
+// against an idle server means running at the clamp for the whole session.
+//
+// A window already learned from a provider rejection is left alone: that
+// rejection is direct evidence about what the server will serve, discovery is
+// an inference, and raising the window back would walk into the same overflow
+// again.
+//
+// Returns a notice to show the user, or "" when nothing changed.
+func (a *openaiAgent) refreshContextWindow(ctx context.Context) string {
+	if a.refreshWindow == nil || a.windowRefreshed {
+		return ""
+	}
+	a.windowRefreshed = true
+
+	if a.windowFromRejection {
+		return ""
+	}
+
+	window, ok := a.refreshWindow(ctx)
+	if !ok || window == a.contextWindow {
+		return ""
+	}
+
+	previous := a.contextWindow
+	a.contextWindow = window
+	return fmt.Sprintf(
+		"Context window updated from ~%d to %d tokens now that the model is loaded.",
+		previous, window)
+}
+
 // shouldCompact reports whether estimated tokens have crossed
 // compactionThreshold of the context window. Compaction is disabled
 // entirely when contextWindow <= 0.
@@ -396,6 +497,67 @@ func (a *openaiAgent) compact(ctx context.Context, truncateLen int) error {
 	return nil
 }
 
+// contextOverflowMarkers are substrings that identify a provider rejecting a
+// request because the prompt exceeds its context window. There is no standard
+// error code for this across OpenAI-compatible servers, so matching is by
+// message text, lowercased. Add markers as new providers turn up; a missed
+// marker costs the backstop, not correctness.
+var contextOverflowMarkers = []string{
+	"context_length_exceeded",
+	"maximum context length",
+	"context window exceeded",
+	"reduce the length of the messages",
+	"overflow policy",
+	"prompt is too long",
+}
+
+// isContextOverflow reports whether err is a provider complaining that the
+// prompt is too long for its context window, as opposed to any other failure.
+// It is deliberately narrow: treating an unrelated error as an overflow would
+// summarize away real history to no purpose.
+func isContextOverflow(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range contextOverflowMarkers {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// minForcedContextWindow floors the window learned from a provider rejection.
+// The rejection bounds the real limit from above, but a.estimateTokens() can
+// undercount badly when the provider's tokenizer differs from tiktoken, and
+// adopting a tiny window verbatim would compact on every subsequent turn.
+const minForcedContextWindow = 4096
+
+// forceCompact compacts because the provider rejected the request as too long,
+// rather than because the local estimate crossed a threshold. It ignores
+// contextWindow on the way in — the provider has already ruled — and on the
+// way out lowers the believed window, since the rejection proves the current
+// value is an over-estimate. Without that, discovery reporting a window larger
+// than the server will serve means shouldCompact never fires and every turn
+// has to learn the same lesson again.
+func (a *openaiAgent) forceCompact(ctx context.Context, truncateLen int) (Event, error) {
+	estimated := a.estimateTokens()
+
+	if err := a.compact(ctx, truncateLen); err != nil {
+		return Event{}, err
+	}
+
+	if learned := max(minForcedContextWindow, estimated); a.contextWindow <= 0 || learned < a.contextWindow {
+		a.contextWindow = learned
+		a.windowFromRejection = true
+	}
+
+	return Event{Kind: "compacted", Payload: fmt.Sprintf(
+		"The provider rejected the request as too long for its context window. "+
+			"Compacted and retrying; assuming ~%d tokens from here.", a.contextWindow)}, nil
+}
+
 func prettyPrintArgs(argsJSON string) string {
 	var buf bytes.Buffer
 	if err := json.Indent(&buf, []byte(argsJSON), "", "  "); err == nil {
@@ -405,7 +567,7 @@ func prettyPrintArgs(argsJSON string) string {
 }
 
 // describeArgs renders tool arguments for a human reader. A lone string
-// argument — the shape of run_shell_command's {"command": "..."} — is returned
+// argument — the shape of Bash's {"command": "..."} — is returned
 // bare, so a command reads as a command, with real newlines instead of
 // JSON-escaped ones. Anything else falls back to indented JSON rather than
 // risk silently dropping fields.
