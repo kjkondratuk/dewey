@@ -285,3 +285,52 @@ func TestDefaultInvokableToolset_IncludesRememberWithARecorder(t *testing.T) {
 		t.Error("remember missing with a recorder present")
 	}
 }
+
+func TestRememberTool_TagVocabularyReachesTheModel(t *testing.T) {
+	// A comma inside jsonschema:"description=..." truncates it at that comma.
+	// This description listed "go, node, rust, python" and reached the model
+	// as "...Only these values are meaningful: go" — so three of the four
+	// valid tags were invisible, and the whole tag vocabulary the memory
+	// system is built on was unusable. Nothing asserted otherwise, which is
+	// why it survived.
+	info, err := newRememberTool(&fakeRecorder{}).Info(context.Background())
+	if err != nil {
+		t.Fatalf("Info() error = %v", err)
+	}
+	raw, err := json.Marshal(info)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	var parsed struct {
+		JSONSchema struct {
+			Properties map[string]struct {
+				Description string `json:"description"`
+			} `json:"properties"`
+			Required []string `json:"required"`
+		} `json:"json_schema"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+
+	desc := parsed.JSONSchema.Properties["tags"].Description
+	for _, want := range []string{"go", "node", "rust", "python"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("tags description = %q, want it to name the %q tag", desc, want)
+		}
+	}
+
+	// Same truncation, same tool: the text description lost the guidance that
+	// makes a saved memory well-formed.
+	if got := parsed.JSONSchema.Properties["text"].Description; !strings.Contains(got, "self-contained") {
+		t.Errorf("text description = %q, want it to keep the self-contained-sentence guidance", got)
+	}
+
+	// The description tells the model to omit tags for a universal
+	// preference, so the schema must not contradict it by demanding one.
+	for _, name := range parsed.JSONSchema.Required {
+		if name == "tags" || name == "this_org_only" {
+			t.Errorf("required = %v, want %q optional — its own description says to omit it", parsed.JSONSchema.Required, name)
+		}
+	}
+}
