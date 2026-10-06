@@ -65,3 +65,28 @@ func TestToolDeniedDoesNotReadAsAnError(t *testing.T) {
 		t.Errorf("ToolDenied looks like a tool failure: %q", ToolDenied)
 	}
 }
+
+// dewey has Read/Write/Edit/Grep/Glob tools alongside Bash; a prompt that
+// only talks about "running shell commands" nudges the model toward Bash for
+// file work it should do with the specific tools instead.
+func TestSystemBaseDescribesTheSpecificToolsNotJustShell(t *testing.T) {
+	lower := strings.ToLower(SystemBase)
+	for _, want := range []string{"read", "edit", "search"} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("SystemBase does not mention %q; it should describe reading, editing, and searching, not just running commands", want)
+		}
+	}
+}
+
+// The model has no way to recover from its own repetition by generating more
+// output; the one documented failure (a model streaming the same text until
+// the user killed it) was a model that never noticed it was stuck. The
+// prompt must tell it to stop and ask instead.
+func TestSystemBaseInstructsStoppingOnSelfRepetition(t *testing.T) {
+	lower := strings.ToLower(SystemBase)
+	for _, want := range []string{"repeat", "stop", "ask"} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("SystemBase does not mention %q; it should instruct the model to notice repetition and stop to ask for direction", want)
+		}
+	}
+}
