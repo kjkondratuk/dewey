@@ -20,6 +20,7 @@ import (
 	"github.com/kjkondratuk/dewey/internal/config"
 	"github.com/kjkondratuk/dewey/internal/files"
 	"github.com/kjkondratuk/dewey/internal/memory"
+	"github.com/kjkondratuk/dewey/internal/picker"
 	"github.com/kjkondratuk/dewey/internal/safety"
 	"github.com/kjkondratuk/dewey/internal/session"
 	tools2 "github.com/kjkondratuk/dewey/internal/tools"
@@ -28,7 +29,7 @@ import (
 )
 
 func main() {
-	resume := flag.String("resume", "", "resume a previous session by id (or unambiguous id prefix)")
+	resume := flag.Bool("resume", false, "resume a previous session: pass an id (or unambiguous id prefix) as the first argument, or omit it to choose one interactively")
 	listSessions := flag.Bool("sessions", false, "list recorded sessions and exit")
 	noSession := flag.Bool("no-session", false, "do not record this session to disk")
 	flag.Parse()
@@ -88,11 +89,25 @@ func main() {
 	switch {
 	case *noSession:
 		// Recording disabled explicitly; store stays nil.
-	case *resume != "":
-		var sessionNotices []string
-		store, seedHistory, sessionNotices, err = resumeSession(cwd, cfg, contextWindow, *resume)
+	case *resume:
+		id, err := resolveResumeID(flag.Arg(0))
+		if errors.Is(err, errNoSessionsToResume) {
+			fmt.Println("no recorded sessions")
+			return
+		}
 		if err != nil {
-			log.Fatalf("failed to resume session %q: %v", *resume, err)
+			log.Fatal(err)
+		}
+		if id == "" {
+			// The picker ran and the user quit without choosing -- a normal
+			// outcome, not an error, so exit quietly.
+			return
+		}
+
+		var sessionNotices []string
+		store, seedHistory, sessionNotices, err = resumeSession(cwd, cfg, contextWindow, id)
+		if err != nil {
+			log.Fatalf("failed to resume session %q: %v", id, err)
 		}
 		notices = append(notices, sessionNotices...)
 	default:
@@ -184,6 +199,58 @@ func checkToolSupport(ctx context.Context, m config.ModelConfig) error {
 	}
 	msg += "\nset models.intermediate.model in ~/.dewey/config.yaml"
 	return errors.New(msg)
+}
+
+// errNoSessionsToResume signals that --resume was given with no id and
+// there is nothing recorded to choose from. It is distinct from every other
+// resumeTarget error: callers treat it as "print a plain message and exit
+// 0", not as a failure.
+var errNoSessionsToResume = errors.New("no recorded sessions")
+
+// resolveResumeID is the IO-performing wrapper around resumeTarget for
+// --resume with no id already on the command line: it loads the recorded
+// sessions, checks whether stdout is a real terminal, and -- via
+// resumeTarget -- runs the interactive picker when one can be shown.
+func resolveResumeID(id string) (string, error) {
+	if id != "" {
+		return id, nil
+	}
+
+	dir, err := sessionsDir()
+	var sums []session.Summary
+	if err == nil {
+		sums, err = session.Summaries(dir)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	interactive := term.IsTerminal(int(os.Stdout.Fd()))
+	return resumeTarget(id, sums, interactive, picker.Choose)
+}
+
+// resumeTarget decides which session id --resume should resolve to. It is a
+// pure decision, with everything TTY-dependent injected (interactive,
+// choose), so it is testable without a real terminal:
+//
+//   - an id already given is used as-is, without even looking at sums
+//   - no id and no sessions is errNoSessionsToResume -- nothing to choose
+//   - no id, sessions exist, but no terminal to run a picker in is a plain
+//     error asking for an id instead of attempting a TUI that would panic
+//   - no id and a terminal defers to choose; its result (including "",
+//     which means the user quit without choosing -- not an error) is
+//     returned unchanged
+func resumeTarget(id string, sums []session.Summary, interactive bool, choose func([]session.Summary) (string, error)) (string, error) {
+	if id != "" {
+		return id, nil
+	}
+	if len(sums) == 0 {
+		return "", errNoSessionsToResume
+	}
+	if !interactive {
+		return "", errors.New("--resume needs a session id when stdout is not a terminal: pass one, e.g. dewey --resume <id>")
+	}
+	return choose(sums)
 }
 
 // sessionsDir is where session transcripts live: ~/.dewey/sessions. It is a

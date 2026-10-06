@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -306,6 +307,119 @@ func TestResumeSession_UnknownIDReturnsError(t *testing.T) {
 
 	if _, _, _, err := resumeSession("/work/project", config.Config{}, 4096, "nope-does-not-exist"); err == nil {
 		t.Error("resumeSession() error = nil, want an error for an unknown id")
+	}
+}
+
+// resumeTarget is the pure decision at the heart of --resume with no id: it
+// decides whether to use an id already on the command line, report that
+// there is nothing to resume, ask the injected picker, or refuse because
+// there's no terminal to run one in. Everything TTY-dependent is injected,
+// so none of this needs a real terminal to test.
+
+// An id already supplied (e.g. "dewey --resume abc123") is used as-is --
+// the picker never runs.
+func TestResumeTarget_IDGivenReturnsIDWithoutChoosing(t *testing.T) {
+	choose := func([]session.Summary) (string, error) {
+		t.Fatal("choose() called, want the given id used directly")
+		return "", nil
+	}
+
+	id, err := resumeTarget("abc123", nil, true, choose)
+	if err != nil {
+		t.Fatalf("resumeTarget() error = %v", err)
+	}
+	if id != "abc123" {
+		t.Errorf("id = %q, want %q", id, "abc123")
+	}
+}
+
+// No id and no recorded sessions must report that plainly, not launch a
+// picker over an empty list.
+func TestResumeTarget_NoSessionsReturnsErrNoSessionsToResume(t *testing.T) {
+	choose := func([]session.Summary) (string, error) {
+		t.Fatal("choose() called, want no picker over an empty list")
+		return "", nil
+	}
+
+	_, err := resumeTarget("", nil, true, choose)
+	if !errors.Is(err, errNoSessionsToResume) {
+		t.Errorf("err = %v, want errNoSessionsToResume", err)
+	}
+}
+
+// No id, sessions exist, but stdout isn't a terminal: this must fail with a
+// clear error asking for an id, not attempt to run a TUI (which would panic
+// without a TTY) and not silently invent one.
+func TestResumeTarget_NonInteractiveNoIDErrorsClearly(t *testing.T) {
+	sums := []session.Summary{{Header: session.Header{ID: "s1"}}}
+	choose := func([]session.Summary) (string, error) {
+		t.Fatal("choose() called, want no picker without a terminal")
+		return "", nil
+	}
+
+	id, err := resumeTarget("", sums, false, choose)
+	if err == nil {
+		t.Fatal("resumeTarget() error = nil, want an error when stdout is not a terminal")
+	}
+	if errors.Is(err, errNoSessionsToResume) {
+		t.Errorf("err = %v, want a terminal-required error, not errNoSessionsToResume", err)
+	}
+	if id != "" {
+		t.Errorf("id = %q, want empty on error", id)
+	}
+	if !strings.Contains(err.Error(), "id") {
+		t.Errorf("err = %q, want a message that mentions a session id is required", err.Error())
+	}
+}
+
+// Interactive with sessions available: the chosen id flows straight through.
+func TestResumeTarget_InteractivePicksChosenID(t *testing.T) {
+	sums := []session.Summary{{Header: session.Header{ID: "s1"}}, {Header: session.Header{ID: "s2"}}}
+	choose := func(got []session.Summary) (string, error) {
+		if len(got) != 2 {
+			t.Errorf("choose() got %d summaries, want 2", len(got))
+		}
+		return "s2", nil
+	}
+
+	id, err := resumeTarget("", sums, true, choose)
+	if err != nil {
+		t.Fatalf("resumeTarget() error = %v", err)
+	}
+	if id != "s2" {
+		t.Errorf("id = %q, want %q", id, "s2")
+	}
+}
+
+// Quitting the picker without choosing is not an error: the caller should
+// exit cleanly and silently.
+func TestResumeTarget_InteractiveEmptyChoiceReturnsEmptyNoError(t *testing.T) {
+	sums := []session.Summary{{Header: session.Header{ID: "s1"}}}
+	choose := func([]session.Summary) (string, error) {
+		return "", nil
+	}
+
+	id, err := resumeTarget("", sums, true, choose)
+	if err != nil {
+		t.Fatalf("resumeTarget() error = %v, want nil when the user quits the picker", err)
+	}
+	if id != "" {
+		t.Errorf("id = %q, want empty when the user quits the picker", id)
+	}
+}
+
+// A failure running the picker itself propagates rather than being
+// swallowed.
+func TestResumeTarget_ChooseErrorPropagates(t *testing.T) {
+	sums := []session.Summary{{Header: session.Header{ID: "s1"}}}
+	wantErr := errors.New("picker exploded")
+	choose := func([]session.Summary) (string, error) {
+		return "", wantErr
+	}
+
+	_, err := resumeTarget("", sums, true, choose)
+	if !errors.Is(err, wantErr) {
+		t.Errorf("err = %v, want %v", err, wantErr)
 	}
 }
 
