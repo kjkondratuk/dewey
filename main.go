@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"charm.land/bubbles/v2/textinput"
@@ -62,6 +64,16 @@ func main() {
 	classifier := safety.NewLLMClassifier(simpleModel, cfg.ShellRules, config.ProjectRoot(cwd))
 	summarizer := compaction.NewLLMSummarizer(simpleModel)
 	contextWindow := config.DiscoverContextWindow(ctx, cfg.Intermediate)
+
+	// A model that cannot call tools cannot do dewey's job; it will invent
+	// tool results instead. Checked here rather than tolerated because the
+	// failure mode is an unbounded stream of plausible fiction. Only the
+	// intermediate tier is checked: it is the tier tools are bound to below
+	// (intermediateModel.WithTools); simple only classifies and summarizes
+	// and is never given tools.
+	if err := checkToolSupport(ctx, cfg.Intermediate); err != nil {
+		log.Fatal(err)
+	}
 
 	systemPrompt, toolRecorder, provider, notices := buildMemory(cwd, cfg)
 	notices = append(ruleNotices, notices...)
@@ -149,6 +161,29 @@ func main() {
 			log.Printf("session recording error: %v", recErr)
 		}
 	}
+}
+
+// checkToolSupport gates startup on the intermediate tier's ability to call
+// tools, which dewey requires: a model that cannot call tools hallucinates
+// tool results instead of running anything, and with no token limit can
+// generate until the context window fills. Extracted from main() so the
+// fail-open behavior on an unknown or merely-unreachable provider is
+// testable -- an untested fatal path is how that requirement silently
+// becomes fail-closed.
+//
+// Returns nil for config.ToolSupportYes and config.ToolSupportUnknown alike;
+// only config.ToolSupportNo, a definite negative, is an error.
+func checkToolSupport(ctx context.Context, m config.ModelConfig) error {
+	if config.DiscoverToolSupport(ctx, m) != config.ToolSupportNo {
+		return nil
+	}
+	alternatives := config.ToolCapableModels(ctx, m)
+	msg := fmt.Sprintf("model %q does not support tool calling, which dewey requires", m.Model)
+	if len(alternatives) > 0 {
+		msg += fmt.Sprintf("\nmodels on this server that do: %s", strings.Join(alternatives, ", "))
+	}
+	msg += "\nset models.intermediate.model in ~/.dewey/config.yaml"
+	return errors.New(msg)
 }
 
 // sessionsDir is where session transcripts live: ~/.dewey/sessions. It is a

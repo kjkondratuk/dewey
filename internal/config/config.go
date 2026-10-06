@@ -303,10 +303,117 @@ const maxAssumedContextWindow = 32768
 
 type lmStudioModelsResponse struct {
 	Data []struct {
-		ID                  string `json:"id"`
-		MaxContextLength    int    `json:"max_context_length"`
-		LoadedContextLength int    `json:"loaded_context_length"`
+		ID                  string    `json:"id"`
+		MaxContextLength    int       `json:"max_context_length"`
+		LoadedContextLength int       `json:"loaded_context_length"`
+		Capabilities        *[]string `json:"capabilities"`
 	} `json:"data"`
+}
+
+// fetchLMStudioModels issues the shared LM Studio /api/v0/models request used
+// by both context-window and tool-support discovery. The bool reports
+// whether a well-formed response was obtained at all; callers that can't find
+// what they're looking for in parsed.Data still get ok=true and decide for
+// themselves what that means.
+func fetchLMStudioModels(ctx context.Context, m ModelConfig) (lmStudioModelsResponse, bool) {
+	base := strings.TrimSuffix(strings.TrimSuffix(m.BaseURL, "/"), "/v1")
+
+	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, base+"/api/v0/models", nil)
+	if err != nil {
+		return lmStudioModelsResponse{}, false
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return lmStudioModelsResponse{}, false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return lmStudioModelsResponse{}, false
+	}
+
+	var parsed lmStudioModelsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return lmStudioModelsResponse{}, false
+	}
+	return parsed, true
+}
+
+// ToolSupport is what a provider says about a model's ability to call tools.
+type ToolSupport int
+
+const (
+	// ToolSupportUnknown means the provider did not tell us. dewey must not
+	// act on this: most OpenAI-compatible servers expose no such field, and
+	// treating silence as a refusal would lock users out of every provider
+	// except LM Studio.
+	ToolSupportUnknown ToolSupport = iota
+	// ToolSupportYes means the provider advertises tool use.
+	ToolSupportYes
+	// ToolSupportNo means the provider enumerated this model's capabilities
+	// and tool use was not among them.
+	ToolSupportNo
+)
+
+// DiscoverToolSupport asks LM Studio whether m.Model can call tools.
+//
+// dewey cannot do its job with a model that cannot call tools: it will
+// hallucinate tool results instead of running anything, and with no token
+// limit it can generate until the context window fills. That is a failure
+// worth catching at launch rather than halfway through a turn, and the answer
+// is already in the response dewey reads for the context window.
+//
+// Returns ToolSupportUnknown for every provider that does not expose this,
+// which is most of them.
+func DiscoverToolSupport(ctx context.Context, m ModelConfig) ToolSupport {
+	parsed, ok := fetchLMStudioModels(ctx, m)
+	if !ok {
+		return ToolSupportUnknown
+	}
+
+	for _, entry := range parsed.Data {
+		if entry.ID != m.Model {
+			continue
+		}
+		if entry.Capabilities == nil {
+			return ToolSupportUnknown
+		}
+		for _, cap := range *entry.Capabilities {
+			if cap == "tool_use" {
+				return ToolSupportYes
+			}
+		}
+		return ToolSupportNo
+	}
+	return ToolSupportUnknown
+}
+
+// ToolCapableModels returns the models the provider says can call tools, for
+// an error message that tells the user what they can switch to rather than
+// only what is wrong.
+func ToolCapableModels(ctx context.Context, m ModelConfig) []string {
+	parsed, ok := fetchLMStudioModels(ctx, m)
+	if !ok {
+		return nil
+	}
+
+	var names []string
+	for _, entry := range parsed.Data {
+		if entry.Capabilities == nil {
+			continue
+		}
+		for _, cap := range *entry.Capabilities {
+			if cap == "tool_use" {
+				names = append(names, entry.ID)
+				break
+			}
+		}
+	}
+	return names
 }
 
 // DiscoverContextWindow resolves the context window size for m, trying (in
@@ -344,28 +451,8 @@ func DiscoverContextWindow(ctx context.Context, m ModelConfig) int {
 // as a measurement means compaction never fires and the request fails at the
 // provider instead.
 func discoverLMStudioContextWindow(ctx context.Context, m ModelConfig) (window int, exact, ok bool) {
-	base := strings.TrimSuffix(strings.TrimSuffix(m.BaseURL, "/"), "/v1")
-
-	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, base+"/api/v0/models", nil)
-	if err != nil {
-		return 0, false, false
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0, false, false
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return 0, false, false
-	}
-
-	var parsed lmStudioModelsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+	parsed, fetched := fetchLMStudioModels(ctx, m)
+	if !fetched {
 		return 0, false, false
 	}
 

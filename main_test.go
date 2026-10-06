@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -304,5 +306,58 @@ func TestResumeSession_UnknownIDReturnsError(t *testing.T) {
 
 	if _, _, _, err := resumeSession("/work/project", config.Config{}, 4096, "nope-does-not-exist"); err == nil {
 		t.Error("resumeSession() error = nil, want an error for an unknown id")
+	}
+}
+
+// checkToolSupport is the gate main() applies to the intermediate tier before
+// starting the TUI. A model that cannot call tools cannot do dewey's job --
+// it will invent tool results instead -- so this is the definite-negative
+// case that must become an error.
+func TestCheckToolSupport_ErrorsWhenModelCannotCallTools(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"no-tools-model","capabilities":[]}]}`))
+	}))
+	defer srv.Close()
+
+	err := checkToolSupport(context.Background(), config.ModelConfig{BaseURL: srv.URL + "/v1", Model: "no-tools-model"})
+	if err == nil {
+		t.Fatal("checkToolSupport() error = nil, want an error for a model that cannot call tools")
+	}
+	if !strings.Contains(err.Error(), "no-tools-model") {
+		t.Errorf("error = %q, want it to name the model", err.Error())
+	}
+}
+
+// Fail open: a provider that says nothing about capabilities, or doesn't
+// list the model at all, must never block startup.
+func TestCheckToolSupport_NilWhenUnknown(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"some-model","max_context_length":32768}]}`))
+	}))
+	defer srv.Close()
+
+	err := checkToolSupport(context.Background(), config.ModelConfig{BaseURL: srv.URL + "/v1", Model: "some-model"})
+	if err != nil {
+		t.Errorf("checkToolSupport() error = %v, want nil when the provider says nothing about capabilities", err)
+	}
+}
+
+// Fail open: an unreachable provider must never block startup either.
+func TestCheckToolSupport_NilWhenProviderUnreachable(t *testing.T) {
+	err := checkToolSupport(context.Background(), config.ModelConfig{BaseURL: "http://127.0.0.1:1", Model: "some-model"})
+	if err != nil {
+		t.Errorf("checkToolSupport() error = %v, want nil when the provider is unreachable", err)
+	}
+}
+
+func TestCheckToolSupport_NilWhenModelSupportsTools(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"tool-model","capabilities":["tool_use"]}]}`))
+	}))
+	defer srv.Close()
+
+	err := checkToolSupport(context.Background(), config.ModelConfig{BaseURL: srv.URL + "/v1", Model: "tool-model"})
+	if err != nil {
+		t.Errorf("checkToolSupport() error = %v, want nil when the model supports tools", err)
 	}
 }
