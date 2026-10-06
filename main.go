@@ -13,6 +13,8 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	"charm.land/lipgloss/v2/table"
 	"github.com/cloudwego/eino/schema"
 	"github.com/kjkondratuk/dewey/internal/agent"
 	"github.com/kjkondratuk/dewey/internal/app"
@@ -328,9 +330,9 @@ func resumeSession(cwd string, cfg config.Config, window int, id string) (*sessi
 }
 
 // printSessions implements --sessions: an aligned table (id, start time,
-// message count, project, opening message) with no TUI started. It uses the
-// same session.Columns renderer as the interactive picker, so the two can
-// never drift apart.
+// message count, project, opening message) with no TUI started. It renders
+// the same session.Cells data the interactive picker uses, so the two can
+// never drift apart on what columns exist or what is in them.
 func printSessions() error {
 	dir, err := sessionsDir()
 	if err != nil {
@@ -344,12 +346,38 @@ func printSessions() error {
 		return err
 	}
 
-	header, rows := session.Columns(sums, terminalWidth())
-	fmt.Println(header)
-	for _, row := range rows {
-		fmt.Println(row)
-	}
+	fmt.Println(renderSessionsTable(sums, terminalWidth()))
 	return nil
+}
+
+// renderSessionsTable renders sums as a borderless, pipe-friendly table sized
+// to width. Wrapping is disabled so a long cell (almost always the summary)
+// is truncated with an ellipsis instead of spilling onto a second line --
+// --sessions promises one line per session.
+func renderSessionsTable(sums []session.Summary, width int) string {
+	headers, rows := session.Cells(sums)
+
+	gutter := func(_, col int) lipgloss.Style {
+		if col == len(headers)-1 {
+			return lipgloss.NewStyle()
+		}
+		return lipgloss.NewStyle().PaddingRight(2)
+	}
+
+	return table.New().
+		Headers(headers...).
+		Rows(rows...).
+		Width(width).
+		Wrap(false).
+		BorderTop(false).
+		BorderBottom(false).
+		BorderLeft(false).
+		BorderRight(false).
+		BorderHeader(false).
+		BorderColumn(false).
+		BorderRow(false).
+		StyleFunc(gutter).
+		String()
 }
 
 // terminalWidth is the width printSessions renders its table at: the real

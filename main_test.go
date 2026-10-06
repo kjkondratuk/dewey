@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
@@ -473,5 +474,93 @@ func TestCheckToolSupport_NilWhenModelSupportsTools(t *testing.T) {
 	err := checkToolSupport(context.Background(), config.ModelConfig{BaseURL: srv.URL + "/v1", Model: "tool-model"})
 	if err != nil {
 		t.Errorf("checkToolSupport() error = %v, want nil when the model supports tools", err)
+	}
+}
+
+// renderSessionsTable backs --sessions. It must render exactly one line per
+// session plus a header, with no borders (the output stays pipe-friendly).
+
+func TestRenderSessionsTable_OneLinePerSessionNoBorders(t *testing.T) {
+	sums := []session.Summary{
+		{Header: session.Header{ID: "81e12fd9-ca71", StartedAt: time.Date(2026, 10, 5, 9, 7, 0, 0, time.UTC), ProjectRoot: "/x/dewey"}, FirstUserMessage: "review this project and write a doc", MessageCount: 8},
+		{Header: session.Header{ID: "4d315e3c-20fc", StartedAt: time.Date(2026, 10, 5, 9, 2, 0, 0, time.UTC), ProjectRoot: "/x/dewey"}, FirstUserMessage: "hello?", MessageCount: 3},
+	}
+
+	out := renderSessionsTable(sums, 100)
+	lines := strings.Split(out, "\n")
+	if len(lines) != len(sums)+1 {
+		t.Fatalf("len(lines) = %d, want %d (1 header + %d sessions); out = %q", len(lines), len(sums)+1, len(sums), out)
+	}
+
+	for _, border := range []string{"│", "┌", "└", "┐", "┘", "─", "├", "┤"} {
+		if strings.Contains(out, border) {
+			t.Errorf("out contains border character %q, want a borderless table:\n%s", border, out)
+		}
+	}
+}
+
+// No ANSI color escapes when stdout is not a terminal (which is always true
+// under `go test`).
+func TestRenderSessionsTable_NoColorEscapes(t *testing.T) {
+	sums := []session.Summary{
+		{Header: session.Header{ID: "81e12fd9"}, FirstUserMessage: "hi"},
+	}
+	out := renderSessionsTable(sums, 100)
+	if strings.Contains(out, "\x1b[") {
+		t.Errorf("out contains an ANSI escape sequence, want plain text:\n%q", out)
+	}
+}
+
+// Columns line up: every row's STARTED column starts at the same offset as
+// the header's.
+func TestRenderSessionsTable_ColumnsAligned(t *testing.T) {
+	sums := []session.Summary{
+		{Header: session.Header{ID: "81e12fd9", StartedAt: time.Date(2026, 10, 5, 9, 7, 0, 0, time.UTC)}, FirstUserMessage: "review this project"},
+		{Header: session.Header{ID: "4d315e3c"}, FirstUserMessage: "hi"},
+	}
+	out := renderSessionsTable(sums, 100)
+	lines := strings.Split(out, "\n")
+	if len(lines) != 3 {
+		t.Fatalf("len(lines) = %d, want 3", len(lines))
+	}
+
+	idx := strings.Index(lines[0], "STARTED")
+	if idx < 0 {
+		t.Fatalf("header %q has no STARTED label", lines[0])
+	}
+	for i, line := range lines[1:] {
+		if len(line) < idx || !strings.HasPrefix(line[idx:], "2026") && !strings.HasPrefix(line[idx:], "unknown") {
+			t.Errorf("row[%d] = %q, want STARTED content at offset %d", i, line, idx)
+		}
+	}
+}
+
+// A long summary is truncated with a trailing ellipsis rather than wrapping
+// onto a second line.
+func TestRenderSessionsTable_LongSummaryTruncatedNotWrapped(t *testing.T) {
+	sums := []session.Summary{
+		{Header: session.Header{ID: "81e12fd9"}, FirstUserMessage: strings.Repeat("a very long summary that keeps going ", 10)},
+	}
+
+	const width = 100
+	out := renderSessionsTable(sums, width)
+	lines := strings.Split(out, "\n")
+	if len(lines) != 2 {
+		t.Fatalf("len(lines) = %d, want 2 (1 header + 1 session); a wrapped summary breaks one-line-per-session:\n%q", len(lines), out)
+	}
+	if !strings.Contains(lines[1], "…") {
+		t.Errorf("row = %q, want a truncation ellipsis", lines[1])
+	}
+}
+
+// Empty input still renders a header row and nothing else.
+func TestRenderSessionsTable_EmptyInputHeaderOnly(t *testing.T) {
+	out := renderSessionsTable(nil, 100)
+	lines := strings.Split(out, "\n")
+	if len(lines) != 1 {
+		t.Fatalf("len(lines) = %d, want 1 (header only); out = %q", len(lines), out)
+	}
+	if !strings.Contains(lines[0], "ID") || !strings.Contains(lines[0], "SUMMARY") {
+		t.Errorf("header = %q, want ID and SUMMARY column labels", lines[0])
 	}
 }

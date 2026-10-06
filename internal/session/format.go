@@ -5,65 +5,40 @@ import (
 	"strconv"
 )
 
-// Fixed column widths. STARTED matches len("2006-01-02 15:04"); the others
-// are chosen to comfortably hold their content ("unknown", a 2-4 digit
-// count, a typical directory name) without being wasteful.
-const (
-	idWidth      = 8
-	startedWidth = 16
-	msgsWidth    = 4
-	projectWidth = 12
-	gutter       = "  "
+// shortIDRunes is how many runes of a session id are shown: enough to
+// disambiguate without eating the whole line.
+const shortIDRunes = 8
 
-	// minSummaryWidth is the floor the summary column never goes below, so a
-	// narrow terminal degrades to a hard truncation rather than negative
-	// slice arithmetic.
-	minSummaryWidth = 20
-
-	ellipsis = "…"
-)
-
-const fixedColumnsWidth = idWidth + len(gutter) + startedWidth + len(gutter) + msgsWidth + len(gutter) + projectWidth + len(gutter)
-
-// Columns renders summaries as an aligned table: a header row and one row
-// per session, with the summary column truncated to fit width.
+// Cells renders summaries as table data: a header row and one row of cell
+// values per session.
 //
-// Shared so the plain listing and the interactive picker cannot drift apart.
-func Columns(sums []Summary, width int) (header string, rows []string) {
-	summaryWidth := width - fixedColumnsWidth
-	if summaryWidth < minSummaryWidth {
-		summaryWidth = minSummaryWidth
-	}
+// Deliberately unpadded and untruncated. Layout belongs to whatever is
+// drawing — lipgloss/table for the static listing, bubbles/table for the
+// picker — and both get the same cells, so the two views cannot disagree
+// about what columns exist or what is in them.
+func Cells(sums []Summary) (headers []string, rows [][]string) {
+	headers = []string{"ID", "STARTED", "MSGS", "PROJECT", "SUMMARY"}
 
-	header = padRightRunes("ID", idWidth) + gutter +
-		padRightRunes("STARTED", startedWidth) + gutter +
-		padLeftRunes("MSGS", msgsWidth) + gutter +
-		padRightRunes("PROJECT", projectWidth) + gutter +
-		"SUMMARY"
-
-	rows = make([]string, len(sums))
+	rows = make([][]string, len(sums))
 	for i, s := range sums {
-		rows[i] = formatRow(s, summaryWidth)
+		rows[i] = []string{
+			shortID(s.ID),
+			startedLabel(s),
+			strconv.Itoa(s.MessageCount),
+			projectLabel(s),
+			summaryLabel(s),
+		}
 	}
-	return header, rows
+	return headers, rows
 }
 
-func formatRow(s Summary, summaryWidth int) string {
-	id := padRightRunes(firstNRunes(s.ID, idWidth), idWidth)
-
-	started := "unknown"
-	if !s.StartedAt.IsZero() {
-		started = s.StartedAt.Local().Format("2006-01-02 15:04")
+// startedLabel is the text shown in the STARTED column: the session's start
+// time in local time, or "unknown" when it was never recorded.
+func startedLabel(s Summary) string {
+	if s.StartedAt.IsZero() {
+		return "unknown"
 	}
-	started = padRightRunes(started, startedWidth)
-
-	msgs := padLeftRunes(strconv.Itoa(s.MessageCount), msgsWidth)
-
-	project := padRightRunes(truncateRunes(projectLabel(s), projectWidth), projectWidth)
-
-	summary := truncateRunes(summaryLabel(s), summaryWidth)
-
-	return id + gutter + started + gutter + msgs + gutter + project + gutter + summary
+	return s.StartedAt.Local().Format("2006-01-02 15:04")
 }
 
 // projectLabel is the directory name identifying which project a session ran
@@ -80,75 +55,27 @@ func projectLabel(s Summary) string {
 	}
 }
 
-// summaryLabel is the text shown in the SUMMARY column, before truncation.
-// A session resumed from another one gets its summary prefixed, since its
-// own opening message continues a conversation rather than describing what
-// it was originally about.
+// summaryLabel is the text shown in the SUMMARY column. A session resumed
+// from another one gets its summary prefixed, since its own opening message
+// continues a conversation rather than describing what it was originally
+// about.
 func summaryLabel(s Summary) string {
 	msg := s.FirstUserMessage
 	if msg == "" {
 		msg = "(no messages)"
 	}
 	if s.ResumedFrom != "" {
-		msg = "↳ from " + firstNRunes(s.ResumedFrom, idWidth) + ": " + msg
+		msg = "↳ from " + shortID(s.ResumedFrom) + ": " + msg
 	}
 	return msg
 }
 
-// firstNRunes returns the first n runes of s, or s unchanged if it has fewer.
-func firstNRunes(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
+// shortID returns the first shortIDRunes runes of id, or id unchanged if it
+// has fewer. Rune-safe so a multi-byte character is never cut mid-codepoint.
+func shortID(id string) string {
+	r := []rune(id)
+	if len(r) <= shortIDRunes {
+		return id
 	}
-	return string(r[:n])
-}
-
-// truncateRunes truncates s to at most width runes, counting runes rather
-// than bytes so a multi-byte character is never cut mid-codepoint. A
-// truncated string ends with an ellipsis, which counts against width.
-func truncateRunes(s string, width int) string {
-	if width <= 0 {
-		return ""
-	}
-	r := []rune(s)
-	if len(r) <= width {
-		return s
-	}
-	if width == 1 {
-		return ellipsis
-	}
-	return string(r[:width-1]) + ellipsis
-}
-
-// padRightRunes pads s with trailing spaces until it is width runes wide. A
-// string already at or beyond width is returned unchanged.
-func padRightRunes(s string, width int) string {
-	n := width - runeLen(s)
-	if n <= 0 {
-		return s
-	}
-	return s + spaces(n)
-}
-
-// padLeftRunes pads s with leading spaces until it is width runes wide. A
-// string already at or beyond width is returned unchanged.
-func padLeftRunes(s string, width int) string {
-	n := width - runeLen(s)
-	if n <= 0 {
-		return s
-	}
-	return spaces(n) + s
-}
-
-func runeLen(s string) int {
-	return len([]rune(s))
-}
-
-func spaces(n int) string {
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = ' '
-	}
-	return string(b)
+	return string(r[:shortIDRunes])
 }
