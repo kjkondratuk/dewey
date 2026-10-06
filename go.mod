@@ -7,11 +7,13 @@ require (
 	charm.land/bubbletea/v2 v2.0.9
 	charm.land/glamour/v2 v2.0.1
 	charm.land/lipgloss/v2 v2.0.6
+	github.com/charmbracelet/x/ansi v0.11.8
 	github.com/cloudwego/eino v0.9.20
 	github.com/cloudwego/eino-ext/components/model/openai v0.1.13
 	github.com/google/uuid v1.6.0
 	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/yargevad/filepathx v1.0.0
+	golang.org/x/term v0.33.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -26,7 +28,6 @@ require (
 	github.com/bytedance/sonic/loader v0.5.0 // indirect
 	github.com/charmbracelet/colorprofile v0.4.3 // indirect
 	github.com/charmbracelet/ultraviolet v0.0.0-20260811164956-006e29f97886 // indirect
-	github.com/charmbracelet/x/ansi v0.11.8 // indirect
 	github.com/charmbracelet/x/exp/slice v0.0.0-20250327172914-2fdc97757edf // indirect
 	github.com/charmbracelet/x/term v0.2.2 // indirect
 	github.com/charmbracelet/x/termios v0.1.1 // indirect

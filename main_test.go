@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"github.com/charmbracelet/x/ansi"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
@@ -309,6 +312,119 @@ func TestResumeSession_UnknownIDReturnsError(t *testing.T) {
 	}
 }
 
+// resumeTarget is the pure decision at the heart of --resume with no id: it
+// decides whether to use an id already on the command line, report that
+// there is nothing to resume, ask the injected picker, or refuse because
+// there's no terminal to run one in. Everything TTY-dependent is injected,
+// so none of this needs a real terminal to test.
+
+// An id already supplied (e.g. "dewey --resume abc123") is used as-is --
+// the picker never runs.
+func TestResumeTarget_IDGivenReturnsIDWithoutChoosing(t *testing.T) {
+	choose := func([]session.Summary) (string, error) {
+		t.Fatal("choose() called, want the given id used directly")
+		return "", nil
+	}
+
+	id, err := resumeTarget("abc123", nil, true, choose)
+	if err != nil {
+		t.Fatalf("resumeTarget() error = %v", err)
+	}
+	if id != "abc123" {
+		t.Errorf("id = %q, want %q", id, "abc123")
+	}
+}
+
+// No id and no recorded sessions must report that plainly, not launch a
+// picker over an empty list.
+func TestResumeTarget_NoSessionsReturnsErrNoSessionsToResume(t *testing.T) {
+	choose := func([]session.Summary) (string, error) {
+		t.Fatal("choose() called, want no picker over an empty list")
+		return "", nil
+	}
+
+	_, err := resumeTarget("", nil, true, choose)
+	if !errors.Is(err, errNoSessionsToResume) {
+		t.Errorf("err = %v, want errNoSessionsToResume", err)
+	}
+}
+
+// No id, sessions exist, but stdout isn't a terminal: this must fail with a
+// clear error asking for an id, not attempt to run a TUI (which would panic
+// without a TTY) and not silently invent one.
+func TestResumeTarget_NonInteractiveNoIDErrorsClearly(t *testing.T) {
+	sums := []session.Summary{{Header: session.Header{ID: "s1"}}}
+	choose := func([]session.Summary) (string, error) {
+		t.Fatal("choose() called, want no picker without a terminal")
+		return "", nil
+	}
+
+	id, err := resumeTarget("", sums, false, choose)
+	if err == nil {
+		t.Fatal("resumeTarget() error = nil, want an error when stdout is not a terminal")
+	}
+	if errors.Is(err, errNoSessionsToResume) {
+		t.Errorf("err = %v, want a terminal-required error, not errNoSessionsToResume", err)
+	}
+	if id != "" {
+		t.Errorf("id = %q, want empty on error", id)
+	}
+	if !strings.Contains(err.Error(), "id") {
+		t.Errorf("err = %q, want a message that mentions a session id is required", err.Error())
+	}
+}
+
+// Interactive with sessions available: the chosen id flows straight through.
+func TestResumeTarget_InteractivePicksChosenID(t *testing.T) {
+	sums := []session.Summary{{Header: session.Header{ID: "s1"}}, {Header: session.Header{ID: "s2"}}}
+	choose := func(got []session.Summary) (string, error) {
+		if len(got) != 2 {
+			t.Errorf("choose() got %d summaries, want 2", len(got))
+		}
+		return "s2", nil
+	}
+
+	id, err := resumeTarget("", sums, true, choose)
+	if err != nil {
+		t.Fatalf("resumeTarget() error = %v", err)
+	}
+	if id != "s2" {
+		t.Errorf("id = %q, want %q", id, "s2")
+	}
+}
+
+// Quitting the picker without choosing is not an error: the caller should
+// exit cleanly and silently.
+func TestResumeTarget_InteractiveEmptyChoiceReturnsEmptyNoError(t *testing.T) {
+	sums := []session.Summary{{Header: session.Header{ID: "s1"}}}
+	choose := func([]session.Summary) (string, error) {
+		return "", nil
+	}
+
+	id, err := resumeTarget("", sums, true, choose)
+	if err != nil {
+		t.Fatalf("resumeTarget() error = %v, want nil when the user quits the picker", err)
+	}
+	if id != "" {
+		t.Errorf("id = %q, want empty when the user quits the picker", id)
+	}
+}
+
+// A failure running the picker itself propagates rather than being
+// swallowed.
+func TestResumeTarget_ChooseErrorPropagates(t *testing.T) {
+	sums := []session.Summary{{Header: session.Header{ID: "s1"}}}
+	wantErr := errors.New("picker exploded")
+	choose := func([]session.Summary) (string, error) {
+		return "", wantErr
+	}
+
+	_, err := resumeTarget("", sums, true, choose)
+	if !errors.Is(err, wantErr) {
+		t.Errorf("err = %v, want %v", err, wantErr)
+	}
+}
+
 // checkToolSupport is the gate main() applies to the intermediate tier before
 // starting the TUI. A model that cannot call tools cannot do dewey's job --
 // it will invent tool results instead -- so this is the definite-negative
@@ -359,5 +475,151 @@ func TestCheckToolSupport_NilWhenModelSupportsTools(t *testing.T) {
 	err := checkToolSupport(context.Background(), config.ModelConfig{BaseURL: srv.URL + "/v1", Model: "tool-model"})
 	if err != nil {
 		t.Errorf("checkToolSupport() error = %v, want nil when the model supports tools", err)
+	}
+}
+
+// renderSessionsTable backs --sessions. It must render exactly one line per
+// session plus a header, with no borders (the output stays pipe-friendly).
+
+func TestRenderSessionsTable_OneLinePerSessionNoBorders(t *testing.T) {
+	sums := []session.Summary{
+		{Header: session.Header{ID: "81e12fd9-ca71", StartedAt: time.Date(2026, 10, 5, 9, 7, 0, 0, time.UTC), ProjectRoot: "/x/dewey"}, FirstUserMessage: "review this project and write a doc", MessageCount: 8},
+		{Header: session.Header{ID: "4d315e3c-20fc", StartedAt: time.Date(2026, 10, 5, 9, 2, 0, 0, time.UTC), ProjectRoot: "/x/dewey"}, FirstUserMessage: "hello?", MessageCount: 3},
+	}
+
+	out := renderSessionsTable(sums, 100)
+	lines := strings.Split(out, "\n")
+	if len(lines) != len(sums)+1 {
+		t.Fatalf("len(lines) = %d, want %d (1 header + %d sessions); out = %q", len(lines), len(sums)+1, len(sums), out)
+	}
+
+	for _, border := range []string{"│", "┌", "└", "┐", "┘", "─", "├", "┤"} {
+		if strings.Contains(out, border) {
+			t.Errorf("out contains border character %q, want a borderless table:\n%s", border, out)
+		}
+	}
+}
+
+// No ANSI color escapes when stdout is not a terminal (which is always true
+// under `go test`).
+func TestRenderSessionsTable_NoColorEscapes(t *testing.T) {
+	sums := []session.Summary{
+		{Header: session.Header{ID: "81e12fd9"}, FirstUserMessage: "hi"},
+	}
+	out := renderSessionsTable(sums, 100)
+	if strings.Contains(out, "\x1b[") {
+		t.Errorf("out contains an ANSI escape sequence, want plain text:\n%q", out)
+	}
+}
+
+// Columns line up: every row's STARTED column starts at the same offset as
+// the header's.
+func TestRenderSessionsTable_ColumnsAligned(t *testing.T) {
+	sums := []session.Summary{
+		{Header: session.Header{ID: "81e12fd9", StartedAt: time.Date(2026, 10, 5, 9, 7, 0, 0, time.UTC)}, FirstUserMessage: "review this project"},
+		{Header: session.Header{ID: "4d315e3c"}, FirstUserMessage: "hi"},
+	}
+	out := renderSessionsTable(sums, 100)
+	lines := strings.Split(out, "\n")
+	if len(lines) != 3 {
+		t.Fatalf("len(lines) = %d, want 3", len(lines))
+	}
+
+	idx := strings.Index(lines[0], "STARTED")
+	if idx < 0 {
+		t.Fatalf("header %q has no STARTED label", lines[0])
+	}
+	for i, line := range lines[1:] {
+		if len(line) < idx || !strings.HasPrefix(line[idx:], "2026") && !strings.HasPrefix(line[idx:], "unknown") {
+			t.Errorf("row[%d] = %q, want STARTED content at offset %d", i, line, idx)
+		}
+	}
+}
+
+// A long summary is truncated with a trailing ellipsis rather than wrapping
+// onto a second line.
+func TestRenderSessionsTable_LongSummaryTruncatedNotWrapped(t *testing.T) {
+	sums := []session.Summary{
+		{Header: session.Header{ID: "81e12fd9"}, FirstUserMessage: strings.Repeat("a very long summary that keeps going ", 10)},
+	}
+
+	const width = 100
+	out := renderSessionsTable(sums, width)
+	lines := strings.Split(out, "\n")
+	if len(lines) != 2 {
+		t.Fatalf("len(lines) = %d, want 2 (1 header + 1 session); a wrapped summary breaks one-line-per-session:\n%q", len(lines), out)
+	}
+	if !strings.Contains(lines[1], "…") {
+		t.Errorf("row = %q, want a truncation ellipsis", lines[1])
+	}
+}
+
+// Empty input still renders a header row and nothing else.
+func TestRenderSessionsTable_EmptyInputHeaderOnly(t *testing.T) {
+	out := renderSessionsTable(nil, 100)
+	lines := strings.Split(out, "\n")
+	if len(lines) != 1 {
+		t.Fatalf("len(lines) = %d, want 1 (header only); out = %q", len(lines), out)
+	}
+	if !strings.Contains(lines[0], "ID") || !strings.Contains(lines[0], "SUMMARY") {
+		t.Errorf("header = %q, want ID and SUMMARY column labels", lines[0])
+	}
+}
+
+func TestRenderSessionsTable_StaysCompactWhenContentIsNarrow(t *testing.T) {
+	// Asking lipgloss/table for a width makes it expand every column evenly to
+	// fill it, so a narrow table in a wide terminal gets ID padded to 17
+	// columns for 8 characters of content. Only constrain the width when the
+	// content actually exceeds the terminal.
+	sums := []session.Summary{
+		{Header: session.Header{ID: "89ef2c2d-aaaa", CWD: "/p/dewey", StartedAt: time.Now()}, FirstUserMessage: "hellos", MessageCount: 2},
+		{Header: session.Header{ID: "81e12fd9-bbbb", CWD: "/p/dewey", StartedAt: time.Now()}, FirstUserMessage: "review the code in this project", MessageCount: 18},
+	}
+
+	out := renderSessionsTable(sums, 200)
+	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if len(line) > 90 {
+			t.Errorf("line is %d chars in a 200-column terminal, want it sized to content:\n%q", len(line), line)
+		}
+	}
+}
+
+func TestRenderSessionsTable_NoTrailingWhitespace(t *testing.T) {
+	// lipgloss/table pads every cell to its column width, including the last
+	// one, so each row ends in spaces unless they are stripped. Trailing
+	// whitespace makes the output noisy to diff and to compare in tests.
+	sums := []session.Summary{
+		{Header: session.Header{ID: "89ef2c2d-aaaa", CWD: "/p/dewey", StartedAt: time.Now()}, FirstUserMessage: "short", MessageCount: 2},
+		{Header: session.Header{ID: "81e12fd9-bbbb", CWD: "/p/dewey", StartedAt: time.Now()}, FirstUserMessage: "a considerably longer opening request", MessageCount: 18},
+	}
+
+	out := renderSessionsTable(sums, 120)
+	for i, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if line != strings.TrimRight(line, " \t") {
+			t.Errorf("line %d has trailing whitespace: %q", i, line)
+		}
+	}
+}
+
+func TestRenderSessionsTable_TruncatesWhenContentExceedsTheTerminal(t *testing.T) {
+	// The summary has to give way when it cannot fit, rather than wrapping
+	// onto a second line and breaking one-row-per-session.
+	sums := []session.Summary{
+		{Header: session.Header{ID: "81e12fd9-bbbb", CWD: "/p/dewey", StartedAt: time.Now()},
+			FirstUserMessage: strings.Repeat("long request text ", 20), MessageCount: 18},
+	}
+
+	out := renderSessionsTable(sums, 70)
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines, want a header and exactly one row:\n%s", len(lines), out)
+	}
+	for _, line := range lines {
+		// Measured in terminal cells, not bytes: the truncation ellipsis is
+		// three bytes and one column, so len() would report a line that fits
+		// as four over budget.
+		if w := ansi.StringWidth(line); w > 70 {
+			t.Errorf("line is %d columns wide, want it within the 70-column terminal: %q", w, line)
+		}
 	}
 }

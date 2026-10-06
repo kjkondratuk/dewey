@@ -5,15 +5,17 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/charmbracelet/x/ansi"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	"charm.land/lipgloss/v2/table"
 	"github.com/cloudwego/eino/schema"
 	"github.com/kjkondratuk/dewey/internal/agent"
 	"github.com/kjkondratuk/dewey/internal/app"
@@ -21,14 +23,16 @@ import (
 	"github.com/kjkondratuk/dewey/internal/config"
 	"github.com/kjkondratuk/dewey/internal/files"
 	"github.com/kjkondratuk/dewey/internal/memory"
+	"github.com/kjkondratuk/dewey/internal/picker"
 	"github.com/kjkondratuk/dewey/internal/safety"
 	"github.com/kjkondratuk/dewey/internal/session"
 	tools2 "github.com/kjkondratuk/dewey/internal/tools"
 	"github.com/kjkondratuk/dewey/prompts"
+	"golang.org/x/term"
 )
 
 func main() {
-	resume := flag.String("resume", "", "resume a previous session by id (or unambiguous id prefix)")
+	resume := flag.Bool("resume", false, "resume a previous session: pass an id (or unambiguous id prefix) as the first argument, or omit it to choose one interactively")
 	listSessions := flag.Bool("sessions", false, "list recorded sessions and exit")
 	noSession := flag.Bool("no-session", false, "do not record this session to disk")
 	flag.Parse()
@@ -88,11 +92,25 @@ func main() {
 	switch {
 	case *noSession:
 		// Recording disabled explicitly; store stays nil.
-	case *resume != "":
-		var sessionNotices []string
-		store, seedHistory, sessionNotices, err = resumeSession(cwd, cfg, contextWindow, *resume)
+	case *resume:
+		id, err := resolveResumeID(flag.Arg(0))
+		if errors.Is(err, errNoSessionsToResume) {
+			fmt.Println("no recorded sessions")
+			return
+		}
 		if err != nil {
-			log.Fatalf("failed to resume session %q: %v", *resume, err)
+			log.Fatal(err)
+		}
+		if id == "" {
+			// The picker ran and the user quit without choosing -- a normal
+			// outcome, not an error, so exit quietly.
+			return
+		}
+
+		var sessionNotices []string
+		store, seedHistory, sessionNotices, err = resumeSession(cwd, cfg, contextWindow, id)
+		if err != nil {
+			log.Fatalf("failed to resume session %q: %v", id, err)
 		}
 		notices = append(notices, sessionNotices...)
 	default:
@@ -186,6 +204,58 @@ func checkToolSupport(ctx context.Context, m config.ModelConfig) error {
 	return errors.New(msg)
 }
 
+// errNoSessionsToResume signals that --resume was given with no id and
+// there is nothing recorded to choose from. It is distinct from every other
+// resumeTarget error: callers treat it as "print a plain message and exit
+// 0", not as a failure.
+var errNoSessionsToResume = errors.New("no recorded sessions")
+
+// resolveResumeID is the IO-performing wrapper around resumeTarget for
+// --resume with no id already on the command line: it loads the recorded
+// sessions, checks whether stdout is a real terminal, and -- via
+// resumeTarget -- runs the interactive picker when one can be shown.
+func resolveResumeID(id string) (string, error) {
+	if id != "" {
+		return id, nil
+	}
+
+	dir, err := sessionsDir()
+	var sums []session.Summary
+	if err == nil {
+		sums, err = session.Summaries(dir)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	interactive := term.IsTerminal(int(os.Stdout.Fd()))
+	return resumeTarget(id, sums, interactive, picker.Choose)
+}
+
+// resumeTarget decides which session id --resume should resolve to. It is a
+// pure decision, with everything TTY-dependent injected (interactive,
+// choose), so it is testable without a real terminal:
+//
+//   - an id already given is used as-is, without even looking at sums
+//   - no id and no sessions is errNoSessionsToResume -- nothing to choose
+//   - no id, sessions exist, but no terminal to run a picker in is a plain
+//     error asking for an id instead of attempting a TUI that would panic
+//   - no id and a terminal defers to choose; its result (including "",
+//     which means the user quit without choosing -- not an error) is
+//     returned unchanged
+func resumeTarget(id string, sums []session.Summary, interactive bool, choose func([]session.Summary) (string, error)) (string, error) {
+	if id != "" {
+		return id, nil
+	}
+	if len(sums) == 0 {
+		return "", errNoSessionsToResume
+	}
+	if !interactive {
+		return "", errors.New("--resume needs a session id when stdout is not a terminal: pass one, e.g. dewey --resume <id>")
+	}
+	return choose(sums)
+}
+
 // sessionsDir is where session transcripts live: ~/.dewey/sessions. It is a
 // function (not a package-level constant) so tests can point it at a
 // temporary $HOME without touching the real one.
@@ -260,10 +330,10 @@ func resumeSession(cwd string, cfg config.Config, window int, id string) (*sessi
 	return store, history, nil, nil
 }
 
-// printSessions implements --sessions: a cheap, header-only listing (id,
-// start time, working directory) with no TUI started. Message counts are
-// deliberately omitted -- getting them right requires a full Load of every
-// transcript, which is not cheap once sessions get long.
+// printSessions implements --sessions: an aligned table (id, start time,
+// message count, project, opening message) with no TUI started. It renders
+// the same session.Cells data the interactive picker uses, so the two can
+// never drift apart on what columns exist or what is in them.
 func printSessions() error {
 	dir, err := sessionsDir()
 	if err != nil {
@@ -272,18 +342,110 @@ func printSessions() error {
 		return nil
 	}
 
-	headers, err := session.List(dir)
+	sums, err := session.Summaries(dir)
 	if err != nil {
 		return err
 	}
-	for _, h := range headers {
-		started := "unknown start time"
-		if !h.StartedAt.IsZero() {
-			started = h.StartedAt.Local().Format(time.RFC3339)
-		}
-		fmt.Printf("%s\t%s\t%s\n", h.ID, started, h.CWD)
-	}
+
+	fmt.Println(renderSessionsTable(sums, terminalWidth()))
 	return nil
+}
+
+// renderSessionsTable renders sums as a borderless, pipe-friendly table sized
+// to width. Wrapping is disabled so a long cell (almost always the summary)
+// is truncated with an ellipsis instead of spilling onto a second line --
+// --sessions promises one line per session.
+func renderSessionsTable(sums []session.Summary, width int) string {
+	headers, rows := session.Cells(sums)
+
+	// msgsColumn is right-aligned so counts line up on their units digit,
+	// which is the only way a column of numbers scans. The last column takes
+	// no gutter so rows do not end in padding.
+	const msgsColumn = 2
+	gutter := func(_, col int) lipgloss.Style {
+		style := lipgloss.NewStyle()
+		if col != len(headers)-1 {
+			style = style.PaddingRight(2)
+		}
+		if col == msgsColumn {
+			style = style.Align(lipgloss.Right)
+		}
+		return style
+	}
+
+	build := func() *table.Table {
+		return table.New().
+			Headers(headers...).
+			Rows(rows...).
+			Wrap(false).
+			BorderTop(false).
+			BorderBottom(false).
+			BorderLeft(false).
+			BorderRight(false).
+			BorderHeader(false).
+			BorderColumn(false).
+			BorderRow(false).
+			StyleFunc(gutter)
+	}
+
+	// Render unconstrained first. Asking lipgloss/table for a Width makes it
+	// expand every column evenly to fill it, so a narrow table in a wide
+	// terminal pads ID out to forty columns for eight characters of content --
+	// worse than the hand-rolled layout this replaced. Unconstrained, it sizes
+	// to content, which is what is wanted whenever the content fits.
+	out := trimTableLines(build().String(), 0)
+
+	if tableWidth(out) > width {
+		// Only now constrain it, so the summary column gives way. The library
+		// treats Width as a target rather than a bound and can overshoot it, so
+		// the lines are also clipped below.
+		out = trimTableLines(build().Width(width).String(), width)
+	}
+	return out
+}
+
+// trimTableLines strips the trailing padding lipgloss/table leaves on every
+// row -- it pads each cell to its column width including the last, so rows end
+// in spaces that make the output noisy to diff and to compare. When max is
+// positive, lines are also clipped to it, because Width is a target the
+// library may exceed and --sessions should never wrap.
+func trimTableLines(s string, max int) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimRight(line, " \t")
+		if max > 0 {
+			line = ansi.Truncate(line, max, "\u2026")
+		}
+		if line != "" {
+			kept = append(kept, line)
+		}
+	}
+	return strings.Join(kept, "\n")
+}
+
+// tableWidth is the width of the widest rendered line, measured in terminal
+// cells rather than bytes so a multi-byte or double-width summary is not
+// mistaken for a line that fits.
+func tableWidth(s string) int {
+	widest := 0
+	for _, line := range strings.Split(s, "\n") {
+		if w := ansi.StringWidth(line); w > widest {
+			widest = w
+		}
+	}
+	return widest
+}
+
+// terminalWidth is the width printSessions renders its table at: the real
+// terminal width when stdout is a terminal, else a sensible default so the
+// listing still works headless (piped to a file, redirected in a script).
+func terminalWidth() int {
+	const fallback = 100
+	if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 0 {
+		return w
+	}
+	return fallback
 }
 
 // buildMemory assembles the long-term memory wiring for one run: the system
