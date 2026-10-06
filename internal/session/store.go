@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -289,70 +288,6 @@ func recordToMessage(rec Record) *schema.Message {
 		})
 	}
 	return msg
-}
-
-// List returns the sessions under dir, newest first, reading only each
-// file's header record -- the first line of each file -- so listing is cheap
-// even for a long transcript.
-func List(dir string) ([]Header, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	type dated struct {
-		h  Header
-		at time.Time
-	}
-	var items []dated
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
-			continue
-		}
-		rec, ok := readHeaderRecord(filepath.Join(dir, e.Name()))
-		if !ok {
-			continue
-		}
-		items = append(items, dated{h: *rec.Header, at: rec.At})
-	}
-
-	sort.SliceStable(items, func(i, j int) bool {
-		return items[i].at.After(items[j].at)
-	})
-
-	headers := make([]Header, len(items))
-	for i, it := range items {
-		headers[i] = it.h
-	}
-	return headers, nil
-}
-
-// readHeaderRecord reads only the first line of path and reports whether it
-// is a valid header record.
-func readHeaderRecord(path string) (Record, bool) {
-	f, err := os.Open(path)
-	if err != nil {
-		return Record{}, false
-	}
-	defer f.Close()
-
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
-	if !sc.Scan() {
-		return Record{}, false
-	}
-
-	var rec Record
-	if err := json.Unmarshal(bytes.TrimSpace(sc.Bytes()), &rec); err != nil {
-		return Record{}, false
-	}
-	if rec.Kind != "header" || rec.Header == nil {
-		return Record{}, false
-	}
-	return rec, true
 }
 
 // Resolve finds a session file by full or partial id under dir, so a user can

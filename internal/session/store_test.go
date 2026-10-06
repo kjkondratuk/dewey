@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/cloudwego/eino/schema"
 )
@@ -272,53 +271,6 @@ func TestLoad_TruncatedFinalLineStillLoadsCompleteRecords(t *testing.T) {
 	}
 	if msgs[0].Content != "one" {
 		t.Errorf("msgs[0].Content = %q, want %q", msgs[0].Content, "one")
-	}
-}
-
-// 6. List returns newest-first and reads only headers -- a garbage body must
-// not prevent a file's header from being listed.
-func TestList_NewestFirstHeadersOnly(t *testing.T) {
-	dir := t.TempDir()
-
-	s1, err := NewStore(dir, Header{CWD: "/first"})
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-	s1.Close()
-	time.Sleep(5 * time.Millisecond)
-
-	s2, err := NewStore(dir, Header{CWD: "/second"})
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-	s2.Close()
-	time.Sleep(5 * time.Millisecond)
-
-	// A third file whose body is garbage after a valid header line.
-	garbagePath := filepath.Join(dir, "garbage-session.jsonl")
-	garbageHeader := Record{Seq: 1, At: time.Now(), Kind: "header", Header: &Header{ID: "garbage-session", CWD: "/garbage"}}
-	hdrBytes, _ := json.Marshal(garbageHeader)
-	content := string(hdrBytes) + "\nnot valid json at all{{{\n"
-	if err := os.WriteFile(garbagePath, []byte(content), 0o600); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
-	}
-
-	headers, err := List(dir)
-	if err != nil {
-		t.Fatalf("List() error = %v", err)
-	}
-	if len(headers) != 3 {
-		t.Fatalf("len(headers) = %d, want 3", len(headers))
-	}
-	// Newest first: garbage-session was written last.
-	if headers[0].CWD != "/garbage" {
-		t.Errorf("headers[0].CWD = %q, want /garbage (newest)", headers[0].CWD)
-	}
-	if headers[1].CWD != "/second" {
-		t.Errorf("headers[1].CWD = %q, want /second", headers[1].CWD)
-	}
-	if headers[2].CWD != "/first" {
-		t.Errorf("headers[2].CWD = %q, want /first (oldest)", headers[2].CWD)
 	}
 }
 

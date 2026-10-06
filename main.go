@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
@@ -25,6 +24,7 @@ import (
 	"github.com/kjkondratuk/dewey/internal/session"
 	tools2 "github.com/kjkondratuk/dewey/internal/tools"
 	"github.com/kjkondratuk/dewey/prompts"
+	"golang.org/x/term"
 )
 
 func main() {
@@ -260,10 +260,10 @@ func resumeSession(cwd string, cfg config.Config, window int, id string) (*sessi
 	return store, history, nil, nil
 }
 
-// printSessions implements --sessions: a cheap, header-only listing (id,
-// start time, working directory) with no TUI started. Message counts are
-// deliberately omitted -- getting them right requires a full Load of every
-// transcript, which is not cheap once sessions get long.
+// printSessions implements --sessions: an aligned table (id, start time,
+// message count, project, opening message) with no TUI started. It uses the
+// same session.Columns renderer as the interactive picker, so the two can
+// never drift apart.
 func printSessions() error {
 	dir, err := sessionsDir()
 	if err != nil {
@@ -272,18 +272,28 @@ func printSessions() error {
 		return nil
 	}
 
-	headers, err := session.List(dir)
+	sums, err := session.Summaries(dir)
 	if err != nil {
 		return err
 	}
-	for _, h := range headers {
-		started := "unknown start time"
-		if !h.StartedAt.IsZero() {
-			started = h.StartedAt.Local().Format(time.RFC3339)
-		}
-		fmt.Printf("%s\t%s\t%s\n", h.ID, started, h.CWD)
+
+	header, rows := session.Columns(sums, terminalWidth())
+	fmt.Println(header)
+	for _, row := range rows {
+		fmt.Println(row)
 	}
 	return nil
+}
+
+// terminalWidth is the width printSessions renders its table at: the real
+// terminal width when stdout is a terminal, else a sensible default so the
+// listing still works headless (piped to a file, redirected in a script).
+func terminalWidth() int {
+	const fallback = 100
+	if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 0 {
+		return w
+	}
+	return fallback
 }
 
 // buildMemory assembles the long-term memory wiring for one run: the system

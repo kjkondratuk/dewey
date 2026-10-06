@@ -12,6 +12,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/yargevad/filepathx v1.0.0
+	golang.org/x/term v0.33.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
