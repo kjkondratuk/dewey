@@ -41,6 +41,17 @@ func toolResult(content, toolCallID, toolName string) *schema.Message {
 	return msg
 }
 
+// excerpt bounds model-authored text for a diagnostic record. A runaway
+// generation is precisely the case being recorded, so the whole thing must
+// not be written: the point is to see what it was repeating, which the first
+// few hundred characters show as well as a megabyte would.
+func excerpt(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + fmt.Sprintf("... [+%d bytes]", len(s)-max)
+}
+
 // SystemPromptProvider supplies the system message for each model call. It is
 // consulted per Stream rather than once per session so a memory saved mid-turn
 // takes effect immediately.
@@ -327,6 +338,15 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 				}
 				if errors.Is(err, context.Canceled) {
 					sr.Close()
+					// A cancelled stream is the only record we get of a model
+					// that will not stop on its own, which is exactly the
+					// failure worth diagnosing. History is rolled back below,
+					// so this is recorded as an event rather than a message —
+					// it never became part of the conversation.
+					if partial, cErr := schema.ConcatMessages(chunks); cErr == nil && partial.Content != "" {
+						a.recordEvent("partial_response", fmt.Sprintf(
+							"content_len=%d excerpt=%s", len(partial.Content), excerpt(partial.Content, 2000)))
+					}
 					// Roll the whole turn back, as if the question was never
 					// asked. Dropping just the last message is only equivalent
 					// on the first pass: cancelling during a later model turn

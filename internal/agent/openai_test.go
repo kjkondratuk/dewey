@@ -27,6 +27,13 @@ type fakeStreamModel struct {
 	// is the only way to assert what the model was actually sent as opposed
 	// to what the agent kept in history.
 	seen [][]*schema.Message
+
+	// streamReaders, when set for a call index, is returned instead of a
+	// reader built from responses[call]. This is how a test models a
+	// provider that fails *mid-stream*, after already yielding chunks --
+	// something StreamReaderFromArray cannot do, since it never produces
+	// anything but io.EOF.
+	streamReaders []*schema.StreamReader[*schema.Message]
 }
 
 func (f *fakeStreamModel) Generate(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.Message, error) {
@@ -40,8 +47,31 @@ func (f *fakeStreamModel) Stream(ctx context.Context, in []*schema.Message, opts
 	if call < len(f.errs) && f.errs[call] != nil {
 		return nil, f.errs[call]
 	}
+	if call < len(f.streamReaders) && f.streamReaders[call] != nil {
+		return f.streamReaders[call], nil
+	}
 	resp := f.responses[call]
 	return schema.StreamReaderFromArray(resp), nil
+}
+
+// pipeStream builds a StreamReader that yields chunks in order and then fails
+// with err (or hits io.EOF if err is nil). Unlike schema.StreamReaderFromArray,
+// which can only ever end in io.EOF, this models a provider stream that is
+// cancelled partway through -- after some chunks already arrived.
+func pipeStream(chunks []*schema.Message, err error) *schema.StreamReader[*schema.Message] {
+	sr, sw := schema.Pipe[*schema.Message](len(chunks) + 1)
+	go func() {
+		defer sw.Close()
+		for _, c := range chunks {
+			if sw.Send(c, nil) {
+				return
+			}
+		}
+		if err != nil {
+			sw.Send(nil, err)
+		}
+	}()
+	return sr
 }
 
 func (f *fakeStreamModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatModel, error) {
@@ -1472,5 +1502,99 @@ func TestRun_RecordsCancelledEvent(t *testing.T) {
 	}
 	if !found {
 		t.Error("no cancelled event recorded")
+	}
+}
+
+// A cancelled stream is the only record of a model that will not stop on its
+// own -- the exact failure that prompted this change -- so whatever content
+// arrived before cancellation must be captured even though history is rolled
+// back and never sees it.
+func TestRun_CancelDuringStreamRecordsPartialResponse(t *testing.T) {
+	m := &fakeStreamModel{
+		responses: [][]*schema.Message{nil},
+		streamReaders: []*schema.StreamReader[*schema.Message]{
+			pipeStream([]*schema.Message{
+				{Role: schema.Assistant, Content: "1. README.md 2. app.js "},
+			}, context.Canceled),
+		},
+	}
+	rec := &fakeRecorder{}
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 0, nil).
+		WithRecorder(rec)
+
+	ch, err := agt.Run(context.Background(), "list files")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events := drain(t, ch, func(Event) bool { return true })
+
+	if events[len(events)-1].Kind != "cancelled" {
+		t.Fatalf("last event = %+v, want cancelled", events[len(events)-1])
+	}
+
+	var detail string
+	var found bool
+	for _, c := range rec.calls {
+		if c.kind == "event" && c.event == "partial_response" {
+			found = true
+			detail = c.detail
+		}
+	}
+	if !found {
+		t.Fatal("no partial_response event recorded")
+	}
+	if !strings.Contains(detail, "content_len=") {
+		t.Errorf("detail = %q, want it to report content_len=", detail)
+	}
+	if !strings.Contains(detail, "README.md") {
+		t.Errorf("detail = %q, want it to contain the streamed text", detail)
+	}
+}
+
+// No content arrived before cancellation, so there is nothing to excerpt --
+// recording an empty partial_response would just be noise in the transcript.
+func TestRun_CancelDuringStreamWithNoContentRecordsNoPartialResponse(t *testing.T) {
+	m := &fakeStreamModel{
+		responses: [][]*schema.Message{nil},
+		streamReaders: []*schema.StreamReader[*schema.Message]{
+			pipeStream(nil, context.Canceled),
+		},
+	}
+	rec := &fakeRecorder{}
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 0, nil).
+		WithRecorder(rec)
+
+	ch, err := agt.Run(context.Background(), "list files")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	drain(t, ch, func(Event) bool { return true })
+
+	for _, c := range rec.calls {
+		if c.kind == "event" && c.event == "partial_response" {
+			t.Errorf("unexpected partial_response event with no content: %+v", c)
+		}
+	}
+}
+
+func TestExcerpt_ReturnsShortInputUnchanged(t *testing.T) {
+	got := excerpt("short text", 2000)
+	if got != "short text" {
+		t.Errorf("excerpt() = %q, want unchanged input", got)
+	}
+}
+
+func TestExcerpt_TruncatesPastLimitAndAppendsByteCount(t *testing.T) {
+	s := strings.Repeat("a", 2500)
+	got := excerpt(s, 2000)
+
+	if len(got) <= 2000 {
+		t.Fatalf("excerpt() length = %d, want it to include the trailing byte-count note", len(got))
+	}
+	if !strings.HasPrefix(got, strings.Repeat("a", 2000)) {
+		t.Error("excerpt() did not preserve the first max bytes")
+	}
+	if !strings.Contains(got, "+500 bytes") {
+		t.Errorf("excerpt() = %q, want it to report the omitted byte count", got)
 	}
 }
