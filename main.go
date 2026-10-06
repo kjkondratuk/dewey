@@ -2,10 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
@@ -18,11 +22,24 @@ import (
 	"github.com/kjkondratuk/dewey/internal/files"
 	"github.com/kjkondratuk/dewey/internal/memory"
 	"github.com/kjkondratuk/dewey/internal/safety"
+	"github.com/kjkondratuk/dewey/internal/session"
 	tools2 "github.com/kjkondratuk/dewey/internal/tools"
 	"github.com/kjkondratuk/dewey/prompts"
 )
 
 func main() {
+	resume := flag.String("resume", "", "resume a previous session by id (or unambiguous id prefix)")
+	listSessions := flag.Bool("sessions", false, "list recorded sessions and exit")
+	noSession := flag.Bool("no-session", false, "do not record this session to disk")
+	flag.Parse()
+
+	if *listSessions {
+		if err := printSessions(); err != nil {
+			log.Fatalf("failed to list sessions: %v", err)
+		}
+		return
+	}
+
 	ctx := context.Background()
 
 	cwd, err := os.Getwd()
@@ -48,8 +65,41 @@ func main() {
 	summarizer := compaction.NewLLMSummarizer(simpleModel)
 	contextWindow := config.DiscoverContextWindow(ctx, cfg.Intermediate)
 
+	// A model that cannot call tools cannot do dewey's job; it will invent
+	// tool results instead. Checked here rather than tolerated because the
+	// failure mode is an unbounded stream of plausible fiction. Only the
+	// intermediate tier is checked: it is the tier tools are bound to below
+	// (intermediateModel.WithTools); simple only classifies and summarizes
+	// and is never given tools.
+	if err := checkToolSupport(ctx, cfg.Intermediate); err != nil {
+		log.Fatal(err)
+	}
+
 	systemPrompt, toolRecorder, provider, notices := buildMemory(cwd, cfg)
 	notices = append(ruleNotices, notices...)
+
+	// Session recording is debugging instrumentation, not a feature the run
+	// depends on: any problem standing it up becomes a notice, never a fatal
+	// error (see buildSession / resumeSession).
+	var (
+		store       *session.Store
+		seedHistory []*schema.Message
+	)
+	switch {
+	case *noSession:
+		// Recording disabled explicitly; store stays nil.
+	case *resume != "":
+		var sessionNotices []string
+		store, seedHistory, sessionNotices, err = resumeSession(cwd, cfg, contextWindow, *resume)
+		if err != nil {
+			log.Fatalf("failed to resume session %q: %v", *resume, err)
+		}
+		notices = append(notices, sessionNotices...)
+	default:
+		var sessionNotices []string
+		store, sessionNotices = buildSession(cwd, cfg, contextWindow)
+		notices = append(notices, sessionNotices...)
+	}
 
 	// Force one load here so an unreadable memory directory or a dropped
 	// memory is reported at startup, rather than surfacing mid-turn as a
@@ -80,7 +130,7 @@ func main() {
 		log.Fatalf("failed to bind tools: %v", err)
 	}
 
-	agt := agent.New(tm, tools, classifier, contextWindow, summarizer).
+	agtBuilder := agent.New(tm, tools, classifier, contextWindow, summarizer).
 		WithSystemPrompt(systemPrompt).
 		// Startup discovery runs before any request, so the model is often
 		// not loaded yet and contextWindow above may be a clamped guess. Once
@@ -88,12 +138,152 @@ func main() {
 		WithContextWindowRefresher(func(ctx context.Context) (int, bool) {
 			return config.RefreshContextWindow(ctx, cfg.Intermediate)
 		})
+	if len(seedHistory) > 0 {
+		agtBuilder = agtBuilder.WithHistory(seedHistory)
+	}
+	if store != nil {
+		defer store.Close()
+		agtBuilder = agtBuilder.WithRecorder(store)
+	}
+	agt := agtBuilder
 
 	prog := tea.NewProgram(initModel(agt, notices))
 	_, err = prog.Run()
 	if err != nil {
 		log.Fatalf("program exited with error: %v", err)
 	}
+
+	// Surface any recording problem only after the run so it never delays or
+	// blocks the conversation itself -- a recording failure must never break
+	// a session.
+	if store != nil {
+		if recErr := store.Err(); recErr != nil {
+			log.Printf("session recording error: %v", recErr)
+		}
+	}
+}
+
+// checkToolSupport gates startup on the intermediate tier's ability to call
+// tools, which dewey requires: a model that cannot call tools hallucinates
+// tool results instead of running anything, and with no token limit can
+// generate until the context window fills. Extracted from main() so the
+// fail-open behavior on an unknown or merely-unreachable provider is
+// testable -- an untested fatal path is how that requirement silently
+// becomes fail-closed.
+//
+// Returns nil for config.ToolSupportYes and config.ToolSupportUnknown alike;
+// only config.ToolSupportNo, a definite negative, is an error.
+func checkToolSupport(ctx context.Context, m config.ModelConfig) error {
+	if config.DiscoverToolSupport(ctx, m) != config.ToolSupportNo {
+		return nil
+	}
+	alternatives := config.ToolCapableModels(ctx, m)
+	msg := fmt.Sprintf("model %q does not support tool calling, which dewey requires", m.Model)
+	if len(alternatives) > 0 {
+		msg += fmt.Sprintf("\nmodels on this server that do: %s", strings.Join(alternatives, ", "))
+	}
+	msg += "\nset models.intermediate.model in ~/.dewey/config.yaml"
+	return errors.New(msg)
+}
+
+// sessionsDir is where session transcripts live: ~/.dewey/sessions. It is a
+// function (not a package-level constant) so tests can point it at a
+// temporary $HOME without touching the real one.
+func sessionsDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("determining home directory: %w", err)
+	}
+	return filepath.Join(home, ".dewey", "sessions"), nil
+}
+
+// buildSession starts a new session transcript for this run. Recording is
+// instrumentation, not a dependency of the conversation: if the home
+// directory can't be found or the sessions directory can't be created, it
+// returns a nil store and a notice explaining why, rather than failing the
+// run.
+func buildSession(cwd string, cfg config.Config, window int) (*session.Store, []string) {
+	dir, err := sessionsDir()
+	if err != nil {
+		return nil, []string{fmt.Sprintf("session recording disabled: %v", err)}
+	}
+
+	store, err := session.NewStore(dir, session.Header{
+		CWD:               cwd,
+		ProjectRoot:       config.ProjectRoot(cwd),
+		IntermediateModel: cfg.Intermediate.Model,
+		SimpleModel:       cfg.Simple.Model,
+		ContextWindow:     window,
+	})
+	if err != nil {
+		return nil, []string{fmt.Sprintf("session recording disabled: %v", err)}
+	}
+	return store, nil
+}
+
+// resumeSession loads a prior session's transcript by id (or unambiguous
+// prefix) and starts a new session file that continues it -- a resumed
+// transcript is never appended to the original file, so the original stays a
+// faithful record of exactly what happened in that run. Failing to resolve
+// or load the requested id is returned as an error: the user asked to
+// resume a specific conversation, so silently starting a fresh one instead
+// would hide that their request did not do what they asked. Once the
+// original is loaded, standing up the new session file is instrumentation
+// like buildSession -- a failure there is a notice, not a fatal error.
+func resumeSession(cwd string, cfg config.Config, window int, id string) (*session.Store, []*schema.Message, []string, error) {
+	dir, err := sessionsDir()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("determining sessions directory: %w", err)
+	}
+
+	path, err := session.Resolve(dir, id)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	history, _, err := session.Load(path)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("loading session %q: %w", id, err)
+	}
+
+	store, err := session.NewStore(dir, session.Header{
+		CWD:               cwd,
+		ProjectRoot:       config.ProjectRoot(cwd),
+		IntermediateModel: cfg.Intermediate.Model,
+		SimpleModel:       cfg.Simple.Model,
+		ContextWindow:     window,
+		ResumedFrom:       id,
+	})
+	if err != nil {
+		return nil, history, []string{fmt.Sprintf("session recording disabled: %v", err)}, nil
+	}
+	return store, history, nil, nil
+}
+
+// printSessions implements --sessions: a cheap, header-only listing (id,
+// start time, working directory) with no TUI started. Message counts are
+// deliberately omitted -- getting them right requires a full Load of every
+// transcript, which is not cheap once sessions get long.
+func printSessions() error {
+	dir, err := sessionsDir()
+	if err != nil {
+		// No home directory, no sessions directory, nothing to list -- not a
+		// failure worth reporting here.
+		return nil
+	}
+
+	headers, err := session.List(dir)
+	if err != nil {
+		return err
+	}
+	for _, h := range headers {
+		started := "unknown start time"
+		if !h.StartedAt.IsZero() {
+			started = h.StartedAt.Local().Format(time.RFC3339)
+		}
+		fmt.Printf("%s\t%s\t%s\n", h.ID, started, h.CWD)
+	}
+	return nil
 }
 
 // buildMemory assembles the long-term memory wiring for one run: the system

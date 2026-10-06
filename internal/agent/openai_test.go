@@ -27,6 +27,13 @@ type fakeStreamModel struct {
 	// is the only way to assert what the model was actually sent as opposed
 	// to what the agent kept in history.
 	seen [][]*schema.Message
+
+	// streamReaders, when set for a call index, is returned instead of a
+	// reader built from responses[call]. This is how a test models a
+	// provider that fails *mid-stream*, after already yielding chunks --
+	// something StreamReaderFromArray cannot do, since it never produces
+	// anything but io.EOF.
+	streamReaders []*schema.StreamReader[*schema.Message]
 }
 
 func (f *fakeStreamModel) Generate(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.Message, error) {
@@ -40,8 +47,31 @@ func (f *fakeStreamModel) Stream(ctx context.Context, in []*schema.Message, opts
 	if call < len(f.errs) && f.errs[call] != nil {
 		return nil, f.errs[call]
 	}
+	if call < len(f.streamReaders) && f.streamReaders[call] != nil {
+		return f.streamReaders[call], nil
+	}
 	resp := f.responses[call]
 	return schema.StreamReaderFromArray(resp), nil
+}
+
+// pipeStream builds a StreamReader that yields chunks in order and then fails
+// with err (or hits io.EOF if err is nil). Unlike schema.StreamReaderFromArray,
+// which can only ever end in io.EOF, this models a provider stream that is
+// cancelled partway through -- after some chunks already arrived.
+func pipeStream(chunks []*schema.Message, err error) *schema.StreamReader[*schema.Message] {
+	sr, sw := schema.Pipe[*schema.Message](len(chunks) + 1)
+	go func() {
+		defer sw.Close()
+		for _, c := range chunks {
+			if sw.Send(c, nil) {
+				return
+			}
+		}
+		if err != nil {
+			sw.Send(nil, err)
+		}
+	}()
+	return sr
 }
 
 func (f *fakeStreamModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatModel, error) {
@@ -1234,5 +1264,337 @@ func TestRun_NilRefresherIsHarmless(t *testing.T) {
 	}
 	if agt.contextWindow != 32768 {
 		t.Errorf("contextWindow = %d, want 32768 unchanged", agt.contextWindow)
+	}
+}
+
+// recordedCall is one call the fakeRecorder observed, either an Append or an
+// Event.
+type recordedCall struct {
+	kind   string // "append" or "event"
+	msg    *schema.Message
+	event  string
+	detail string
+}
+
+// fakeRecorder is a Recorder that remembers every call, in order, so tests
+// can assert both what was recorded and the sequence it happened in. Calls
+// only ever originate from the single goroutine inside Run, and tests only
+// inspect calls after draining that goroutine's channel to completion, so no
+// locking is needed -- the channel close is the synchronization point.
+type fakeRecorder struct {
+	calls []recordedCall
+}
+
+func (f *fakeRecorder) Append(msg *schema.Message) {
+	f.calls = append(f.calls, recordedCall{kind: "append", msg: msg})
+}
+
+func (f *fakeRecorder) Event(event, detail string) {
+	f.calls = append(f.calls, recordedCall{kind: "event", event: event, detail: detail})
+}
+
+func (f *fakeRecorder) kinds() []string {
+	kinds := make([]string, len(f.calls))
+	for i, c := range f.calls {
+		if c.kind == "append" {
+			kinds[i] = "append:" + string(c.msg.Role)
+		} else {
+			kinds[i] = "event:" + c.event
+		}
+	}
+	return kinds
+}
+
+// A normal turn with one tool call must record, in order: the user message,
+// a request event before each Stream call, the assistant message (including
+// the tool-call response), the tool result, and the final assistant message.
+func TestRun_RecordsConversationInOrder(t *testing.T) {
+	invoked := 0
+	tl := newRecordingTool(t, &invoked)
+	m := &fakeStreamModel{responses: [][]*schema.Message{
+		toolCallResponse("do_thing", `{"x":"1"}`),
+		finalResponse("done"),
+	}}
+	rec := &fakeRecorder{}
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 0, nil).
+		WithRecorder(rec)
+
+	ch, err := agt.Run(context.Background(), "go")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	drain(t, ch, func(Event) bool { return true })
+
+	want := []string{
+		"append:user",
+		"event:request",
+		"append:assistant",
+		"append:tool",
+		"event:request",
+		"append:assistant",
+	}
+	got := rec.kinds()
+	if len(got) != len(want) {
+		t.Fatalf("recorded calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("calls[%d] = %q, want %q (full sequence: %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+// Recording must never be required: a nil recorder is the default and every
+// call site guards through record/recordEvent, so a turn must complete
+// normally with no recorder attached at all.
+func TestRun_NilRecorderIsHarmless(t *testing.T) {
+	m := &fakeStreamModel{responses: [][]*schema.Message{finalResponse("done")}}
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 0, nil)
+
+	ch, err := agt.Run(context.Background(), "hi")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events := drain(t, ch, func(Event) bool { return true })
+
+	if len(events) == 0 || events[len(events)-1].Kind != "done" {
+		t.Errorf("events = %+v, want the turn to finish with done even with no recorder", events)
+	}
+}
+
+// WithHistory seeds the agent's history for resume; the seeded messages must
+// reach the model ahead of the new turn's user message.
+func TestWithHistory_SeedsHistorySentOnFirstRequest(t *testing.T) {
+	m := &fakeStreamModel{responses: [][]*schema.Message{finalResponse("done")}}
+	seed := []*schema.Message{
+		{Role: schema.User, Content: "earlier question"},
+		{Role: schema.Assistant, Content: "earlier answer"},
+	}
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 0, nil).
+		WithHistory(seed)
+
+	ch, err := agt.Run(context.Background(), "continue")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	drain(t, ch, func(Event) bool { return true })
+
+	if len(m.seen) == 0 {
+		t.Fatal("model was never called")
+	}
+	sent := m.seen[0]
+	if len(sent) != 3 {
+		t.Fatalf("sent = %+v, want seeded history (2) plus the new user message (1)", sent)
+	}
+	if sent[0].Content != "earlier question" || sent[1].Content != "earlier answer" {
+		t.Errorf("sent[:2] = %+v, want the seeded history first", sent[:2])
+	}
+	if sent[2].Content != "continue" {
+		t.Errorf("sent[2] = %+v, want the new user message", sent[2])
+	}
+}
+
+// compact() must report what it did without re-appending the whole rewritten
+// history to the recorder -- that history is already fully represented by the
+// Append calls already recorded for the messages that went into it.
+func TestCompact_RecordsCompactedHistoryEventWithoutReAppending(t *testing.T) {
+	rec := &fakeRecorder{}
+	agt := New(nil, nil, nil, 1000, &fakeSummarizer{result: "summary"}).WithRecorder(rec)
+	agt.history = []*schema.Message{
+		{Role: schema.User, Content: "one"},
+		{Role: schema.Assistant, Content: "two"},
+		{Role: schema.User, Content: "kept"},
+	}
+
+	// truncateLen=2: "one" and "two" are summarized away, "kept" survives.
+	if err := agt.compact(context.Background(), 2); err != nil {
+		t.Fatalf("compact() error = %v", err)
+	}
+
+	for _, c := range rec.calls {
+		if c.kind == "append" {
+			t.Errorf("unexpected Append during compact: %+v", c.msg)
+		}
+	}
+
+	var found bool
+	for _, c := range rec.calls {
+		if c.kind == "event" && c.event == "compacted_history" {
+			found = true
+			if c.detail != "replaced=2 kept=1" {
+				t.Errorf("detail = %q, want %q", c.detail, "replaced=2 kept=1")
+			}
+		}
+	}
+	if !found {
+		t.Error("no compacted_history event recorded")
+	}
+}
+
+// The forced-compaction path (provider rejected the request as too long) must
+// be distinguishable in the recorded transcript from a proactive compaction,
+// even though both surface as the same "compacted" Event kind to the UI.
+func TestRun_RecordsForcedCompactionEvent(t *testing.T) {
+	m := &fakeStreamModel{
+		responses: [][]*schema.Message{nil, finalResponse("recovered")},
+		errs:      []error{errors.New("context_length_exceeded"), nil},
+	}
+	rec := &fakeRecorder{}
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 262144, &fakeSummarizer{result: "summary"}).
+		WithRecorder(rec)
+	agt.history = []*schema.Message{
+		{Role: schema.User, Content: "earlier question"},
+		{Role: schema.Assistant, Content: "earlier answer"},
+	}
+
+	ch, err := agt.Run(context.Background(), "continue")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	drain(t, ch, func(Event) bool { return true })
+
+	var found bool
+	for _, c := range rec.calls {
+		if c.kind == "event" && c.event == "forced_compaction" {
+			found = true
+			if !strings.Contains(strings.ToLower(c.detail), "provider") {
+				t.Errorf("detail = %q, want it to explain the provider forced it", c.detail)
+			}
+		}
+	}
+	if !found {
+		t.Error("no forced_compaction event recorded")
+	}
+}
+
+// A cancelled turn must be recorded with no detail. Driving a real
+// cancellation through compaction (summarizer returns context.Canceled, as in
+// TestRun_CancelDuringCompactionRollsBackHistory) is deterministic, unlike
+// racing a context cancel against the fake model's Stream call.
+func TestRun_RecordsCancelledEvent(t *testing.T) {
+	m := &fakeStreamModel{responses: [][]*schema.Message{}}
+	fakeSumm := &fakeSummarizer{err: context.Canceled}
+	rec := &fakeRecorder{}
+
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 10, fakeSumm).
+		WithRecorder(rec)
+	agt.history = []*schema.Message{
+		{Role: schema.User, Content: strings.Repeat("filler content ", 200)},
+	}
+
+	ch, err := agt.Run(context.Background(), "continue")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events := drain(t, ch, func(Event) bool { return true })
+	if len(events) != 1 || events[0].Kind != "cancelled" {
+		t.Fatalf("events = %+v, want exactly one cancelled event", events)
+	}
+
+	var found bool
+	for _, c := range rec.calls {
+		if c.kind == "event" && c.event == "cancelled" {
+			found = true
+			if c.detail != "" {
+				t.Errorf("detail = %q, want empty", c.detail)
+			}
+		}
+	}
+	if !found {
+		t.Error("no cancelled event recorded")
+	}
+}
+
+// A cancelled stream is the only record of a model that will not stop on its
+// own -- the exact failure that prompted this change -- so whatever content
+// arrived before cancellation must be captured even though history is rolled
+// back and never sees it.
+func TestRun_CancelDuringStreamRecordsPartialResponse(t *testing.T) {
+	m := &fakeStreamModel{
+		responses: [][]*schema.Message{nil},
+		streamReaders: []*schema.StreamReader[*schema.Message]{
+			pipeStream([]*schema.Message{
+				{Role: schema.Assistant, Content: "1. README.md 2. app.js "},
+			}, context.Canceled),
+		},
+	}
+	rec := &fakeRecorder{}
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 0, nil).
+		WithRecorder(rec)
+
+	ch, err := agt.Run(context.Background(), "list files")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events := drain(t, ch, func(Event) bool { return true })
+
+	if events[len(events)-1].Kind != "cancelled" {
+		t.Fatalf("last event = %+v, want cancelled", events[len(events)-1])
+	}
+
+	var detail string
+	var found bool
+	for _, c := range rec.calls {
+		if c.kind == "event" && c.event == "partial_response" {
+			found = true
+			detail = c.detail
+		}
+	}
+	if !found {
+		t.Fatal("no partial_response event recorded")
+	}
+	if !strings.Contains(detail, "content_len=") {
+		t.Errorf("detail = %q, want it to report content_len=", detail)
+	}
+	if !strings.Contains(detail, "README.md") {
+		t.Errorf("detail = %q, want it to contain the streamed text", detail)
+	}
+}
+
+// No content arrived before cancellation, so there is nothing to excerpt --
+// recording an empty partial_response would just be noise in the transcript.
+func TestRun_CancelDuringStreamWithNoContentRecordsNoPartialResponse(t *testing.T) {
+	m := &fakeStreamModel{
+		responses: [][]*schema.Message{nil},
+		streamReaders: []*schema.StreamReader[*schema.Message]{
+			pipeStream(nil, context.Canceled),
+		},
+	}
+	rec := &fakeRecorder{}
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 0, nil).
+		WithRecorder(rec)
+
+	ch, err := agt.Run(context.Background(), "list files")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	drain(t, ch, func(Event) bool { return true })
+
+	for _, c := range rec.calls {
+		if c.kind == "event" && c.event == "partial_response" {
+			t.Errorf("unexpected partial_response event with no content: %+v", c)
+		}
+	}
+}
+
+func TestExcerpt_ReturnsShortInputUnchanged(t *testing.T) {
+	got := excerpt("short text", 2000)
+	if got != "short text" {
+		t.Errorf("excerpt() = %q, want unchanged input", got)
+	}
+}
+
+func TestExcerpt_TruncatesPastLimitAndAppendsByteCount(t *testing.T) {
+	s := strings.Repeat("a", 2500)
+	got := excerpt(s, 2000)
+
+	if len(got) <= 2000 {
+		t.Fatalf("excerpt() length = %d, want it to include the trailing byte-count note", len(got))
+	}
+	if !strings.HasPrefix(got, strings.Repeat("a", 2000)) {
+		t.Error("excerpt() did not preserve the first max bytes")
+	}
+	if !strings.Contains(got, "+500 bytes") {
+		t.Errorf("excerpt() = %q, want it to report the omitted byte count", got)
 	}
 }

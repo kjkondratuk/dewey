@@ -492,3 +492,155 @@ func TestRefreshContextWindow_DeclinesWhenProviderUnreachable(t *testing.T) {
 		t.Errorf("RefreshContextWindow() = (%d, true), want ok=false when discovery fails", got)
 	}
 }
+
+// A model that advertises tool_use can be trusted to call tools.
+func TestDiscoverToolSupport_YesWhenToolUseAdvertised(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"test-model","capabilities":["tool_use"]}]}`))
+	}))
+	defer srv.Close()
+
+	got := DiscoverToolSupport(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "test-model"})
+	if got != ToolSupportYes {
+		t.Errorf("DiscoverToolSupport() = %v, want ToolSupportYes", got)
+	}
+}
+
+// capabilities: [] is a present-but-empty list -- the provider enumerated
+// what this model can do and tool_use was not among them. That is a definite
+// negative dewey must act on.
+func TestDiscoverToolSupport_NoWhenCapabilitiesPresentButEmpty(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"test-model","capabilities":[]}]}`))
+	}))
+	defer srv.Close()
+
+	got := DiscoverToolSupport(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "test-model"})
+	if got != ToolSupportNo {
+		t.Errorf("DiscoverToolSupport() = %v, want ToolSupportNo", got)
+	}
+}
+
+// This is the most important case: a provider that simply does not expose a
+// capabilities field (nearly everyone but LM Studio) must never be treated as
+// a refusal. Getting this wrong locks every non-LM-Studio user out.
+func TestDiscoverToolSupport_UnknownWhenCapabilitiesFieldAbsent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"test-model","max_context_length":32768}]}`))
+	}))
+	defer srv.Close()
+
+	got := DiscoverToolSupport(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "test-model"})
+	if got != ToolSupportUnknown {
+		t.Errorf("DiscoverToolSupport() = %v, want ToolSupportUnknown when capabilities is absent", got)
+	}
+}
+
+func TestDiscoverToolSupport_UnknownWhenServerUnreachable(t *testing.T) {
+	got := DiscoverToolSupport(context.Background(), ModelConfig{BaseURL: "http://127.0.0.1:1", Model: "test-model"})
+	if got != ToolSupportUnknown {
+		t.Errorf("DiscoverToolSupport() = %v, want ToolSupportUnknown when unreachable", got)
+	}
+}
+
+func TestDiscoverToolSupport_UnknownWhenServerReturns404(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	got := DiscoverToolSupport(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "test-model"})
+	if got != ToolSupportUnknown {
+		t.Errorf("DiscoverToolSupport() = %v, want ToolSupportUnknown on 404", got)
+	}
+}
+
+func TestDiscoverToolSupport_UnknownWhenBodyUnparseable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`not json`))
+	}))
+	defer srv.Close()
+
+	got := DiscoverToolSupport(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "test-model"})
+	if got != ToolSupportUnknown {
+		t.Errorf("DiscoverToolSupport() = %v, want ToolSupportUnknown on unparseable body", got)
+	}
+}
+
+func TestDiscoverToolSupport_UnknownWhenModelNotListed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"some-other-model","capabilities":[]}]}`))
+	}))
+	defer srv.Close()
+
+	got := DiscoverToolSupport(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "test-model"})
+	if got != ToolSupportUnknown {
+		t.Errorf("DiscoverToolSupport() = %v, want ToolSupportUnknown when the configured model isn't listed", got)
+	}
+}
+
+// ToolCapableModels names only the models that advertise tool_use, so the
+// error message that uses it can tell the user what to switch to.
+func TestToolCapableModels_ReturnsOnlyModelsAdvertisingToolUse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[
+			{"id":"no-tools-model","capabilities":[]},
+			{"id":"tool-model-a","capabilities":["tool_use"]},
+			{"id":"unknown-model"},
+			{"id":"tool-model-b","capabilities":["tool_use","vision"]}
+		]}`))
+	}))
+	defer srv.Close()
+
+	got := ToolCapableModels(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1"})
+	want := []string{"tool-model-a", "tool-model-b"}
+	if len(got) != len(want) {
+		t.Fatalf("ToolCapableModels() = %v, want %v", got, want)
+	}
+	for _, w := range want {
+		if !contains(got, w) {
+			t.Errorf("ToolCapableModels() = %v, missing %q", got, w)
+		}
+	}
+}
+
+func TestDiscoverToolSupport_AbsentFieldIsNoWhenTheServerReportsOthers(t *testing.T) {
+	// Measured against LM Studio: it omits the capabilities key entirely for
+	// a model it does not credit with tool use, rather than sending an empty
+	// list. Treating that as unknown let the exact model that caused this
+	// check to be written start anyway.
+	//
+	// The omission is only informative because a sibling entry carries the
+	// field, which proves the server knows how to report it. Verified not to
+	// be load-state dependent: gemma reports tool_use both loaded and not.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[
+			{"id":"no-caps-model","state":"loaded","max_context_length":1048576},
+			{"id":"other-model","state":"not-loaded","capabilities":["tool_use"]}
+		]}`))
+	}))
+	defer srv.Close()
+
+	got := DiscoverToolSupport(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "no-caps-model"})
+	if got != ToolSupportNo {
+		t.Errorf("DiscoverToolSupport() = %v, want ToolSupportNo — the server reports capabilities for a sibling, so omission is meaningful", got)
+	}
+}
+
+func TestDiscoverToolSupport_AbsentFieldStaysUnknownWhenNoModelReportsAny(t *testing.T) {
+	// A provider that never reports capabilities tells us nothing, and must
+	// never block startup. This is every OpenAI-compatible server other than
+	// LM Studio, so getting it wrong locks those users out entirely.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[
+			{"id":"plain-model","max_context_length":8192},
+			{"id":"another","max_context_length":8192}
+		]}`))
+	}))
+	defer srv.Close()
+
+	got := DiscoverToolSupport(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "plain-model"})
+	if got != ToolSupportUnknown {
+		t.Errorf("DiscoverToolSupport() = %v, want ToolSupportUnknown for a provider that reports no capabilities at all", got)
+	}
+}
