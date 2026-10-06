@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/cloudwego/eino/schema"
 )
@@ -48,13 +49,15 @@ func Summaries(dir string) ([]Summary, error) {
 			continue
 		}
 
-		sum := Summary{Header: header, MessageCount: len(messages)}
-		for _, m := range messages {
-			if m.Role == schema.User {
-				sum.FirstUserMessage = collapseWhitespace(m.Content)
-				break
-			}
+		// A launch that never got a prompt records a header and nothing else.
+		// Resuming it gives empty history, which is just a fresh session, so
+		// listing it is noise in the one view that has to stay scannable.
+		if len(messages) == 0 {
+			continue
 		}
+
+		sum := Summary{Header: header, MessageCount: len(messages)}
+		sum.FirstUserMessage = pickLabel(messages)
 		sums = append(sums, sum)
 	}
 
@@ -62,6 +65,43 @@ func Summaries(dir string) ([]Summary, error) {
 		return sums[i].StartedAt.After(sums[j].StartedAt)
 	})
 	return sums, nil
+}
+
+// minLabelRunes is the length at which a user message is taken to be a
+// request rather than a greeting. Chosen from real transcripts: "hello",
+// "hello?", "hellos" and "continue" all fall below it, while "review the code
+// in this project" and "run the tests" clear it.
+const minLabelRunes = 12
+
+// pickLabel chooses the user message that best identifies a session.
+//
+// Not simply the first one. Users open with "hello" and then say what they
+// want, so labelling an eighteen-message code review "hello" is accurate and
+// useless -- which was the measured behavior before this existed. The first
+// message long enough to be a request wins; failing that the opening message
+// is used anyway, because a poor label beats a blank one.
+//
+// Length is a proxy for substance rather than a rule about it. A genuinely
+// short request is only mislabelled when a longer message precedes it, and
+// then the longer one is the better label regardless.
+func pickLabel(messages []*schema.Message) string {
+	first := ""
+	for _, m := range messages {
+		if m.Role != schema.User {
+			continue
+		}
+		text := collapseWhitespace(m.Content)
+		if text == "" {
+			continue
+		}
+		if first == "" {
+			first = text
+		}
+		if utf8.RuneCountInString(text) >= minLabelRunes {
+			return text
+		}
+	}
+	return first
 }
 
 // collapseWhitespace folds any run of whitespace (including newlines) into a

@@ -124,10 +124,13 @@ func TestSummaries_NoUserMessage(t *testing.T) {
 func TestSummaries_NewestFirst(t *testing.T) {
 	dir := t.TempDir()
 
+	// Each needs a message: a session with none is deliberately not listed,
+	// so a header-only fixture would test the filter rather than the ordering.
 	s1, err := NewStore(dir, Header{CWD: "/first"})
 	if err != nil {
 		t.Fatalf("NewStore() error = %v", err)
 	}
+	s1.Append(&schema.Message{Role: schema.User, Content: "first request here"})
 	s1.Close()
 	time.Sleep(5 * time.Millisecond)
 
@@ -135,6 +138,7 @@ func TestSummaries_NewestFirst(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore() error = %v", err)
 	}
+	s2.Append(&schema.Message{Role: schema.User, Content: "second request here"})
 	s2.Close()
 	time.Sleep(5 * time.Millisecond)
 
@@ -142,6 +146,7 @@ func TestSummaries_NewestFirst(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore() error = %v", err)
 	}
+	s3.Append(&schema.Message{Role: schema.User, Content: "third request here"})
 	s3.Close()
 
 	sums, err := Summaries(dir)
@@ -158,13 +163,14 @@ func TestSummaries_NewestFirst(t *testing.T) {
 
 // 6. A file with a valid header and a corrupt body still appears, with its
 // header intact (ported from the old List test).
-func TestSummaries_CorruptBodyStillYieldsHeader(t *testing.T) {
+func TestSummaries_CorruptTailStillYieldsTheSession(t *testing.T) {
 	dir := t.TempDir()
 
 	s1, err := NewStore(dir, Header{CWD: "/first"})
 	if err != nil {
 		t.Fatalf("NewStore() error = %v", err)
 	}
+	s1.Append(&schema.Message{Role: schema.User, Content: "first request here"})
 	s1.Close()
 	time.Sleep(5 * time.Millisecond)
 
@@ -172,13 +178,19 @@ func TestSummaries_CorruptBodyStillYieldsHeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore() error = %v", err)
 	}
+	s2.Append(&schema.Message{Role: schema.User, Content: "second request here"})
 	s2.Close()
 	time.Sleep(5 * time.Millisecond)
 
+	// A session killed mid-write is valid records followed by a partial line,
+	// which is the shape Load is built to tolerate -- and the shape worth
+	// asserting, since those are the sessions most worth recovering.
 	garbagePath := filepath.Join(dir, "garbage-session.jsonl")
 	garbageHeader := Record{Seq: 1, At: time.Now(), Kind: "header", Header: &Header{ID: "garbage-session", CWD: "/garbage", StartedAt: time.Now()}}
 	hdrBytes, _ := json.Marshal(garbageHeader)
-	content := string(hdrBytes) + "\nnot valid json at all{{{\n"
+	msg := Record{Seq: 2, At: time.Now(), Kind: "message", Role: "user", Content: "investigate the timeout"}
+	msgBytes, _ := json.Marshal(msg)
+	content := string(hdrBytes) + "\n" + string(msgBytes) + "\nnot valid json at all{{{\n"
 	if err := os.WriteFile(garbagePath, []byte(content), 0o600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
@@ -209,5 +221,92 @@ func TestSummaries_MissingDirectory(t *testing.T) {
 	}
 	if sums != nil {
 		t.Errorf("Summaries() = %v, want nil", sums)
+	}
+}
+
+func TestSummaries_SkipsAGreetingForTheFirstRealRequest(t *testing.T) {
+	// Measured against real transcripts: the user opens with "hello", then
+	// says what they want. Labelling an 18-message code review "hello" is
+	// accurate and useless, which is the whole problem the summary exists to
+	// solve.
+	dir := t.TempDir()
+	st, err := NewStore(dir, Header{CWD: "/p"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Append(&schema.Message{Role: schema.User, Content: "hello"})
+	st.Append(&schema.Message{Role: schema.Assistant, Content: "Hi."})
+	st.Append(&schema.Message{Role: schema.User, Content: "review the code in this project"})
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sums, err := Summaries(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sums) != 1 {
+		t.Fatalf("got %d summaries, want 1", len(sums))
+	}
+	if got := sums[0].FirstUserMessage; got != "review the code in this project" {
+		t.Errorf("FirstUserMessage = %q, want the first substantive request", got)
+	}
+}
+
+func TestSummaries_FallsBackToAShortOpeningWhenItIsAllThereIs(t *testing.T) {
+	// "hello" is a poor label but an honest one when the session contains
+	// nothing better. Never show empty where text exists.
+	dir := t.TempDir()
+	st, err := NewStore(dir, Header{CWD: "/p"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Append(&schema.Message{Role: schema.User, Content: "hello?"})
+	st.Append(&schema.Message{Role: schema.User, Content: "continue"})
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sums, err := Summaries(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sums[0].FirstUserMessage; got != "hello?" {
+		t.Errorf("FirstUserMessage = %q, want the opening message as a fallback", got)
+	}
+}
+
+func TestSummaries_OmitsSessionsWithNoMessages(t *testing.T) {
+	// A launch that never got a prompt records a header and nothing else.
+	// Resuming it yields empty history, which is a fresh session, so listing
+	// it is noise in the one place that must stay scannable.
+	dir := t.TempDir()
+	empty, err := NewStore(dir, Header{CWD: "/p"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty.Event("notice", "started")
+	if err := empty.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	real, err := NewStore(dir, Header{CWD: "/p"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	real.Append(&schema.Message{Role: schema.User, Content: "do something useful"})
+	if err := real.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sums, err := Summaries(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sums) != 1 {
+		t.Fatalf("got %d summaries, want only the one with messages", len(sums))
+	}
+	if sums[0].ID != real.ID() {
+		t.Errorf("kept %q, want the session that has messages", sums[0].ID)
 	}
 }
