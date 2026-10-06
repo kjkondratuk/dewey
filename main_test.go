@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"github.com/charmbracelet/x/ansi"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -562,5 +563,63 @@ func TestRenderSessionsTable_EmptyInputHeaderOnly(t *testing.T) {
 	}
 	if !strings.Contains(lines[0], "ID") || !strings.Contains(lines[0], "SUMMARY") {
 		t.Errorf("header = %q, want ID and SUMMARY column labels", lines[0])
+	}
+}
+
+func TestRenderSessionsTable_StaysCompactWhenContentIsNarrow(t *testing.T) {
+	// Asking lipgloss/table for a width makes it expand every column evenly to
+	// fill it, so a narrow table in a wide terminal gets ID padded to 17
+	// columns for 8 characters of content. Only constrain the width when the
+	// content actually exceeds the terminal.
+	sums := []session.Summary{
+		{Header: session.Header{ID: "89ef2c2d-aaaa", CWD: "/p/dewey", StartedAt: time.Now()}, FirstUserMessage: "hellos", MessageCount: 2},
+		{Header: session.Header{ID: "81e12fd9-bbbb", CWD: "/p/dewey", StartedAt: time.Now()}, FirstUserMessage: "review the code in this project", MessageCount: 18},
+	}
+
+	out := renderSessionsTable(sums, 200)
+	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if len(line) > 90 {
+			t.Errorf("line is %d chars in a 200-column terminal, want it sized to content:\n%q", len(line), line)
+		}
+	}
+}
+
+func TestRenderSessionsTable_NoTrailingWhitespace(t *testing.T) {
+	// lipgloss/table pads every cell to its column width, including the last
+	// one, so each row ends in spaces unless they are stripped. Trailing
+	// whitespace makes the output noisy to diff and to compare in tests.
+	sums := []session.Summary{
+		{Header: session.Header{ID: "89ef2c2d-aaaa", CWD: "/p/dewey", StartedAt: time.Now()}, FirstUserMessage: "short", MessageCount: 2},
+		{Header: session.Header{ID: "81e12fd9-bbbb", CWD: "/p/dewey", StartedAt: time.Now()}, FirstUserMessage: "a considerably longer opening request", MessageCount: 18},
+	}
+
+	out := renderSessionsTable(sums, 120)
+	for i, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if line != strings.TrimRight(line, " \t") {
+			t.Errorf("line %d has trailing whitespace: %q", i, line)
+		}
+	}
+}
+
+func TestRenderSessionsTable_TruncatesWhenContentExceedsTheTerminal(t *testing.T) {
+	// The summary has to give way when it cannot fit, rather than wrapping
+	// onto a second line and breaking one-row-per-session.
+	sums := []session.Summary{
+		{Header: session.Header{ID: "81e12fd9-bbbb", CWD: "/p/dewey", StartedAt: time.Now()},
+			FirstUserMessage: strings.Repeat("long request text ", 20), MessageCount: 18},
+	}
+
+	out := renderSessionsTable(sums, 70)
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines, want a header and exactly one row:\n%s", len(lines), out)
+	}
+	for _, line := range lines {
+		// Measured in terminal cells, not bytes: the truncation ellipsis is
+		// three bytes and one column, so len() would report a line that fits
+		// as four over budget.
+		if w := ansi.StringWidth(line); w > 70 {
+			t.Errorf("line is %d columns wide, want it within the 70-column terminal: %q", w, line)
+		}
 	}
 }

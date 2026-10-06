@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/charmbracelet/x/ansi"
 	"log"
 	"os"
 	"path/filepath"
@@ -357,27 +358,83 @@ func printSessions() error {
 func renderSessionsTable(sums []session.Summary, width int) string {
 	headers, rows := session.Cells(sums)
 
+	// msgsColumn is right-aligned so counts line up on their units digit,
+	// which is the only way a column of numbers scans. The last column takes
+	// no gutter so rows do not end in padding.
+	const msgsColumn = 2
 	gutter := func(_, col int) lipgloss.Style {
-		if col == len(headers)-1 {
-			return lipgloss.NewStyle()
+		style := lipgloss.NewStyle()
+		if col != len(headers)-1 {
+			style = style.PaddingRight(2)
 		}
-		return lipgloss.NewStyle().PaddingRight(2)
+		if col == msgsColumn {
+			style = style.Align(lipgloss.Right)
+		}
+		return style
 	}
 
-	return table.New().
-		Headers(headers...).
-		Rows(rows...).
-		Width(width).
-		Wrap(false).
-		BorderTop(false).
-		BorderBottom(false).
-		BorderLeft(false).
-		BorderRight(false).
-		BorderHeader(false).
-		BorderColumn(false).
-		BorderRow(false).
-		StyleFunc(gutter).
-		String()
+	build := func() *table.Table {
+		return table.New().
+			Headers(headers...).
+			Rows(rows...).
+			Wrap(false).
+			BorderTop(false).
+			BorderBottom(false).
+			BorderLeft(false).
+			BorderRight(false).
+			BorderHeader(false).
+			BorderColumn(false).
+			BorderRow(false).
+			StyleFunc(gutter)
+	}
+
+	// Render unconstrained first. Asking lipgloss/table for a Width makes it
+	// expand every column evenly to fill it, so a narrow table in a wide
+	// terminal pads ID out to forty columns for eight characters of content --
+	// worse than the hand-rolled layout this replaced. Unconstrained, it sizes
+	// to content, which is what is wanted whenever the content fits.
+	out := trimTableLines(build().String(), 0)
+
+	if tableWidth(out) > width {
+		// Only now constrain it, so the summary column gives way. The library
+		// treats Width as a target rather than a bound and can overshoot it, so
+		// the lines are also clipped below.
+		out = trimTableLines(build().Width(width).String(), width)
+	}
+	return out
+}
+
+// trimTableLines strips the trailing padding lipgloss/table leaves on every
+// row -- it pads each cell to its column width including the last, so rows end
+// in spaces that make the output noisy to diff and to compare. When max is
+// positive, lines are also clipped to it, because Width is a target the
+// library may exceed and --sessions should never wrap.
+func trimTableLines(s string, max int) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimRight(line, " \t")
+		if max > 0 {
+			line = ansi.Truncate(line, max, "\u2026")
+		}
+		if line != "" {
+			kept = append(kept, line)
+		}
+	}
+	return strings.Join(kept, "\n")
+}
+
+// tableWidth is the width of the widest rendered line, measured in terminal
+// cells rather than bytes so a multi-byte or double-width summary is not
+// mistaken for a line that fits.
+func tableWidth(s string) int {
+	widest := 0
+	for _, line := range strings.Split(s, "\n") {
+		if w := ansi.StringWidth(line); w > widest {
+			widest = w
+		}
+	}
+	return widest
 }
 
 // terminalWidth is the width printSessions renders its table at: the real
