@@ -375,20 +375,48 @@ func DiscoverToolSupport(ctx context.Context, m ModelConfig) ToolSupport {
 		return ToolSupportUnknown
 	}
 
+	// Whether any model carries the field at all decides how to read its
+	// absence on the one we care about. LM Studio omits the key entirely for a
+	// model it does not credit with tool use rather than sending an empty
+	// list, so reading absence as "unknown" let exactly the model this check
+	// exists for start anyway. A sibling entry carrying the field proves the
+	// server knows how to report capabilities, which makes the omission a
+	// statement rather than a silence.
+	//
+	// Measured, not assumed: the field is not load-state dependent — gemma
+	// reports tool_use both loaded and not — so a loaded model missing it is
+	// missing it on its own merits.
+	serverReportsCapabilities := false
+	for _, entry := range parsed.Data {
+		if entry.Capabilities != nil {
+			serverReportsCapabilities = true
+			break
+		}
+	}
+
 	for _, entry := range parsed.Data {
 		if entry.ID != m.Model {
 			continue
 		}
 		if entry.Capabilities == nil {
+			// A provider that reports capabilities for nothing tells us
+			// nothing. That is every OpenAI-compatible server but LM Studio,
+			// and refusing them would be worse than the bug this prevents.
+			if serverReportsCapabilities {
+				return ToolSupportNo
+			}
 			return ToolSupportUnknown
 		}
-		for _, cap := range *entry.Capabilities {
-			if cap == "tool_use" {
+		for _, capability := range *entry.Capabilities {
+			if capability == "tool_use" {
 				return ToolSupportYes
 			}
 		}
 		return ToolSupportNo
 	}
+
+	// Not listed at all: the model may be served by something else entirely,
+	// or LM Studio may simply not have it in view yet. Not a negative.
 	return ToolSupportUnknown
 }
 

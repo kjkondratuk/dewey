@@ -603,3 +603,44 @@ func TestToolCapableModels_ReturnsOnlyModelsAdvertisingToolUse(t *testing.T) {
 		}
 	}
 }
+
+func TestDiscoverToolSupport_AbsentFieldIsNoWhenTheServerReportsOthers(t *testing.T) {
+	// Measured against LM Studio: it omits the capabilities key entirely for
+	// a model it does not credit with tool use, rather than sending an empty
+	// list. Treating that as unknown let the exact model that caused this
+	// check to be written start anyway.
+	//
+	// The omission is only informative because a sibling entry carries the
+	// field, which proves the server knows how to report it. Verified not to
+	// be load-state dependent: gemma reports tool_use both loaded and not.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[
+			{"id":"no-caps-model","state":"loaded","max_context_length":1048576},
+			{"id":"other-model","state":"not-loaded","capabilities":["tool_use"]}
+		]}`))
+	}))
+	defer srv.Close()
+
+	got := DiscoverToolSupport(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "no-caps-model"})
+	if got != ToolSupportNo {
+		t.Errorf("DiscoverToolSupport() = %v, want ToolSupportNo — the server reports capabilities for a sibling, so omission is meaningful", got)
+	}
+}
+
+func TestDiscoverToolSupport_AbsentFieldStaysUnknownWhenNoModelReportsAny(t *testing.T) {
+	// A provider that never reports capabilities tells us nothing, and must
+	// never block startup. This is every OpenAI-compatible server other than
+	// LM Studio, so getting it wrong locks those users out entirely.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[
+			{"id":"plain-model","max_context_length":8192},
+			{"id":"another","max_context_length":8192}
+		]}`))
+	}))
+	defer srv.Close()
+
+	got := DiscoverToolSupport(context.Background(), ModelConfig{BaseURL: srv.URL + "/v1", Model: "plain-model"})
+	if got != ToolSupportUnknown {
+		t.Errorf("DiscoverToolSupport() = %v, want ToolSupportUnknown for a provider that reports no capabilities at all", got)
+	}
+}
