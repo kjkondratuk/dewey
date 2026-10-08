@@ -12,6 +12,7 @@ import (
 	"charm.land/glamour/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/kjkondratuk/dewey/internal/agent"
+	"github.com/kjkondratuk/dewey/internal/herdr"
 )
 
 // abortArmWindow is how long a first escape stays armed before a second one
@@ -81,7 +82,11 @@ type App struct {
 	Entry        textinput.Model
 	// Notices are startup warnings (unreadable memory files, dropped
 	// memories) shown once before the first prompt.
-	Notices        []string
+	Notices []string
+	// Herdr reports working/idle/blocked state when running inside a Herdr
+	// pane; see internal/herdr. Never nil -- herdr.New returns a disabled,
+	// no-op Reporter outside Herdr rather than requiring a nil check here.
+	Herdr          *herdr.Reporter
 	agentChan      <-chan agent.Event
 	cancel         context.CancelFunc
 	renderer       *glamour.TermRenderer
@@ -109,6 +114,7 @@ func (m *App) Init() tea.Cmd {
 	if len(m.Notices) > 0 {
 		m.newLine("system", strings.Join(m.Notices, "\n"))
 	}
+	m.Herdr.ReportState("idle", "")
 	return m.Entry.Focus()
 }
 
@@ -128,11 +134,13 @@ func (m *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.pendingConfirm <- true
 				m.pendingConfirm = nil
 				m.newLine("system", "Allowed.")
+				m.Herdr.ReportState("working", "")
 				return m, m.resumeWaiting()
 			case "n":
 				m.pendingConfirm <- false
 				m.pendingConfirm = nil
 				m.newLine("denied", "Denied.")
+				m.Herdr.ReportState("working", "")
 				return m, m.resumeWaiting()
 			case "esc":
 				m.pendingConfirm = nil
@@ -248,6 +256,7 @@ func (m *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.busy = true
 			m.abortArmed = false
 			m.Entry.Blur()
+			m.Herdr.ReportState("working", "")
 			return m, tea.Batch(waitForAgentEvent(ch), m.spinner.Tick)
 		}
 
@@ -284,6 +293,7 @@ func (m *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// the prompt's own esc means "cancel" on the first press, so a
 			// leftover armed state would make that single press an abort.
 			m.disarmAbort()
+			m.Herdr.ReportState("blocked", herdr.FirstLine(msg.Payload))
 			// The agent emits complete markdown (fencing only the argument
 			// text), so render it verbatim rather than fencing it again.
 			m.newLine("confirm", msg.Payload)
@@ -362,6 +372,7 @@ func (m *App) render() {
 func (m *App) finishTurn() tea.Cmd {
 	m.busy = false
 	m.disarmAbort()
+	m.Herdr.ReportState("idle", "")
 	return m.Entry.Focus()
 }
 

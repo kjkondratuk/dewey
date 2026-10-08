@@ -22,6 +22,7 @@ import (
 	"github.com/kjkondratuk/dewey/internal/compaction"
 	"github.com/kjkondratuk/dewey/internal/config"
 	"github.com/kjkondratuk/dewey/internal/files"
+	"github.com/kjkondratuk/dewey/internal/herdr"
 	"github.com/kjkondratuk/dewey/internal/memory"
 	"github.com/kjkondratuk/dewey/internal/picker"
 	"github.com/kjkondratuk/dewey/internal/safety"
@@ -119,6 +120,14 @@ func main() {
 		notices = append(notices, sessionNotices...)
 	}
 
+	// Herdr integration is a no-op outside a Herdr pane (see herdr.New). The
+	// resume command names dewey's own binary, not a path, since Herdr runs
+	// it as a plain command on PATH after a restart.
+	reporter := herdr.New("dewey")
+	if store != nil {
+		reporter.SetSession(store.ID(), []string{filepath.Base(os.Args[0]), "--resume", store.ID()})
+	}
+
 	// Force one load here so an unreadable memory directory or a dropped
 	// memory is reported at startup, rather than surfacing mid-turn as a
 	// failed model call.
@@ -165,8 +174,12 @@ func main() {
 	}
 	agt := agtBuilder
 
-	prog := tea.NewProgram(initModel(agt, notices))
+	prog := tea.NewProgram(initModel(agt, notices, reporter))
 	_, err = prog.Run()
+	// Release unconditionally, before the fatal check below can exit the
+	// process -- a stuck pane in Herdr is worse than a release that turned
+	// out to be unnecessary.
+	reporter.Release()
 	if err != nil {
 		log.Fatalf("program exited with error: %v", err)
 	}
@@ -494,12 +507,12 @@ func buildMemory(cwd string, cfg config.Config) (*memory.SystemPrompt, tools2.Me
 	return systemPrompt, toolRecorder, provider, notices
 }
 
-func initModel(agt agent.Agent, notices []string) *app.App {
+func initModel(agt agent.Agent, notices []string, reporter *herdr.Reporter) *app.App {
 	conversation := viewport.New()
 
 	entry := textinput.New()
 	entry.Prompt = "> "
 	entry.SetVirtualCursor(false)
 
-	return &app.App{Conversation: conversation, Entry: entry, Agent: agt, Notices: notices}
+	return &app.App{Conversation: conversation, Entry: entry, Agent: agt, Notices: notices, Herdr: reporter}
 }
