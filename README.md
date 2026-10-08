@@ -19,6 +19,7 @@ It is a single Go binary with a TUI. No daemon, no database.
 - [Tool safety and approval](#tool-safety-and-approval)
 - [Context compaction](#context-compaction)
 - [Long-term memory](#long-term-memory)
+- [Herdr](#herdr)
 - [Keybindings](#keybindings)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
@@ -581,6 +582,40 @@ A few deliberate behaviors:
 Memory can be turned off entirely with `memory: {enabled: false}`, which also
 unregisters the `remember` tool and stops telling the model it exists.
 
+## Herdr
+
+[Herdr](https://herdr.dev) manages coding agent sessions in panes, tracking
+each agent's state and letting you monitor and control them from one place.
+dewey reports to it automatically when it detects it's running inside one --
+there is nothing to enable.
+
+Detection is four environment variables every process in a Herdr pane
+inherits: `HERDR_ENV`, `HERDR_PANE_ID`, and `HERDR_BIN_PATH` (dewey also
+receives `HERDR_SOCKET_PATH` but does not use it, reporting through the
+binary instead). Outside Herdr, or with any of the first three missing,
+dewey's reporting is entirely inert -- no process is spawned, nothing is
+written anywhere.
+
+Inside Herdr, dewey reports:
+
+| Herdr state | When |
+|---|---|
+| `working` | A turn is running: you submitted a prompt, or just answered an approval prompt. |
+| `blocked` | An approval prompt is on screen. The classifier's one-line summary is sent as the block reason. |
+| `idle` | Waiting for your next prompt. |
+
+Session recording is on by default (`--no-session` turns it off) and records
+every conversation to `~/.dewey/sessions` for `--resume`. While it's active,
+dewey also tells Herdr how to resume this exact conversation: `dewey --resume
+<id>`. Restarting the Herdr session later reruns that command in the same
+pane, picking the conversation back up.
+
+Reports are fire-and-forget: each one runs in the background with a short
+timeout, failures are ignored, and if several queue up while one is in
+flight only the latest is actually sent. A slow or missing Herdr binary never
+delays a turn. On quit, dewey releases the pane so Herdr doesn't wait on a
+process that's already gone.
+
 ## Keybindings
 
 | Key | Idle | Agent working | Approval prompt |
@@ -644,6 +679,7 @@ Layout:
 | `internal/compaction` | Token estimation and the summarizer. |
 | `internal/memory` | Memory store, scope detection, retrieval, prompt assembly. |
 | `internal/tools` | Tool definitions. |
+| `internal/herdr` | Reports agent state to Herdr when running in a pane. |
 | `prompts` | Model-facing text as embedded markdown. |
 
 Prompts live in `prompts/*.md` and are compiled in with `go:embed`, so they can
