@@ -37,6 +37,13 @@ type Reporter struct {
 	resumeArgv []string
 	pending    *report
 	draining   bool
+
+	// sent, when non-nil, receives after every call out to the Herdr binary
+	// completes (from both send and Release). Nil in production. Tests set it
+	// so they can wait for the real condition -- a send having finished --
+	// instead of polling the fake binary's log file against a guessed
+	// wall-clock deadline, which is what made them flaky under load.
+	sent chan struct{}
 }
 
 type report struct {
@@ -145,6 +152,7 @@ func (r *Reporter) Release() {
 		"--seq", strconv.FormatInt(r.nextSeq(), 10),
 	}
 	_ = exec.CommandContext(ctx, r.binPath, args...).Run()
+	r.notifySent()
 }
 
 func (r *Reporter) send(rep report, sessionID string, resumeArgv []string) {
@@ -169,6 +177,19 @@ func (r *Reporter) send(rep report, sessionID string, resumeArgv []string) {
 		args = append(args, resumeArgv...)
 	}
 	_ = exec.CommandContext(ctx, r.binPath, args...).Run()
+	r.notifySent()
+}
+
+// notifySent signals r.sent, if a test has set one, without ever blocking the
+// real call path: a full or absent channel just means nothing is watching.
+func (r *Reporter) notifySent() {
+	if r.sent == nil {
+		return
+	}
+	select {
+	case r.sent <- struct{}{}:
+	default:
+	}
 }
 
 // nextSeq returns a strictly increasing sequence number, even across

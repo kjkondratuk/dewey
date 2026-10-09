@@ -46,28 +46,31 @@ func readLog(t *testing.T, path string) []string {
 	return lines
 }
 
-func waitForLines(t *testing.T, path string, n int) []string {
+// waitForSends blocks until n calls to the Herdr binary have completed,
+// confirmed via r.sent rather than by polling the log file against a guessed
+// wall-clock deadline. The 5s cap only guards against a genuine hang -- it is
+// not what normally ends the wait.
+func waitForSends(t *testing.T, sent <-chan struct{}, n int) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		lines := readLog(t, path)
-		if len(lines) >= n {
-			return lines
+	for i := 0; i < n; i++ {
+		select {
+		case <-sent:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for send %d/%d to complete", i+1, n)
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %d log lines, got %d: %v", n, len(lines), lines)
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-func newEnabledReporter(t *testing.T, agent string) (*Reporter, string) {
+func newEnabledReporter(t *testing.T, agent string) (*Reporter, string, chan struct{}) {
 	t.Helper()
 	bin, log := fakeHerdrBin(t)
 	t.Setenv("HERDR_ENV", "1")
 	t.Setenv("HERDR_BIN_PATH", bin)
 	t.Setenv("HERDR_PANE_ID", "pane-123")
-	return New(agent), log
+	r := New(agent)
+	sent := make(chan struct{}, 8)
+	r.sent = sent
+	return r, log, sent
 }
 
 func TestNew_DisabledOutsideHerdr(t *testing.T) {
@@ -119,10 +122,14 @@ func TestReportState_DisabledIsNoop(t *testing.T) {
 }
 
 func TestReportState_SendsExpectedArgs(t *testing.T) {
-	r, log := newEnabledReporter(t, "dewey")
+	r, log, sent := newEnabledReporter(t, "dewey")
 	r.ReportState("working", "")
-	lines := waitForLines(t, log, 1)
+	waitForSends(t, sent, 1)
 
+	lines := readLog(t, log)
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 log line, got %d: %v", len(lines), lines)
+	}
 	fields := strings.Fields(lines[0])
 	want := []string{"pane", "report-agent", "pane-123", "--source", "dewey", "--agent", "dewey", "--state", "working"}
 	for i, w := range want {
@@ -133,21 +140,29 @@ func TestReportState_SendsExpectedArgs(t *testing.T) {
 }
 
 func TestReportState_BlockedIncludesMessage(t *testing.T) {
-	r, log := newEnabledReporter(t, "dewey")
+	r, log, sent := newEnabledReporter(t, "dewey")
 	r.ReportState("blocked", "Bash wants to run (WRITE) [risk: dangerous]")
-	lines := waitForLines(t, log, 1)
+	waitForSends(t, sent, 1)
 
+	lines := readLog(t, log)
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 log line, got %d: %v", len(lines), lines)
+	}
 	if !strings.Contains(lines[0], "--message Bash wants to run (WRITE) [risk: dangerous]") {
 		t.Fatalf("expected a --message arg, got: %q", lines[0])
 	}
 }
 
 func TestSetSession_AttachesSessionAndResumeArgv(t *testing.T) {
-	r, log := newEnabledReporter(t, "dewey")
+	r, log, sent := newEnabledReporter(t, "dewey")
 	r.SetSession("sess-1", []string{"dewey", "--resume", "sess-1"})
 	r.ReportState("idle", "")
-	lines := waitForLines(t, log, 1)
+	waitForSends(t, sent, 1)
 
+	lines := readLog(t, log)
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 log line, got %d: %v", len(lines), lines)
+	}
 	if !strings.Contains(lines[0], "--agent-session-id sess-1") {
 		t.Fatalf("expected --agent-session-id, got: %q", lines[0])
 	}
@@ -184,6 +199,8 @@ func TestReportState_DropsSupersededReports(t *testing.T) {
 	t.Setenv("HERDR_BIN_PATH", binPath)
 	t.Setenv("HERDR_PANE_ID", "pane-123")
 	r := New("dewey")
+	sent := make(chan struct{}, 8)
+	r.sent = sent
 
 	r.ReportState("working", "")
 	// Give drain() time to start the first (gated) send before queuing more.
@@ -196,7 +213,8 @@ func TestReportState_DropsSupersededReports(t *testing.T) {
 		t.Fatalf("opening gate: %v", err)
 	}
 
-	lines := waitForLines(t, logPath, 2)
+	waitForSends(t, sent, 2)
+	lines := readLog(t, logPath)
 	if len(lines) != 2 {
 		t.Fatalf("expected exactly 2 sends (first + collapsed latest), got %d: %v", len(lines), lines)
 	}
@@ -206,10 +224,14 @@ func TestReportState_DropsSupersededReports(t *testing.T) {
 }
 
 func TestRelease_SendsExpectedArgs(t *testing.T) {
-	r, log := newEnabledReporter(t, "dewey")
+	r, log, sent := newEnabledReporter(t, "dewey")
 	r.Release()
-	lines := waitForLines(t, log, 1)
+	waitForSends(t, sent, 1)
 
+	lines := readLog(t, log)
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 log line, got %d: %v", len(lines), lines)
+	}
 	fields := strings.Fields(lines[0])
 	want := []string{"pane", "release-agent", "pane-123", "--source", "dewey", "--agent", "dewey"}
 	for i, w := range want {
