@@ -1,0 +1,49 @@
+# Triggered on pull requests, and callable by the release workflows so the
+# test steps are defined once and a release cannot publish past a red suite.
+#
+# Deliberately not triggered on `push`: pull_request already fires on
+# synchronize, so pushing to a branch with an open PR re-runs this. Adding
+# push would run the whole suite twice for every such push.
+name: test
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # ubuntu only. The suite does not pass on Windows yet: internal/tools
+    # shells out to `sh -c` with /tmp paths, and internal/safety parses POSIX
+    # shell syntax. Tracked as follow-up work in the design document.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -race ./...
+
+      - name: goreleaser check
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: '~> v2'
+          args: check
