@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -240,41 +241,6 @@ func TestDenialAndUnknownToolResultsAreDistinguishable(t *testing.T) {
 	}
 }
 
-func TestRun_CancelDuringConfirmationDropsTheTurn(t *testing.T) {
-	invoked := 0
-	tl := newRecordingTool(t, &invoked)
-	m := &fakeStreamModel{responses: [][]*schema.Message{
-		toolCallResponse("do_thing", `{"x":"1"}`),
-	}}
-
-	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Kind: "write", Risk: safety.Dangerous}}, 0, nil)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	ch, err := agt.Run(ctx, "go")
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-
-	var kinds []string
-	for evt := range ch {
-		kinds = append(kinds, evt.Kind)
-		if evt.Kind == "confirm" {
-			cancel() // do not respond; the agent must unblock via ctx.Done()
-		}
-	}
-
-	if invoked != 0 {
-		t.Errorf("tool invoked %d times, want 0 (cancelled)", invoked)
-	}
-	if len(agt.history) != 0 {
-		t.Errorf("history = %+v, want empty (turn dropped)", agt.history)
-	}
-	if kinds[len(kinds)-1] != "cancelled" {
-		t.Errorf("last event kind = %q, want cancelled", kinds[len(kinds)-1])
-	}
-}
-
 func TestShouldCompact(t *testing.T) {
 	agt := New(nil, nil, nil, 1000, nil)
 
@@ -435,7 +401,6 @@ func TestRun_CancelDuringCompactionRollsBackHistory(t *testing.T) {
 	agt.history = []*schema.Message{
 		{Role: schema.User, Content: strings.Repeat("filler content ", 200)},
 	}
-	preRunLen := len(agt.history)
 
 	ch, err := agt.Run(context.Background(), "continue")
 	if err != nil {
@@ -450,8 +415,11 @@ func TestRun_CancelDuringCompactionRollsBackHistory(t *testing.T) {
 	if len(events) != 1 || events[0].Kind != "cancelled" {
 		t.Fatalf("events = %+v, want exactly one cancelled event", events)
 	}
-	if len(agt.history) != preRunLen {
-		t.Errorf("history len = %d, want %d (rolled back, as if the turn never happened)", len(agt.history), preRunLen)
+	// The prompt survives even though nothing ran: erasing it leaves the
+	// user talking about a turn the model can no longer see.
+	want := []string{"user", "user", "note"}
+	if got := historyShape(agt.history); !slices.Equal(got, want) {
+		t.Errorf("history shape = %v, want %v", got, want)
 	}
 }
 
@@ -1596,5 +1564,192 @@ func TestExcerpt_TruncatesPastLimitAndAppendsByteCount(t *testing.T) {
 	}
 	if !strings.Contains(got, "+500 bytes") {
 		t.Errorf("excerpt() = %q, want it to report the omitted byte count", got)
+	}
+}
+
+// cancelNoteMarker is the substring every cancellation note carries. Tests
+// match on this rather than the full sentence so wording can change freely.
+const cancelNoteMarker = "interrupted by the user"
+
+func historyShape(h []*schema.Message) []string {
+	var out []string
+	for _, m := range h {
+		switch {
+		case strings.Contains(m.Content, cancelNoteMarker):
+			out = append(out, "note")
+		case len(m.ToolCalls) > 0:
+			out = append(out, "assistant+toolcalls")
+		default:
+			out = append(out, string(m.Role))
+		}
+	}
+	return out
+}
+
+func TestRun_CancelMidStreamKeepsCompletedWork(t *testing.T) {
+	invoked := 0
+	tl := newRecordingTool(t, &invoked)
+	m := &fakeStreamModel{
+		responses: [][]*schema.Message{
+			toolCallResponse("do_thing", `{"x":"1"}`),
+			nil,
+		},
+		streamReaders: []*schema.StreamReader[*schema.Message]{
+			nil,
+			pipeStream([]*schema.Message{{Role: schema.Assistant, Content: "partial"}}, context.Canceled),
+		},
+	}
+
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 0, nil)
+
+	ch, err := agt.Run(context.Background(), "do the thing")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events := drain(t, ch, func(Event) bool { return true })
+
+	if events[len(events)-1].Kind != "cancelled" {
+		t.Fatalf("last event = %q, want cancelled (events=%+v)", events[len(events)-1].Kind, events)
+	}
+	if invoked != 1 {
+		t.Fatalf("tool invoked %d times, want 1", invoked)
+	}
+
+	// The tool really ran, so its call and result must survive the rollback:
+	// a model that cannot see them denies or repeats work already done.
+	want := []string{"user", "assistant+toolcalls", "tool", "note"}
+	if got := historyShape(agt.history); !slices.Equal(got, want) {
+		t.Errorf("history shape = %v, want %v", got, want)
+	}
+	if n := len(agt.history); n > 0 {
+		last := agt.history[n-1].Content
+		if !strings.Contains(last, "do_thing") {
+			t.Errorf("note = %q, want it to name the completed do_thing call", last)
+		}
+	}
+}
+
+func TestRun_CancelDuringConfirmationDropsTheOrphanedCallButKeepsThePrompt(t *testing.T) {
+	invoked := 0
+	tl := newRecordingTool(t, &invoked)
+	m := &fakeStreamModel{responses: [][]*schema.Message{
+		toolCallResponse("do_thing", `{"x":"1"}`),
+	}}
+
+	agt := New(m, []tool.InvokableTool{tl}, &fakeClassifier{result: safety.Classification{Kind: "write", Risk: safety.Dangerous}}, 0, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := agt.Run(ctx, "go")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	var kinds []string
+	for evt := range ch {
+		kinds = append(kinds, evt.Kind)
+		if evt.Kind == "confirm" {
+			cancel() // do not respond; the agent must unblock via ctx.Done()
+		}
+	}
+
+	if invoked != 0 {
+		t.Errorf("tool invoked %d times, want 0 (cancelled)", invoked)
+	}
+	if kinds[len(kinds)-1] != "cancelled" {
+		t.Errorf("last event kind = %q, want cancelled", kinds[len(kinds)-1])
+	}
+	// The assistant message is dropped because its ToolCalls never got
+	// results and the API rejects that; the user's prompt is not.
+	want := []string{"user", "note"}
+	if got := historyShape(agt.history); !slices.Equal(got, want) {
+		t.Errorf("history shape = %v, want %v", got, want)
+	}
+}
+
+func TestRun_CancelAfterCompactionStaysInBounds(t *testing.T) {
+	m := &fakeStreamModel{
+		responses:     [][]*schema.Message{nil},
+		streamReaders: []*schema.StreamReader[*schema.Message]{pipeStream(nil, context.Canceled)},
+	}
+	fakeSumm := &fakeSummarizer{result: "a summary"}
+
+	agt := New(m, nil, &fakeClassifier{result: safety.Classification{Risk: safety.Safe}}, 10, fakeSumm)
+	// Three messages pre-compaction collapse to one summary, so the turn
+	// start recorded before compaction indexes past the rewritten history.
+	for range 3 {
+		agt.history = append(agt.history, &schema.Message{
+			Role: schema.User, Content: strings.Repeat("filler content ", 100),
+		})
+	}
+
+	ch, err := agt.Run(context.Background(), "continue")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	events := drain(t, ch, func(Event) bool { return true })
+
+	for _, e := range events {
+		if e.Kind == "error" {
+			t.Fatalf("got error event after cancelling a compacted turn: %q", e.Payload)
+		}
+	}
+	if events[len(events)-1].Kind != "cancelled" {
+		t.Fatalf("last event = %q, want cancelled (events=%+v)", events[len(events)-1].Kind, events)
+	}
+	want := []string{"system", "user", "note"}
+	if got := historyShape(agt.history); !slices.Equal(got, want) {
+		t.Errorf("history shape = %v, want %v (summary, the prompt, and the note)", got, want)
+	}
+}
+
+func TestConsistentPrefix(t *testing.T) {
+	user := &schema.Message{Role: schema.User, Content: "go"}
+	callsOne := &schema.Message{Role: schema.Assistant, ToolCalls: []schema.ToolCall{{ID: "a"}}}
+	callsTwo := &schema.Message{Role: schema.Assistant, ToolCalls: []schema.ToolCall{{ID: "a"}, {ID: "b"}}}
+	result := &schema.Message{Role: schema.Tool, Content: "ok"}
+	text := &schema.Message{Role: schema.Assistant, Content: "done"}
+
+	tests := []struct {
+		name      string
+		history   []*schema.Message
+		turnStart int
+		want      int
+	}{
+		{"prompt only", []*schema.Message{user}, 0, 1},
+		{"resolved call", []*schema.Message{user, callsOne, result}, 0, 3},
+		{"orphaned call dropped", []*schema.Message{user, callsOne}, 0, 1},
+		{"partially resolved call dropped", []*schema.Message{user, callsTwo, result}, 0, 1},
+		{"fully resolved pair kept", []*schema.Message{user, callsTwo, result, result}, 0, 4},
+		{"trailing text kept", []*schema.Message{user, callsOne, result, text}, 0, 4},
+		{"second call orphaned", []*schema.Message{user, callsOne, result, callsOne}, 0, 3},
+		{"respects turn start", []*schema.Message{text, user, callsOne}, 1, 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			agt := New(nil, nil, nil, 0, nil)
+			agt.history = tt.history
+			if got := agt.consistentPrefix(tt.turnStart); got != tt.want {
+				t.Errorf("consistentPrefix(%d) = %d, want %d", tt.turnStart, got, tt.want)
+			}
+		})
+	}
+}
+
+// The note is synthetic: the user never typed it. Attributing it to the user
+// would put words in their mouth, and pickLabel draws a session's label from
+// user messages, so a cancelled session could be labelled with this note.
+func TestRollbackCancelled_NoteIsASystemMessageNotTheUsers(t *testing.T) {
+	agt := New(nil, nil, nil, 0, nil)
+	agt.history = []*schema.Message{{Role: schema.User, Content: "go"}}
+
+	agt.rollbackCancelled(0)
+
+	note := agt.history[len(agt.history)-1]
+	if !strings.Contains(note.Content, cancelNoteMarker) {
+		t.Fatalf("last message = %q, want the cancellation note", note.Content)
+	}
+	if note.Role != schema.System {
+		t.Errorf("note role = %q, want %q", note.Role, schema.System)
 	}
 }

@@ -632,6 +632,15 @@ Input is disabled while a turn is in flight, so aborting takes a deliberate
 double-escape. At an approval prompt a single `esc` cancels, since the question
 is already waiting on you.
 
+Cancelling rewinds the conversation to the last point the model can still be
+sent — your prompt and every tool call that already returned are kept, and a
+tool call left unanswered by the abort is dropped, since a provider rejects an
+assistant message whose tool calls have no results. dewey then appends a
+system note naming the tools that ran — a system message rather than a user
+one, so nothing is attributed to you that you did not type. This matters because cancelling does not undo
+anything: a commit made before you hit `esc` is still a commit, and a model
+that could not see it in history would tell you the work was never done.
+
 The live keys are also shown on the status line while a turn is in flight
 (`Thinking… · esc esc to abort`) and at an approval prompt
 (`y allow · n deny · esc cancel`).

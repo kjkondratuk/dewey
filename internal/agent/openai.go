@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 
 	"github.com/cloudwego/eino/components/model"
@@ -222,7 +223,7 @@ func (a *openaiAgent) messages(ctx context.Context) ([]*schema.Message, error) {
 }
 
 func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, error) {
-	truncateLen := len(a.history)
+	turnStart := len(a.history)
 	userMsg := &schema.Message{
 		Role:    schema.User,
 		Content: input,
@@ -243,10 +244,10 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 			}
 		}()
 
-		if estimated := a.estimateTokens(); truncateLen > 0 && a.shouldCompact(estimated) {
-			if err := a.compact(ctx, truncateLen); err != nil {
+		if estimated := a.estimateTokens(); turnStart > 0 && a.shouldCompact(estimated) {
+			if err := a.compact(ctx, turnStart); err != nil {
 				if errors.Is(err, context.Canceled) {
-					a.history = a.history[:truncateLen]
+					a.rollbackCancelled(turnStart)
 					a.recordEvent("cancelled", "")
 					ch <- Event{Kind: "cancelled"}
 					return
@@ -261,6 +262,9 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 				estimated, a.contextWindow, 100*float64(estimated)/float64(a.contextWindow))
 			a.recordEvent("compacted", compactedPayload)
 			ch <- Event{Kind: "compacted", Payload: compactedPayload}
+			// compact replaced everything before this turn with a single
+			// summary message, so the turn now starts just after it.
+			turnStart = 1
 		}
 
 		// forcedCompaction limits the provider-overflow backstop below to one
@@ -303,13 +307,13 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 				// is rejected before generation starts. An overflow surfacing
 				// mid-stream, after content has been emitted, is about output
 				// length and compaction would not help.
-				if !forcedCompaction && truncateLen > 0 && isContextOverflow(err) {
+				if !forcedCompaction && turnStart > 0 && isContextOverflow(err) {
 					forcedCompaction = true
 
-					evt, cerr := a.forceCompact(ctx, truncateLen)
+					evt, cerr := a.forceCompact(ctx, turnStart)
 					if cerr != nil {
 						if errors.Is(cerr, context.Canceled) {
-							a.history = a.history[:truncateLen]
+							a.rollbackCancelled(turnStart)
 							a.recordEvent("cancelled", "")
 							ch <- Event{Kind: "cancelled"}
 							return
@@ -320,6 +324,8 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 						return
 					}
 
+					// As above: history was rewritten, so the start moves.
+					turnStart = 1
 					a.recordEvent("forced_compaction", evt.Payload)
 					ch <- evt
 					continue
@@ -347,12 +353,10 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 						a.recordEvent("partial_response", fmt.Sprintf(
 							"content_len=%d excerpt=%s", len(partial.Content), excerpt(partial.Content, 2000)))
 					}
-					// Roll the whole turn back, as if the question was never
-					// asked. Dropping just the last message is only equivalent
-					// on the first pass: cancelling during a later model turn
-					// would strip one tool result and leave an assistant
-					// message with orphaned ToolCalls, which the API rejects.
-					a.history = a.history[:truncateLen]
+					// Nothing of this response was appended, so the
+					// rollback keeps the whole turn up to here -- including
+					// any tool calls that already ran. See consistentPrefix.
+					a.rollbackCancelled(turnStart)
 					a.recordEvent("cancelled", "")
 					ch <- Event{Kind: "cancelled"}
 					return
@@ -411,7 +415,7 @@ func (a *openaiAgent) Run(ctx context.Context, input string) (<-chan Event, erro
 				if classification.RequiresApproval() {
 					allowed, cancelled := a.awaitConfirmation(ctx, ch, tc.Function.Name, classification, tc.Function.Arguments)
 					if cancelled {
-						a.history = a.history[:truncateLen]
+						a.rollbackCancelled(turnStart)
 						a.recordEvent("cancelled", "")
 						ch <- Event{Kind: "cancelled"}
 						return
@@ -568,6 +572,86 @@ func (a *openaiAgent) refreshContextWindow(ctx context.Context) string {
 // entirely when contextWindow <= 0.
 func (a *openaiAgent) shouldCompact(estimated int) bool {
 	return a.contextWindow > 0 && estimated >= int(float64(a.contextWindow)*compactionThreshold)
+}
+
+// consistentPrefix returns the largest prefix of a.history, at or after
+// turnStart, in which every assistant message's ToolCalls have a matching
+// tool result. It is the point a cancelled turn is trimmed back to.
+//
+// Cutting all the way to turnStart would be simpler, but the tool calls that
+// already ran had real effects -- files written, commits made -- and a model
+// that cannot see them in history denies that work or repeats it. Keeping any
+// more than this would leave an assistant message with orphaned ToolCalls,
+// which the API rejects.
+func (a *openaiAgent) consistentPrefix(turnStart int) int {
+	boundary := turnStart
+	for i := turnStart; i < len(a.history); {
+		if calls := len(a.history[i].ToolCalls); calls > 0 {
+			results, j := 0, i+1
+			for j < len(a.history) && a.history[j].Role == schema.Tool {
+				results++
+				j++
+			}
+			if results < calls {
+				break
+			}
+			i = j
+		} else {
+			i++
+		}
+		boundary = i
+	}
+	return boundary
+}
+
+// rollbackCancelled trims a cancelled turn to the last valid boundary and
+// appends a note describing the interruption. The note carries as much weight
+// as the trim: without it history ends on a user message with no reply, which
+// reads to the model as a question it declined to answer.
+//
+// The note is a system message, matching the summary compact() inserts. The
+// user role would be read more reliably by a small model, but it would also
+// attribute words to the user that the user never typed -- and pickLabel
+// draws a session's label from user messages, so a cancelled session could
+// end up labelled with this note.
+func (a *openaiAgent) rollbackCancelled(turnStart int) {
+	// A compaction earlier in this turn rewrote history and left turnStart
+	// indexing past its end.
+	turnStart = min(turnStart, len(a.history))
+	a.history = a.history[:a.consistentPrefix(turnStart)]
+
+	note := &schema.Message{Role: schema.System, Content: cancelNote(a.ranToolNames(turnStart))}
+	a.history = append(a.history, note)
+	a.record(note)
+}
+
+// ranToolNames lists the distinct tools that returned a result in
+// a.history[from:], in call order, for the cancellation note.
+func (a *openaiAgent) ranToolNames(from int) []string {
+	var names []string
+	for _, msg := range a.history[from:] {
+		if msg.Role != schema.Tool || msg.ToolName == "" {
+			continue
+		}
+		if !slices.Contains(names, msg.ToolName) {
+			names = append(names, msg.ToolName)
+		}
+	}
+	return names
+}
+
+// cancelNote tells the model its turn was cut short and what outlived it, so
+// it checks the state of the work rather than assuming it either finished or
+// never began.
+func cancelNote(ran []string) string {
+	if len(ran) == 0 {
+		return "[The previous turn was interrupted by the user before any tool ran. " +
+			"Nothing was changed.]"
+	}
+	return fmt.Sprintf(
+		"[The previous turn was interrupted by the user. These tools had already run and "+
+			"their effects persist: %s. Check the current state of that work before redoing it.]",
+		strings.Join(ran, ", "))
 }
 
 // compact summarizes a.history[:truncateLen] (everything before the
