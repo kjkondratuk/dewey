@@ -61,7 +61,7 @@ it can run here unchanged once that work lands.
 
 | Tool | What it does | Approval |
 | --- | --- | --- |
-| `Bash` | Runs a shell command via `sh -c` | Per the shell rules below |
+| `Bash` | Runs a shell command via `sh -c`, for work no other tool covers | Per the shell rules below |
 | `Read` | Reads a file with line numbers, 2000 lines by default | Usually silent — see below |
 | `Write` | Replaces a file's contents entirely | Always prompts |
 | `Edit` | Exact string replacement in a file | Always prompts |
@@ -71,6 +71,32 @@ it can run here unchanged once that work lands.
 
 `Write` and `Edit` are pinned to `always_write_tools`, so they prompt no matter
 what the classifier thinks.
+
+### Bash is a fallback, and that is enforced
+
+A shell can do anything, so a model under pressure reaches for it even where a
+purpose-built tool is better — editing through `sed -i` instead of `Edit`,
+reading through `cat` instead of `Read`. Saying so in the prompt does not stop
+it: dewey's system prompt already said "edit it instead of piping through sed"
+while a model piped through sed four times in a row.
+
+So `Bash` refuses a command that a specific tool covers, and names the tool:
+
+```
+refused: this edits a file in place with sed. Use Edit, which verifies the
+text it replaces still matches before writing. Bash is a fallback for what no
+other tool covers, so call Edit instead.
+```
+
+The refusal only fires where the other tool is a genuine replacement. Anything
+the shell can do and the tool cannot is left alone — a pipeline or `&&` chain
+(composition is the shell's own job), `tail -f` (`Read` cannot follow a growing
+file), `grep -A3` (`Grep` has no context lines), `find -exec`, `ls -la`
+(`Glob` returns paths, not modes and sizes), and `go test ./... > out.txt`,
+where the point is running the tests and the redirect only captures output.
+
+Replayed against the 44 shell commands of a real session, this redirects 10 and
+runs the other 34 untouched.
 
 ### Why reads are usually silent, and when they are not
 

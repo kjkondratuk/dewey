@@ -90,3 +90,15 @@ func TestSystemBaseInstructsStoppingOnSelfRepetition(t *testing.T) {
 		}
 	}
 }
+
+// Bash refuses commands a specific tool covers (see safety.PreferredTool). A
+// model that does not know the refusal is coming spends a turn discovering it,
+// and may read it as a broken capability rather than a redirect.
+func TestSystemBaseWarnsThatBashRefusesCoveredCommands(t *testing.T) {
+	lower := strings.ToLower(SystemBase)
+	for _, want := range []string{"refuse", "bash"} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("SystemBase does not mention %q; it should tell the model Bash refuses what another tool covers", want)
+		}
+	}
+}
