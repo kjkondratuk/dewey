@@ -287,29 +287,10 @@ func writesViaRedirection(segment string) bool {
 
 // segmentWrites decides whether one command in a pipeline changes state.
 func (r ShellRules) segmentWrites(segment string) bool {
-	fields := strings.Fields(segment)
-
-	// Step past env assignments and wrappers so `FOO=1 env rm x` still
-	// resolves to rm.
-	i := 0
-	for i < len(fields) {
-		f := fields[i]
-		if strings.Contains(f, "=") && !strings.HasPrefix(f, "-") {
-			i++
-			continue
-		}
-		if wrapperPrograms[f] {
-			i++
-			continue
-		}
-		break
-	}
-	if i >= len(fields) {
+	program, args, ok := resolveProgram(segment)
+	if !ok {
 		return false
 	}
-
-	program := baseName(fields[i])
-	args := fields[i+1:]
 
 	for _, name := range r.AlwaysWrite {
 		if name == program {
