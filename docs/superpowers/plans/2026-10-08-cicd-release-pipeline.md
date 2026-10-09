@@ -865,6 +865,7 @@ and appending to a file, which a test would only restate.
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -960,6 +961,14 @@ func report(v release.Version, ok bool) error {
 func git(args ...string) (string, error) {
 	out, err := exec.Command("git", args...).Output()
 	if err != nil {
+		// .Output() captures stderr into ExitError.Stderr, but ExitError's
+		// own message is only "exit status N". Without this, a CI failure
+		// logs the status and discards the one line explaining it.
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && len(exitErr.Stderr) > 0 {
+			return "", fmt.Errorf("git %s: %w: %s",
+				strings.Join(args, " "), err, strings.TrimSpace(string(exitErr.Stderr)))
+		}
 		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
 	return string(out), nil
