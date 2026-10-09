@@ -42,6 +42,18 @@ jobs:
       - name: go test
         run: go test -race ./...
 
+      - name: cross-compile every release target
+        # vet and the tests only exercise the host platform, but a release
+        # ships six. Without this gate a POSIX-only call added in a pull
+        # request passes CI and then breaks the build *after* release.yml has
+        # already pushed the tag -- the one failure mode the design document
+        # calls out as needing manual recovery.
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            echo "building $target"
+            GOOS="${target%/*}" GOARCH="${target#*/}" go build ./...
+          done
+
       - name: goreleaser check
         uses: goreleaser/goreleaser-action@v6
         with:

@@ -17,8 +17,8 @@ builds:
       - arm64
     ldflags:
       - -s -w
-      - -X main.version={{ .Version }}
-      - -X main.commit={{ .Commit }}
+      - -X main.version={{ .Tag }}
+      - -X main.commit={{ .ShortCommit }}
       - -X main.date={{ .Date }}
 
 archives:
@@ -40,7 +40,6 @@ checksum:
 
 changelog:
   use: git
-  sort: asc
   groups:
     - title: Features
       regexp: '^feat(\([^)]*\))?!?: '
