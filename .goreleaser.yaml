@@ -68,6 +68,8 @@ changelog:
       - '^Merge '
 
 release:
-  # A tag carrying -alpha. or -beta. is published as a prerelease, so the
-  # repository's "latest release" keeps pointing at the newest stable version.
+  # Any tag with a semver prerelease component publishes as a prerelease, so
+  # the repository's "latest release" keeps pointing at the newest stable
+  # version. This project only produces -alpha.N and -beta.N, but the check is
+  # generic, so a hand-cut -rc.1 tag would be handled correctly too.
   prerelease: auto
