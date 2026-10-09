@@ -566,6 +566,30 @@ func TestRenderSessionsTable_EmptyInputHeaderOnly(t *testing.T) {
 	}
 }
 
+func TestVersionLine_ReportsInjectedBuildInfo(t *testing.T) {
+	// Saved and restored because these are package-level vars that other
+	// tests in this package may observe.
+	origVersion, origCommit, origDate := version, commit, date
+	t.Cleanup(func() { version, commit, date = origVersion, origCommit, origDate })
+
+	version, commit, date = "v1.2.3", "abc1234", "2026-10-08T12:00:00Z"
+	want := "dewey v1.2.3 (commit abc1234, built 2026-10-08T12:00:00Z)"
+	if got := versionLine(); got != want {
+		t.Errorf("versionLine() = %q, want %q", got, want)
+	}
+}
+
+func TestVersionLine_DefaultsAreHonestForALocalBuild(t *testing.T) {
+	// A binary built with plain `go build` has no ldflags, and must say so
+	// rather than claim a version it does not have.
+	if version != "dev" {
+		t.Errorf("default version = %q, want %q", version, "dev")
+	}
+	if commit != "none" || date != "unknown" {
+		t.Errorf("default commit/date = %q/%q, want %q/%q", commit, date, "none", "unknown")
+	}
+}
+
 func TestRenderSessionsTable_StaysCompactWhenContentIsNarrow(t *testing.T) {
 	// Asking lipgloss/table for a width makes it expand every column evenly to
 	// fill it, so a narrow table in a wide terminal gets ID padded to 17
