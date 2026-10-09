@@ -608,13 +608,19 @@ func (a *openaiAgent) consistentPrefix(turnStart int) int {
 // appends a note describing the interruption. The note carries as much weight
 // as the trim: without it history ends on a user message with no reply, which
 // reads to the model as a question it declined to answer.
+//
+// The note is a system message, matching the summary compact() inserts. The
+// user role would be read more reliably by a small model, but it would also
+// attribute words to the user that the user never typed -- and pickLabel
+// draws a session's label from user messages, so a cancelled session could
+// end up labelled with this note.
 func (a *openaiAgent) rollbackCancelled(turnStart int) {
 	// A compaction earlier in this turn rewrote history and left turnStart
 	// indexing past its end.
 	turnStart = min(turnStart, len(a.history))
 	a.history = a.history[:a.consistentPrefix(turnStart)]
 
-	note := &schema.Message{Role: schema.User, Content: cancelNote(a.ranToolNames(turnStart))}
+	note := &schema.Message{Role: schema.System, Content: cancelNote(a.ranToolNames(turnStart))}
 	a.history = append(a.history, note)
 	a.record(note)
 }

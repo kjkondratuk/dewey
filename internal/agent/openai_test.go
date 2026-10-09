@@ -1735,3 +1735,21 @@ func TestConsistentPrefix(t *testing.T) {
 		})
 	}
 }
+
+// The note is synthetic: the user never typed it. Attributing it to the user
+// would put words in their mouth, and pickLabel draws a session's label from
+// user messages, so a cancelled session could be labelled with this note.
+func TestRollbackCancelled_NoteIsASystemMessageNotTheUsers(t *testing.T) {
+	agt := New(nil, nil, nil, 0, nil)
+	agt.history = []*schema.Message{{Role: schema.User, Content: "go"}}
+
+	agt.rollbackCancelled(0)
+
+	note := agt.history[len(agt.history)-1]
+	if !strings.Contains(note.Content, cancelNoteMarker) {
+		t.Fatalf("last message = %q, want the cancellation note", note.Content)
+	}
+	if note.Role != schema.System {
+		t.Errorf("note role = %q, want %q", note.Role, schema.System)
+	}
+}

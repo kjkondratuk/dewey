@@ -635,8 +635,9 @@ is already waiting on you.
 Cancelling rewinds the conversation to the last point the model can still be
 sent — your prompt and every tool call that already returned are kept, and a
 tool call left unanswered by the abort is dropped, since a provider rejects an
-assistant message whose tool calls have no results. dewey then appends a note
-naming the tools that ran. This matters because cancelling does not undo
+assistant message whose tool calls have no results. dewey then appends a
+system note naming the tools that ran — a system message rather than a user
+one, so nothing is attributed to you that you did not type. This matters because cancelling does not undo
 anything: a commit made before you hit `esc` is still a commit, and a model
 that could not see it in history would tell you the work was never done.
 
