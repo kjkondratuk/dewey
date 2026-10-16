@@ -1,0 +1,61 @@
+# Manual only. Runs on whichever branch is selected when dispatched, so a
+# build can be shipped from a feature branch for testing.
+name: prerelease
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Prerelease channel
+        required: true
+        type: choice
+        options:
+          - alpha
+          - beta
+
+permissions:
+  contents: write
+
+# Shares the release group, so a prerelease and a merge cannot tag at once.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
+  prerelease:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Compute the version
+        id: version
+        run: go run ./cmd/relver --channel=${{ inputs.channel }}
+
+      - name: Tag the prerelease
+        if: steps.version.outputs.release == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.version.outputs.version }}" \
+            -m "${{ steps.version.outputs.version }}"
+          git push origin "${{ steps.version.outputs.version }}"
+
+      - name: Publish the prerelease
+        if: steps.version.outputs.release == 'true'
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

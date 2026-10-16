@@ -22,6 +22,7 @@ It is a single Go binary with a TUI. No daemon, no database.
 - [Herdr](#herdr)
 - [Keybindings](#keybindings)
 - [Troubleshooting](#troubleshooting)
+- [Releases](#releases)
 - [Development](#development)
 - [Current limitations](#current-limitations)
 
@@ -691,6 +692,58 @@ denials.
 | A memory file seems ignored | Look for a startup notice naming it. Malformed frontmatter, an empty body, and symlinks are each reported and skipped. |
 | Startup errors about a shell rule | An invalid regex under `shell_rules.<program>.patterns`. The message names the program and the pattern. |
 | A command you run constantly keeps prompting | Add its read-only form under `shell_rules.reads_when`, or the program to `never_write` if it should never prompt. Both are reported at startup so a weakened rule stays visible. |
+
+## Releases
+
+Merging to `main` releases. The version is computed from the conventional
+commit subjects since the last tag: a `feat` bumps the minor, a `fix`, `perf`
+or `revert` bumps the patch, and a `!` or a `BREAKING CHANGE:` footer bumps
+the major. A merge whose commits are all `docs`, `chore`, `test`, `ci`,
+`build`, `style` or `refactor` ships nothing, so it tests and stops without
+minting a version.
+
+To see what a release would do without releasing anything:
+
+```bash
+go run ./cmd/relver                  # the stable version a merge would cut
+go run ./cmd/relver --channel=alpha  # the next alpha
+```
+
+Each release publishes six archives — linux, macOS and Windows on amd64 and
+arm64 — with a `checksums.txt`, and release notes grouped by commit type.
+`dewey --version` reports what a downloaded binary is; a locally built one
+says `dev`.
+
+Alpha and beta builds come from the **prerelease** workflow, run by hand from
+the Actions tab against any branch. They are numbered per target version, so
+`v1.3.0-alpha.1` and `.2` lead up to `v1.3.0` and the counter restarts for
+`v1.4.0`. GitHub marks them as prereleases, so the latest-release link keeps
+pointing at the newest stable build.
+
+The changelog's `groups` only catch `feat`, `fix`, `perf` and `revert`
+subjects, and the `exclude` filter only catches `docs`, `chore`, `test`,
+`ci`, `build`, `style`, `refactor` and merge commits. A subject matching
+neither, eleven commits in this repository's history so far, is dropped from
+the notes outright: no catch-all bucket, no warning. That's a fair price for
+grouped release notes given the project already commits conventionally and
+`relver` depends on that convention for version bumps, but a non-conventional
+commit subject will be invisible in what gets published.
+
+### When a release half-fails
+
+The tag is pushed before the archives are built, so a GoReleaser failure
+leaves a tag with no release attached. This is not cleaned up automatically,
+because deleting tags from CI is more dangerous than the problem it solves.
+Recover by hand:
+
+```bash
+git push --delete origin v1.3.0
+git tag -d v1.3.0
+```
+
+Then re-run the workflow. A release workflow re-run on an already tagged
+commit is harmless on its own: the commit range since the tag is empty, so
+nothing is releasable and the job succeeds without doing anything.
 
 ## Development
 

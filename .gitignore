@@ -39,3 +39,7 @@ go.work.sum
 
 # Compiled binary (module name has no extension, so the patterns above miss it)
 /dewey
+
+# GoReleaser build output. A snapshot build writes ~120MB of binaries and
+# archives here, which `git add -A` would otherwise happily commit.
+/dist/

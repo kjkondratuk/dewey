@@ -1,0 +1,74 @@
+# Six targets: linux, macOS and Windows on amd64 and arm64. darwin/arm64 is
+# Apple silicon. CGO is off, so cross-compilation needs no C toolchains.
+version: 2
+
+builds:
+  - id: dewey
+    main: .
+    binary: dewey
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Tag }}
+      - -X main.commit={{ .ShortCommit }}
+      - -X main.date={{ .Date }}
+
+archives:
+  - id: dewey
+    formats:
+      - tar.gz
+    # Windows users are far likelier to have a zip tool than a tar one.
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "dewey_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  use: git
+  groups:
+    - title: Features
+      regexp: '^feat(\([^)]*\))?!?: '
+      order: 0
+    - title: Fixes
+      regexp: '^fix(\([^)]*\))?!?: '
+      order: 1
+    - title: Performance
+      regexp: '^perf(\([^)]*\))?!?: '
+      order: 2
+    - title: Reverts
+      regexp: '^revert(\([^)]*\))?!?: '
+      order: 3
+  filters:
+    # The non-releasable types. These never trigger a release on their own, so
+    # they would only pad the notes of a release they did not cause.
+    exclude:
+      - '^docs(\([^)]*\))?!?: '
+      - '^chore(\([^)]*\))?!?: '
+      - '^test(\([^)]*\))?!?: '
+      - '^ci(\([^)]*\))?!?: '
+      - '^build(\([^)]*\))?!?: '
+      - '^style(\([^)]*\))?!?: '
+      - '^refactor(\([^)]*\))?!?: '
+      - '^Merge '
+
+release:
+  # Any tag with a semver prerelease component publishes as a prerelease, so
+  # the repository's "latest release" keeps pointing at the newest stable
+  # version. This project only produces -alpha.N and -beta.N, but the check is
+  # generic, so a hand-cut -rc.1 tag would be handled correctly too.
+  prerelease: auto

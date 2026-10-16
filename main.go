@@ -32,11 +32,29 @@ import (
 	"golang.org/x/term"
 )
 
+// Build information, overridden at release time via -ldflags. The defaults
+// are what a local `go build` honestly reports.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
+func versionLine() string {
+	return fmt.Sprintf("dewey %s (commit %s, built %s)", version, commit, date)
+}
+
 func main() {
 	resume := flag.Bool("resume", false, "resume a previous session: pass an id (or unambiguous id prefix) as the first argument, or omit it to choose one interactively")
 	listSessions := flag.Bool("sessions", false, "list recorded sessions and exit")
 	noSession := flag.Bool("no-session", false, "do not record this session to disk")
+	showVersion := flag.Bool("version", false, "print version information and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(versionLine())
+		return
+	}
 
 	if *listSessions {
 		if err := printSessions(); err != nil {
